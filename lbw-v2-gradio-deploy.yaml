@@ -32,9 +32,9 @@ spec:
             - -c
             - |
               set -e
-              apt-get update -qq && apt-get install -y -qq git >/dev/null
+              DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /app
-              pip install -q gradio requests numpy pillow imageio imageio-ffmpeg
+              pip install -q --root-user-action=ignore --disable-pip-version-check gradio requests numpy pillow imageio imageio-ffmpeg
               exec python -u /app/gradio_app.py
           env:
             - name: BRANCH
@@ -43,11 +43,24 @@ spec:
               value: "http://lbw-v2.default.svc.cluster.local:8000"
           ports:
             - containerPort: 7860
+          startupProbe:
+            httpGet:
+              path: /
+              port: 7860
+            periodSeconds: 10
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /
               port: 7860
             periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 7860
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: "1"
