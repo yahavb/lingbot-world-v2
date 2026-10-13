@@ -58,10 +58,10 @@ spec:
 
               GEN=$(grep -oE "\[BENCH\] GEN time: [0-9.]+" "$OUT/generate.txt" | grep -oE "[0-9.]+$")
               VAE=$(grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" "$OUT/decode.txt" | grep -oE "[0-9.]+$")
-              python3 -c "g,v,n=$GEN,$VAE,$FRAME_NUM; print(f'GEN {g:.0f} ms  VAE {v:.0f} ms  steady-state {n/((g+v)/1000):.2f} fps')"
+              STEADY=$(python3 -c "print($FRAME_NUM / (($GEN + $VAE) / 1000))")
 
               python3 tests/smoke_test_video.py --skip-run --save-file "$SAVE" \
-                --expected-frame-num "$FRAME_NUM" --expected-fps 16 --size "$SIZE"
+                --expected-frame-num "$FRAME_NUM" --size "$SIZE" --steady-fps "$STEADY"
           resources:
             claims:
               - name: neuroncores

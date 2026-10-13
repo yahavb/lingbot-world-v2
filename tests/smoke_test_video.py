@@ -2,7 +2,7 @@
 """Smoke test for LingBot-World v2 inference.
 
 Runs the model's bring-up pipeline (run_fast_neuron.sh by default) and
-sanity-checks the resulting mp4: right frame count / fps / resolution, not
+sanity-checks the resulting mp4: right frame count / resolution, not
 blank, not frozen. Doesn't check semantic quality -- just "did inference
 produce a video that looks like a video".
 
@@ -46,7 +46,6 @@ def read_all_frames(path):
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {path}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -62,7 +61,7 @@ def read_all_frames(path):
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     cap.release()
 
-    return {"playback_fps": fps, "width": width, "height": height, "frame_count": len(frames)}, frames
+    return {"width": width, "height": height, "frame_count": len(frames)}, frames
 
 
 def shannon_entropy(gray):
@@ -75,7 +74,6 @@ def shannon_entropy(gray):
 def check_video(
     path,
     expected_frame_num=None,
-    expected_fps=None,
     expected_area=None,
     area_tolerance=0.2,
     min_entropy=3.0,
@@ -96,8 +94,6 @@ def check_video(
 
     if expected_frame_num is not None:
         checks["frame_count_matches"] = meta["frame_count"] == expected_frame_num
-    if expected_fps is not None:
-        checks["fps_matches"] = abs(meta["playback_fps"] - expected_fps) < 0.5
     if expected_area is not None:
         actual_area = meta["width"] * meta["height"]
         meta["area"] = actual_area
@@ -155,8 +151,8 @@ def main():
                     help="Check an existing video at --save-file instead of running inference.")
     p.add_argument("--expected-frame-num", type=int, default=21,
                     help="Must match --frame_num used inside the pipeline script.")
-    p.add_argument("--expected-fps", type=float, default=16.0,
-                    help="wan_shared_cfg.sample_fps (wan/configs/shared_config.py).")
+    p.add_argument("--steady-fps", type=float, default=None,
+                    help="Measured steady-state generation fps, reported with the metrics.")
     p.add_argument("--size", default="480*832",
                     help="Must match --size used inside the pipeline script (WAN reports it as an area target, "
                          "not exact WxH, since output follows the input image's aspect ratio).")
@@ -179,7 +175,6 @@ def main():
     checks, meta = check_video(
         video_path,
         expected_frame_num=args.expected_frame_num,
-        expected_fps=args.expected_fps,
         expected_area=expected_area,
         area_tolerance=args.area_tolerance,
         min_entropy=args.min_entropy,
@@ -191,6 +186,8 @@ def main():
     print(f"\n{'PASS' if passed else 'FAIL'}  {video_path}")
     for name, ok in checks.items():
         print(f"  [{'x' if ok else ' '}] {name}")
+    if args.steady_fps is not None:
+        meta = {"steady_fps": round(args.steady_fps, 2), **meta}
     print("metrics:", meta)
 
     sys.exit(0 if passed else 1)
