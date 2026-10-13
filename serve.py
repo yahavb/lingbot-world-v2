@@ -25,7 +25,8 @@ prompts extend the same scene.
 Live mode is one continuous generation: memory, camera motion and scene carry
 on, and a new prompt takes effect at the next chunk.
 
-    POST /live             {"prompt": str, "seed": int} -> same event stream, until stopped
+    POST /live             {"prompt": str, "seed": int, "scene": "02"} -> same event stream,
+                           until stopped; scene picks examples/<scene>/ (start image + camera path)
     POST /live/prompt      {"prompt": str}  switch the running stream's prompt
     POST /live/stop
     GET  /health
@@ -61,11 +62,12 @@ LIVE_MAX_CHUNKS = 900
 
 class Job:
 
-    def __init__(self, prompt, cont, seed, live=False):
+    def __init__(self, prompt, cont, seed, live=False, scene=None):
         self.prompt = prompt
         self.cont = cont
         self.seed = seed
         self.live = live
+        self.scene = scene
         self.frames = queue.Queue()
 
 
@@ -199,12 +201,15 @@ def run_server(sched):
     class LiveRequest(BaseModel):
         prompt: str
         seed: int = 42
+        scene: str = ""
 
     @app.post("/live")
     def live(req: LiveRequest):
         if not sched.ready:
             raise HTTPException(status_code=503, detail="warming up")
-        job = Job(req.prompt, False, req.seed, live=True)
+        if req.scene and not (req.scene.isdigit() and os.path.isfile(f"examples/{req.scene}/poses.npy")):
+            raise HTTPException(status_code=400, detail=f"unknown scene {req.scene!r}")
+        job = Job(req.prompt, False, req.seed, live=True, scene=req.scene or None)
         sched.submit(job)
 
         def events():
@@ -338,7 +343,7 @@ def main():
             chunk_callback=on_chunk)
         return remote.drain() if remote is not None else None
 
-    def run_live(prompt, img, seed, emit, control):
+    def run_live(prompt, img, seed, emit, control, action_path=None):
         """One continuous generation on every rank until control() says stop.
 
         control(chunk_id) runs on rank 0 and returns (new prompt or None, stop?);
@@ -366,7 +371,7 @@ def main():
 
         pipe.generate(
             prompt, img,
-            action_path=args.action_path,
+            action_path=action_path or args.action_path,
             chunk_size=args.chunk_size,
             max_area=max_area,
             target_hw=target_hw,
@@ -412,10 +417,13 @@ def main():
         if job is not None:
             cont = job.cont and last_frame is not None
             img = last_frame if cont else first_img
+            if job.scene:
+                img = Image.open(f"examples/{job.scene}/image.jpg").convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             msg = [{"prompt": job.prompt, "seed": job.seed, "png": buf.getvalue(),
-                    "skip_first": cont, "live": job.live}]
+                    "skip_first": cont, "live": job.live,
+                    "action_path": f"examples/{job.scene}" if job.scene else None}]
         dist.broadcast_object_list(msg, src=0)
         m = msg[0]
         if m is None:
@@ -439,7 +447,7 @@ def main():
                     prompt, stop = sched.control()
                     return prompt, stop or time.perf_counter() - t_live > LIVE_MAX_S
 
-                err = run_live(m["prompt"], img, m["seed"], emit, control)
+                err = run_live(m["prompt"], img, m["seed"], emit, control, m["action_path"])
             else:
                 err = run_segment(m["prompt"], img, m["seed"], emit)
             if rank == 0:
