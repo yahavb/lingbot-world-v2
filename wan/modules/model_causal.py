@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as torch_F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
-from .attention import attention, flash_attention
+from .attention import attention
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -21,47 +21,81 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('neuron', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
-    )
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
+        torch.arange(max_seq_len).float(),
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).float().div(dim)))
     return freqs
 
 
-def rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
+def rope_grids(freqs, grid_sizes, device):
+    """Precompute per-batch cos/sin rotary grids. Independent of x."""
+    c = freqs.size(1)  # half head dim
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Split frequency dims: (c - 2*(c//3), c//3, c//3) for (frame, height, width)
+    s0 = c - 2 * (c // 3)
+    s1 = c // 3
 
-    # loop over samples
-    output = []
+    # Move freqs to CPU for grid construction (Neuron can't handle cat of expanded views)
+    freqs_cpu = freqs.cpu().float()
+    freqs_split = freqs_cpu.split([s0, s1, s1], dim=1)
 
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    cos_grids, sin_grids = [], []
+    for (f, h, w) in grid_sizes.tolist():
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
+        # Build angle grids on CPU: [seq_len, 1, c]
+        angles_grid = torch.cat([
+            freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, c)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # Compute cos/sin on CPU then transfer to device
+        cos_grids.append(torch.cos(angles_grid).to(device))
+        sin_grids.append(torch.sin(angles_grid).to(device))
 
-        # append to collection
+    return cos_grids, sin_grids
+
+def rope_apply_rotation(x, grid_sizes, cos_grids, sin_grids):
+    """Apply precomputed rotary grids to x."""
+    n, c = x.size(2), x.size(3) // 2  # num_heads, half_head_dim
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        cos_grid, sin_grid = cos_grids[i], sin_grids[i]
+
+        # Extract x for this sample using slice (not select — unsupported on Neuron)
+        x_seq = x[i:i+1, :seq_len].to(torch.float32)  # [1, seq_len, N, D]
+
+        # Reshape to pairs: [1, seq_len, N, c, 2]
+        x_pairs = x_seq.reshape(1, seq_len, n, c, 2)
+        # Use slice 0:1/1:2 instead of [..., 0] select (unsupported on Neuron)
+        x_re = x_pairs[:, :, :, :, 0:1].reshape(1, seq_len, n, c)
+        x_im = x_pairs[:, :, :, :, 1:2].reshape(1, seq_len, n, c)
+
+        # Apply rotation: (x_re + i*x_im) * (cos + i*sin)
+        out_re = x_re * cos_grid - x_im * sin_grid
+        out_im = x_re * sin_grid + x_im * cos_grid
+
+        # Interleave with unsqueeze+cat (not stack — unsupported on Neuron)
+        x_out = torch.cat([out_re.unsqueeze(-1), out_im.unsqueeze(-1)], dim=-1)
+        x_out = x_out.reshape(1, seq_len, n, c * 2)  # [1, seq_len, N, D]
+
+        # Concat with remaining tokens beyond seq_len
+        x_rest = x[i:i+1, seq_len:].to(torch.float32)
+        x_i = torch.cat([x_out, x_rest], dim=1)  # [1, L, N, D]
         output.append(x_i)
-    return torch.stack(output).type_as(x)
 
+    result = torch.cat(output, dim=0)  # [B, L, N, D]
+    return result.to(x.dtype)
+
+def rope_apply(x, grid_sizes, freqs):
+    cos_grids, sin_grids = rope_grids(freqs, grid_sizes, x.device)
+    return rope_apply_rotation(x, grid_sizes, cos_grids, sin_grids)
 
 class WanRMSNorm(nn.Module):
 
@@ -256,7 +290,7 @@ class CrossAttention_KVCache(nn.Module):
             v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -356,14 +390,14 @@ class AttentionBlock(nn.Module):
         internally.
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.amp.autocast('neuron', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.amp.autocast('neuron', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
@@ -379,7 +413,7 @@ class AttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
             x = x + self.cross_attn(self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache)
             y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('cuda', dtype=torch.float32):
+            with torch.amp.autocast('neuron', dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -411,7 +445,7 @@ class CausalHead(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.amp.autocast('neuron', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = (
                 self.head(
@@ -641,7 +675,7 @@ class WanModelCausal(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_lens)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.amp.autocast('neuron', dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(

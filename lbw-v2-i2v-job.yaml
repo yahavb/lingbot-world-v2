@@ -1,0 +1,146 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-v2-i2v
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: xl-lnc2
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              cd /tmp/lingbot
+              OUT=/tmp/results; mkdir -p "$OUT"
+              CKPT=/tmp/ckpt/lingbot-world-v2-14b-causal-fast
+              SAVE="$OUT/lingbot_i2v_cp${CP}xtp${TP}_${SIZE//\*/x}_${FRAME_NUM}f.mp4"
+              LATENTS=/tmp/latents.pt
+              export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              export NKI_ENABLE_TRACE_CACHE=1
+              export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
+              export HF_HOME=/tmp/hf-cache
+
+              pip install -q -r requirements_neuron.txt
+              python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
+
+              hf download robbyant/lingbot-world-v2-14b-causal-fast --local-dir "$CKPT"
+              [ -f "$CKPT/transformers/config.json" ] || cp "$CKPT/config.json" "$CKPT/transformers/config.json"
+              python3 scripts/inference/convert_dit_to_pth.py --ckpt_dir "$CKPT"
+              rm -f "$CKPT"/transformers/*.safetensors
+
+              python3 scripts/analysis/qk_gamma_temperature.py --ckpt_dir "$CKPT" | tee /tmp/qk.txt
+              export FLASH_ATTN_LAYERS=$(grep -oE "CANDIDATE HOT LAYERS \([0-9]+\): [0-9,]+" /tmp/qk.txt | sed -E "s/.*: //" || true)
+
+              ARGS=(--task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT"
+                    --size "$SIZE" --frame_num "$FRAME_NUM" --chunk_size "$CHUNK_SIZE"
+                    --image examples/03/image.jpg --action_path examples/03 --prompt "$PROMPT"
+                    --tp_degree "$TP" --cp_size "$CP" --denoise_steps "$DENOISE_STEPS"
+                    --local_attn_size "$LOCAL_ATTN_SIZE" --sink_size "$SINK_SIZE" --base_seed 42)
+              NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun --nproc_per_node="$NPROC" generate.py \
+                "${ARGS[@]}" --save_file "$SAVE" --save_latents_path "$LATENTS" 2>&1 | tee "$OUT/generate.txt"
+              NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun --nproc_per_node="$NPROC" decode_latents_width_sharded.py \
+                --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$LATENTS" --save_file "$SAVE" \
+                --timing --warmup 2>&1 | tee "$OUT/decode.txt"
+
+              GEN=$(grep -oE "\[BENCH\] GEN time: [0-9.]+" "$OUT/generate.txt" | grep -oE "[0-9.]+$")
+              VAE=$(grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" "$OUT/decode.txt" | grep -oE "[0-9.]+$")
+              python3 -c "g,v,n=$GEN,$VAE,$FRAME_NUM; print(f'GEN {g:.0f} ms  VAE {v:.0f} ms  steady-state {n/((g+v)/1000):.2f} fps')"
+
+              python3 tests/smoke_test_video.py --skip-run --save-file "$SAVE" \
+                --expected-frame-num "$FRAME_NUM" --expected-fps 16 --size "$SIZE"
+              sleep "$HOLD_SECONDS"
+          resources:
+            claims:
+              - name: neuroncores
+            requests:
+              ephemeral-storage: 600Gi
+            limits:
+              ephemeral-storage: 600Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+            - name: BRANCH
+              value: "main"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HOLD_SECONDS
+              value: "0"
+            - name: NPROC
+              value: "32"
+            - name: LNC
+              value: "2"
+            - name: CP
+              value: "4"
+            - name: TP
+              value: "8"
+            - name: SIZE
+              value: "480*832"
+            - name: FRAME_NUM
+              value: "81"
+            - name: CHUNK_SIZE
+              value: "3"
+            - name: LOCAL_ATTN_SIZE
+              value: "12"
+            - name: SINK_SIZE
+              value: "1"
+            - name: DENOISE_STEPS
+              value: "4"
+            - name: PROMPT
+              value: "gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
+            - name: LINGBOT_BENCH_RUNS
+              value: "2"
+            - name: LINGBOT_CHUNKED_KV
+              value: "1"
+            - name: LINGBOT_COMPILE_DIT
+              value: "1"
+            - name: COMPILE_SCOPE
+              value: "blocks"
+            - name: LINGBOT_CP_FLAT_SEQ
+              value: "1"
+            - name: ATTENTION_BACKEND
+              value: "const_max_ag"
+            - name: NEURON_CC_FLAGS
+              value: "--internal-backend-options=--disable-cb-before-global-cc"
+            - name: NKI_COMPILER_FRONTEND
+              value: "tracer"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "1"
+            - name: TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION
+              value: "1"
+            - name: NEURON_RT_EXEC_TIMEOUT
+              value: "600"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_LOAD_CONCURRENCY
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+                  optional: true
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

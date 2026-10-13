@@ -1,0 +1,41 @@
+# lingbot-world-v2 dependencies — AWS Trainium (TorchNeuron native)
+# Torch, NKI, and the Neuron compiler are pre-installed in the Docker image.
+# No pip install needed for torch — just docker run.
+#
+# torchvision is intentionally NOT listed here — it cannot be installed as
+# a normal pip dependency in this environment. See install_neuron.sh
+# for how it's actually built and why.
+#
+# Derived from the upstream requirements.txt with two deliberate removals,
+# one addition, and one substitution:
+#
+#   - numpy: upstream pins numpy>=1.23.5,<2, which conflicts with
+#     neuronx-cc/torch-neuronx's declared numpy>=2 requirement. Omitted
+#     entirely rather than re-pinned — the container's existing numpy
+#     (installed for the Neuron toolchain) is left alone.
+#   - flash_attn: CUDA-only, unused (attention is routed through
+#     F.scaled_dot_product_attention on Neuron — see
+#     wan/modules/attention.py), and fails to build in
+#     this container regardless (its setup.py needs torch importable
+#     during isolated build, which it isn't). torchaudio is likewise
+#     dropped — nothing in the ported code imports it.
+#   - pymediainfo: not in upstream. Needed by
+#     scripts/monitoring/monitor_inference.py's video-metadata report
+#     (codec/fps/resolution/bitrate).
+#   - opencv-python-headless instead of upstream's opencv-python: the
+#     regular package needs libGL.so.1, which this container doesn't have
+#     (no GUI stack). headless provides the same cv2 API without that
+#     dependency — nothing here uses imshow/GUI features.
+opencv-python-headless>=4.9.0.80
+diffusers>=0.31.0
+transformers>=4.49.0,<=4.51.3
+tokenizers>=0.20.3
+accelerate>=1.1.1
+tqdm
+imageio[ffmpeg]
+easydict
+einops
+ftfy
+imageio-ffmpeg
+scipy
+pymediainfo

@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..distributed import tensor_parallel as tp
+from ..utils.neuron_compile import compile
 from .tokenizers import HuggingfaceTokenizer
 
 __all__ = [
@@ -12,7 +14,32 @@ __all__ = [
     'T5Encoder',
     'T5Decoder',
     'T5EncoderModel',
+    'init_t5_parallel_group',
+    'destroy_t5_parallel_group',
 ]
+
+_TP_GROUP = 't5-tp'
+
+
+def init_t5_parallel_group(tp_degree):
+    """Register the process group T5's Linear layers shard across. 
+    Call before building any T5 module and before loading the checkpoint - 
+    both read the TP degree from the registry to size themselves. 
+    """
+    tp.init_tp_group(_TP_GROUP, tp_degree)
+
+
+def destroy_t5_parallel_group():
+    if tp.is_registered(_TP_GROUP):
+        tp.destroy_group(_TP_GROUP)
+
+
+def _tp_degree():
+    return tp.tp_degree(_TP_GROUP)
+
+
+def _tp_rank():
+    return tp.tp_rank(_TP_GROUP)
 
 
 def fp16_clamp(x):
@@ -47,7 +74,7 @@ class GELU(nn.Module):
         return 0.5 * x * (1.0 + torch.tanh(
             math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-
+@compile
 class T5LayerNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-6):
@@ -69,16 +96,23 @@ class T5Attention(nn.Module):
     def __init__(self, dim, dim_attn, num_heads, dropout=0.1):
         assert dim_attn % num_heads == 0
         super(T5Attention, self).__init__()
+        tp_size = _tp_degree()
+        assert dim_attn % tp_size == 0 and num_heads % tp_size == 0
         self.dim = dim
         self.dim_attn = dim_attn
         self.num_heads = num_heads
         self.head_dim = dim_attn // num_heads
+        self.tp_size = tp_size
+        self.heads_per_shard = num_heads // tp_size
+        shard_dim = dim_attn // tp_size
 
-        # layers
-        self.q = nn.Linear(dim, dim_attn, bias=False)
-        self.k = nn.Linear(dim, dim_attn, bias=False)
-        self.v = nn.Linear(dim, dim_attn, bias=False)
-        self.o = nn.Linear(dim_attn, dim, bias=False)
+        # layers — q/k/v column-parallel, o row-parallel across the
+        # "t5-tp" group (see wan/distributed/tensor_parallel.py); each
+        # rank owns heads_per_shard whole attention heads.
+        self.q = nn.Linear(dim, shard_dim, bias=False)
+        self.k = nn.Linear(dim, shard_dim, bias=False)
+        self.v = nn.Linear(dim, shard_dim, bias=False)
+        self.o = nn.Linear(shard_dim, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, context=None, mask=None, pos_bias=None):
@@ -89,7 +123,7 @@ class T5Attention(nn.Module):
         """
         # check inputs
         context = x if context is None else context
-        b, n, c = x.size(0), self.num_heads, self.head_dim
+        b, n, c = x.size(0), self.heads_per_shard, self.head_dim
 
         # compute query, key, value
         q = self.q(x).view(b, -1, n, c)
@@ -114,6 +148,8 @@ class T5Attention(nn.Module):
         # output
         x = x.reshape(b, -1, n * c)
         x = self.o(x)
+        if self.tp_size > 1:
+            x = tp.all_reduce(x, _TP_GROUP)
         x = self.dropout(x)
         return x
 
@@ -122,23 +158,30 @@ class T5FeedForward(nn.Module):
 
     def __init__(self, dim, dim_ffn, dropout=0.1):
         super(T5FeedForward, self).__init__()
+        tp_size = _tp_degree()
+        assert dim_ffn % tp_size == 0
         self.dim = dim
         self.dim_ffn = dim_ffn
+        self.tp_size = tp_size
+        shard_ffn = dim_ffn // tp_size
 
-        # layers
-        self.gate = nn.Sequential(nn.Linear(dim, dim_ffn, bias=False), GELU())
-        self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
-        self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
+        # layers — gate/fc1 column-parallel, fc2 row-parallel across the
+        # "t5-tp" group.
+        self.gate = nn.Sequential(nn.Linear(dim, shard_ffn, bias=False), GELU())
+        self.fc1 = nn.Linear(dim, shard_ffn, bias=False)
+        self.fc2 = nn.Linear(shard_ffn, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x = self.fc1(x) * self.gate(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        if self.tp_size > 1:
+            x = tp.all_reduce(x, _TP_GROUP)
         x = self.dropout(x)
         return x
 
-
+@compile
 class T5SelfAttention(nn.Module):
 
     def __init__(self,
@@ -220,10 +263,14 @@ class T5RelativeEmbedding(nn.Module):
 
     def __init__(self, num_buckets, num_heads, bidirectional, max_dist=128):
         super(T5RelativeEmbedding, self).__init__()
+        tp_size = _tp_degree()
+        assert num_heads % tp_size == 0
         self.num_buckets = num_buckets
         self.num_heads = num_heads
         self.bidirectional = bidirectional
         self.max_dist = max_dist
+        self.tp_size = tp_size
+        self.heads_per_shard = num_heads // tp_size
 
         # layers
         self.embedding = nn.Embedding(num_buckets, num_heads)
@@ -238,6 +285,10 @@ class T5RelativeEmbedding(nn.Module):
         rel_pos_embeds = self.embedding(rel_pos)
         rel_pos_embeds = rel_pos_embeds.permute(2, 0, 1).unsqueeze(
             0)  # [1, N, Lq, Lk]
+        if self.tp_size > 1:
+            rank = _tp_rank()
+            h = self.heads_per_shard
+            rel_pos_embeds = rel_pos_embeds[:, rank * h:(rank + 1) * h]
         return rel_pos_embeds.contiguous()
 
     def _relative_position_bucket(self, rel_pos):
@@ -260,7 +311,6 @@ class T5RelativeEmbedding(nn.Module):
             rel_pos_large, torch.full_like(rel_pos_large, num_buckets - 1))
         rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
         return rel_buckets
-
 
 class T5Encoder(nn.Module):
 
@@ -467,13 +517,83 @@ def umt5_xxl(**kwargs):
     return _t5('umt5-xxl', **cfg)
 
 
+def _shard_attention_sd(full_sd, rank, tp_size):
+    sd = {}
+    for k, v in full_sd.items():
+        if k in ('q.weight', 'k.weight', 'v.weight'):
+            # T5's Linears are all bias=False -- no bias to shard alongside.
+            sd[k], _ = tp.shard_column_parallel(v, None, rank, tp_size)
+        elif k == 'o.weight':
+            sd[k], _ = tp.shard_row_parallel(v, None, rank, tp_size)
+        else:
+            sd[k] = v.clone()
+    return sd
+
+
+def _shard_ffn_sd(full_sd, rank, tp_size):
+    sd = {}
+    for k, v in full_sd.items():
+        if k in ('gate.0.weight', 'fc1.weight'):
+            sd[k], _ = tp.shard_column_parallel(v, None, rank, tp_size)
+        elif k == 'fc2.weight':
+            sd[k], _ = tp.shard_row_parallel(v, None, rank, tp_size)
+        else:
+            sd[k] = v.clone()
+    return sd
+
+
+def _shard_block_sd(full_sd, rank, tp_size):
+    attn_sd = {
+        k[len('attn.'):]: v for k, v in full_sd.items() if k.startswith('attn.')
+    }
+    ffn_sd = {
+        k[len('ffn.'):]: v for k, v in full_sd.items() if k.startswith('ffn.')
+    }
+    sa = _shard_attention_sd(attn_sd, rank, tp_size)
+    sf = _shard_ffn_sd(ffn_sd, rank, tp_size)
+    sd = {}
+    for k, v in full_sd.items():
+        if k.startswith('attn.'):
+            sd[k] = sa[k[len('attn.'):]]
+        elif k.startswith('ffn.'):
+            sd[k] = sf[k[len('ffn.'):]]
+        else:
+            sd[k] = v.clone()
+    return sd
+
+
+def _shard_state_dict_for_tp(full_sd):
+    """Slice a full (unsharded) T5Encoder state dict to this rank's TP
+    shard. Blocks are matched by their `blocks.{i}.` prefix; everything
+    else (token_embedding, final norm) is replicated as-is. Assumes an
+    encoder-only state dict layout — the layout T5EncoderModel's
+    checkpoint actually has — not a full T5Model/T5Decoder checkpoint.
+    """
+    tp_size = _tp_degree()
+    if tp_size == 1:
+        return dict(full_sd)
+    rank = _tp_rank()
+    blocks_by_idx, passthrough = {}, {}
+    for k, v in full_sd.items():
+        if k.startswith('blocks.'):
+            idx_str, subkey = k[len('blocks.'):].split('.', 1)
+            blocks_by_idx.setdefault(int(idx_str), {})[subkey] = v
+        else:
+            passthrough[k] = v
+    sd = {k: v.clone() for k, v in passthrough.items()}
+    for idx, block_sd in blocks_by_idx.items():
+        for subkey, v in _shard_block_sd(block_sd, rank, tp_size).items():
+            sd[f'blocks.{idx}.{subkey}'] = v
+    return sd
+
+
 class T5EncoderModel:
 
     def __init__(
         self,
         text_len,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device='cpu',
         checkpoint_path=None,
         tokenizer_path=None,
         shard_fn=None,
@@ -491,7 +611,14 @@ class T5EncoderModel:
             dtype=dtype,
             device=device).eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
+        # mmap so each rank only pages in and clones its own TP shard,
+        # instead of every rank materializing the full checkpoint in host
+        # RAM before slicing it down (this is what turns an N-rank run into
+        # an N-way host OOM on a large checkpoint).
+        full_sd = torch.load(
+            checkpoint_path, map_location='cpu', weights_only=True, mmap=True)
+        full_sd = _shard_state_dict_for_tp(full_sd)
+        model.load_state_dict(full_sd)
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)

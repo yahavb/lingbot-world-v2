@@ -619,8 +619,8 @@ class Wan2_1_VAE:
     def __init__(self,
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
-                 dtype=torch.float,
-                 device="cuda"):
+                 dtype=torch.bfloat16,
+                 device="cpu"):
         self.dtype = dtype
         self.device = device
 

@@ -12,7 +12,7 @@ from .util import all_to_all, gather_forward, get_rank, get_world_size
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
     pad_size = target_len - seq_len
-    padding_tensor = torch.ones(
+    padding_tensor = torch.zeros(
         pad_size,
         s1,
         s2,
@@ -22,77 +22,123 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('neuron', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
-    """
-    x:          [B, L, N, C].
-    grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
-    """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
+    
+    n, c = x.size(2), x.size(3) // 2  # num_heads, half_head_dim
+    
+    # Split frequency dims: (c - 2*(c//3), c//3, c//3) for (frame, height, width)
+    s0 = c - 2 * (c // 3)
+    s1 = c // 3
+    
+    # Move freqs to CPU for grid construction (Neuron can't handle cat of expanded views)
+    freqs_cpu = freqs.cpu().float()
+    freqs_split = freqs_cpu.split([s0, s1, s1], dim=1)
+    
+    device = x.device
+    
+    # Loop over batch (usually B=1)
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        sp_size = get_world_size()
-        sp_rank = get_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-
-        # append to collection
+        
+        # Build angle grids on CPU: [seq_len, 1, c]
+        angles_grid = torch.cat([
+            freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, c)
+        
+        # Compute cos/sin on CPU then transfer to device
+        cos_grid = torch.cos(angles_grid).to(device)
+        sin_grid = torch.sin(angles_grid).to(device)
+        
+        # Extract x for this sample using slice (not select — unsupported on Neuron)
+        # x[i:i+1, :seq_len] gives [1, seq_len, N, D]
+        x_seq = x[i:i+1, :seq_len].to(torch.float32)  # [1, seq_len, N, D]
+        
+        # Reshape to pairs: [1, seq_len, N, c, 2]
+        x_pairs = x_seq.reshape(1, seq_len, n, c, 2)
+        # Use slice 0:1/1:2 instead of [..., 0] select (unsupported on Neuron)
+        x_re = x_pairs[:, :, :, :, 0:1].reshape(1, seq_len, n, c)
+        x_im = x_pairs[:, :, :, :, 1:2].reshape(1, seq_len, n, c)
+        
+        # Apply rotation: (x_re + i*x_im) * (cos + i*sin)
+        out_re = x_re * cos_grid - x_im * sin_grid
+        out_im = x_re * sin_grid + x_im * cos_grid
+        
+        # Interleave with unsqueeze+cat (not stack — unsupported on Neuron)
+        x_out = torch.cat([out_re.unsqueeze(-1), out_im.unsqueeze(-1)], dim=-1)
+        x_out = x_out.reshape(1, seq_len, n, c * 2)  # [1, seq_len, N, D]
+        
+        # Concat with remaining tokens beyond seq_len
+        x_rest = x[i:i+1, seq_len:].to(torch.float32)
+        x_i = torch.cat([x_out, x_rest], dim=1)  # [1, L, N, D]
         output.append(x_i)
-    return torch.stack(output).float()
+    
+    # Cat along batch dim (not stack)
+    result = torch.cat(output, dim=0)  # [B, L, N, D]
+    return result.float()
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('neuron', enabled=False)
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
+    n, c = x.size(2), x.size(3) // 2  # num_heads, half_head_dim
+    
+    # Split frequency dims: (c - 2*(c//3), c//3, c//3) for (frame, height, width)
+    s0 = c - 2 * (c // 3)
+    s1 = c // 3
+    
+    # Move freqs to CPU for grid construction (Neuron can't handle cat of expanded views)
+    freqs_cpu = freqs.cpu().float()
+    freqs_split = freqs_cpu.split([s0, s1, s1], dim=1)
+    
+    device = x.device
+    
+    # Loop over batch (usually B=1)
     output = []
-
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
+        
+        # Build angle grids on CPU: [seq_len, 1, c]
+        angles_grid = torch.cat([
+            freqs_split[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            #freqs_split[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_split[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_split[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(seq_len, 1, c)
+        
+        # Compute cos/sin on CPU then transfer to device
+        cos_grid = torch.cos(angles_grid).to(device)
+        sin_grid = torch.sin(angles_grid).to(device)
+        
+        # Extract x for this sample using slice (not select — unsupported on Neuron)
+        # x[i:i+1, :seq_len] gives [1, seq_len, N, D]
+        x_seq = x[i:i+1, :seq_len].to(torch.float32)  # [1, seq_len, N, D]
+        
+        # Reshape to pairs: [1, seq_len, N, c, 2]
+        x_pairs = x_seq.reshape(1, seq_len, n, c, 2)
+        # Use slice 0:1/1:2 instead of [..., 0] select (unsupported on Neuron)
+        x_re = x_pairs[:, :, :, :, 0:1].reshape(1, seq_len, n, c)
+        x_im = x_pairs[:, :, :, :, 1:2].reshape(1, seq_len, n, c)
+        
+        # Apply rotation: (x_re + i*x_im) * (cos + i*sin)
+        out_re = x_re * cos_grid - x_im * sin_grid
+        out_im = x_re * sin_grid + x_im * cos_grid
+        
+        # Interleave with unsqueeze+cat (not stack — unsupported on Neuron)
+        x_out = torch.cat([out_re.unsqueeze(-1), out_im.unsqueeze(-1)], dim=-1)
+        x_out = x_out.reshape(1, seq_len, n, c * 2)  # [1, seq_len, N, D]
+        
+        # Concat with remaining tokens beyond seq_len
+        x_rest = x[i:i+1, seq_len:].to(torch.float32)
+        x_i = torch.cat([x_out, x_rest], dim=1)  # [1, L, N, D]
         output.append(x_i)
-    return torch.stack(output).type_as(x)
+    
+    # Cat along batch dim (not stack)
+    result = torch.cat(output, dim=0)  # [B, L, N, D]
+    return result.to(x.dtype)
 
 
 def sp_dit_forward(
@@ -134,7 +180,7 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.amp.autocast('neuron', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
@@ -320,7 +366,7 @@ def sp_dit_forward_causal(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), padded_seq_lens)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.amp.autocast('neuron', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(

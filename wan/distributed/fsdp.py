@@ -41,4 +41,4 @@ def free_model(model):
             _free_storage(m._handle.flat_param.data)
     del model
     gc.collect()
-    torch.cuda.empty_cache()
+    torch.neuron.empty_cache()

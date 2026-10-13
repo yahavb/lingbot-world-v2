@@ -9,6 +9,7 @@ import sys
 import time
 import types
 from contextlib import contextmanager
+from pathlib import Path
 from functools import partial
 
 import numpy as np
@@ -20,8 +21,20 @@ from tqdm import tqdm
 
 from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward_causal, sp_dit_forward_causal
+from .modules.attention import const_max_ag_available
+from .modules.chunked_kv_cache import (
+    allocate_self_kv_chunks,
+    chunk_bytes,
+    num_chunks,
+)
 from .distributed.util import get_world_size
-from .modules.model_fast import WanModelFast
+from .modules.model_fast import (
+    init_dit_mesh,
+    set_seq_parallel_mode,
+    init_dit_parallel_group,
+    init_dit_sp_group,
+    load_tp_wan_model_fast,
+)
 from .modules.model_causal import WanModelCausal
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
@@ -160,10 +173,8 @@ class WanI2VCausal:
         checkpoint_dir,
         device_id=0,
         rank=0,
-        t5_fsdp=False,
         dit_fsdp=False,
         use_sp=False,
-        t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
         pipe_dtype=torch.bfloat16,
@@ -171,6 +182,10 @@ class WanI2VCausal:
         sink_size=0,
         infer_mode="causal_fast",
         assets_dir=None,
+        skip_text_encoder=False,
+        tp_degree=1,
+        sp_size=1,
+        seq_mode="ulysses",
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -190,14 +205,10 @@ class WanI2VCausal:
                 Id of target GPU device
             rank (`int`,  *optional*, defaults to 0):
                 Process rank for distributed training
-            t5_fsdp (`bool`, *optional*, defaults to False):
-                Enable FSDP sharding for T5 model
             dit_fsdp (`bool`, *optional*, defaults to False):
                 Enable FSDP sharding for DiT model
             use_sp (`bool`, *optional*, defaults to False):
                 Enable distribution strategy of sequence parallel.
-            t5_cpu (`bool`, *optional*, defaults to False):
-                Whether to place T5 model on CPU. Only works without t5_fsdp.
             init_on_cpu (`bool`, *optional*, defaults to True):
                 Enable initializing Transformer Model on CPU. Only works without FSDP or USP.
             convert_model_dtype (`bool`, *optional*, defaults to False):
@@ -207,15 +218,21 @@ class WanI2VCausal:
                 Directory that holds shared T5 / VAE / tokenizer files when
                 they are not packaged with ``checkpoint_dir`` (the 1.3B DiT
                 upload). Typically the 14B causal-fast checkpoint directory.
+            skip_text_encoder (`bool`, *optional*, defaults to False):
+                Skip building the T5 text encoder entirely. Set this flag to True when generate()
+                call uses precomputed embeddings from prompt_embeds_path.
+                The text encoder would otherwise be loaded and never used.
+            tp_degree (`int`, *optional*, defaults to 1):
+                Tensor-parallel degree for the causal_fast DiT (model_fast.py
+                only). Must equal world_size when > 1.
         """
         assert infer_mode in ("causal_fast", "causal_pretrain"), \
             f"Unsupported infer_mode: {infer_mode}"
         self.infer_mode = infer_mode
 
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"neuron:{device_id}")
         self.config = config
         self.rank = rank
-        self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
 
         self.num_train_timesteps = config.num_train_timesteps
@@ -224,40 +241,82 @@ class WanI2VCausal:
         self.pipe_dtype = pipe_dtype
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
+        self.tp_degree = tp_degree
+        self.sp_size = sp_size
 
-        if t5_fsdp or dit_fsdp or use_sp:
+        # TP x SP are now composable for the causal_fast DiT: they are two
+        # orthogonal axes of one rank mesh (TP shards channels/heads within a
+        # cell, SP shards sequence/cells across it). causal_pretrain (CFG,
+        # WanModelCausal) still asserts against mixing.
+        if self.infer_mode == "causal_pretrain":
+            assert not (tp_degree > 1 and use_sp), (
+                "tensor-parallel + sequence-parallel mix unsupported in causal_pretrain.")
+        # "cp": token-axis, stays token-sharded through attention, so heads are
+        # divided by tp_degree alone. "ulysses": all_to_all makes the token
+        # shard a head shard, so heads are divided by sp_size*tp_degree.
+        self.seq_mode = seq_mode
+        self.heads_div = tp_degree if seq_mode == "cp" else sp_size * tp_degree
+        if sp_size > 1:
+            assert config.num_heads % self.heads_div == 0, (
+                f"num_heads={config.num_heads} must be divisible by "
+                f"{self.heads_div} (heads are the head-parallel resource; "
+                f"seq_mode={seq_mode}).")
+        if use_sp or sp_size > 1:
+            init_dit_mesh(sp_size, tp_degree)
+            set_seq_parallel_mode(seq_mode)
+        elif tp_degree > 1:
+            init_dit_parallel_group(tp_degree)
+
+        if dit_fsdp or use_sp:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=_resolve_asset_path(
-                config.t5_checkpoint, checkpoint_dir, assets_dir),
-            tokenizer_path=_resolve_asset_path(
-                config.t5_tokenizer, checkpoint_dir, assets_dir),
-            shard_fn=shard_fn if t5_fsdp else None,
-        )
+
+        if skip_text_encoder:
+            logging.info(
+                "Skipping text encoder - not loading the T5 checkpoint "
+                "(prompt_embeds_path will be used instead).")
+            self.text_encoder = None
+        else:
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=_resolve_asset_path(
+                    config.t5_checkpoint, checkpoint_dir, assets_dir),
+                tokenizer_path=_resolve_asset_path(
+                    config.t5_tokenizer, checkpoint_dir, assets_dir),
+                shard_fn=shard_fn if t5_fsdp else None,
+            )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
         self.vae = Wan2_1_VAE(
             vae_pth=_resolve_asset_path(
                 config.vae_checkpoint, checkpoint_dir, assets_dir),
-            device=self.device)
+            device=self.device, dtype=torch.bfloat16)
 
         if self.infer_mode == "causal_fast":
-            self.model = load_dit_model(
-                WanModelFast,
+            log_prefix = (f"TP={tp_degree}-sharded" if tp_degree > 1
+                          else "unsharded (tp_degree=1)")
+            logging.info(f"Creating {log_prefix} WanModelFast from {checkpoint_dir}")
+            dit_pth = os.path.join(
+                checkpoint_dir, f"{config.fast_checkpoint}-bf16.pth")
+            if not os.path.exists(dit_pth):
+                logging.warning(
+                    "%s not found; falling back to per-rank from_pretrained, "
+                    "which needs ~54 GB host RAM per rank. Build it once with "
+                    "scripts/inference/convert_dit_to_pth.py.", dit_pth)
+                dit_pth = None
+            self.model = load_tp_wan_model_fast(
                 checkpoint_dir,
-                config.fast_checkpoint,
-                config,
-                torch.bfloat16,
-                extra=dict(
-                    local_attn_size=self.local_attn_size,
-                    sink_size=self.sink_size),
-            )
+                subfolder=config.fast_checkpoint,
+                tp_degree=tp_degree,
+                dtype=torch.bfloat16,
+                local_attn_size=self.local_attn_size,
+                sink_size=self.sink_size,
+                device=self.device,
+                pth_path=dit_pth)
         else:
             self.model = load_dit_model(
                 WanModelCausal,
@@ -272,7 +331,7 @@ class WanI2VCausal:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype).to(self.device)
+            convert_model_dtype=convert_model_dtype)
 
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.num_train_timesteps,
@@ -280,9 +339,9 @@ class WanI2VCausal:
             use_dynamic_shifting=False)
 
         if use_sp:
-            self.sp_size = get_world_size()
+            self.local_heads_div = self.sp_size * self.tp_degree
         else:
-            self.sp_size = 1
+            self.local_heads_div = self.tp_degree
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -306,6 +365,7 @@ class WanI2VCausal:
         self,
         img,
         max_area: int = 480 * 832,
+        target_hw=None,
         frame_num: int = 81,
         chunk_size: int = 3,
         text_seq_len: int = 512,
@@ -351,19 +411,25 @@ class WanI2VCausal:
         F = frame_num
         h, w = (img.shape[1], img.shape[2]) if hasattr(img, 'shape') else (img.size[1], img.size[0])
         aspect_ratio = h / w
-        lat_h = round(
-            np.sqrt(max_area * aspect_ratio) // cfg.vae_stride[1] //
-            cfg.patch_size[1] * cfg.patch_size[1])
-        lat_w = round(
-            np.sqrt(max_area / aspect_ratio) // cfg.vae_stride[2] //
-            cfg.patch_size[2] * cfg.patch_size[2])
+        # Same exact-grid override as generation. If prewarm computed a different grid
+        # it would compile the wrong shapes and generation would recompile anyway.
+        if target_hw is not None:
+            lat_h = target_hw[0] // cfg.vae_stride[1]
+            lat_w = target_hw[1] // cfg.vae_stride[2]
+        else:
+            lat_h = round(
+                np.sqrt(max_area * aspect_ratio) // cfg.vae_stride[1] //
+                cfg.patch_size[1] * cfg.patch_size[1])
+            lat_w = round(
+                np.sqrt(max_area / aspect_ratio) // cfg.vae_stride[2] //
+                cfg.patch_size[2] * cfg.patch_size[2])
         lat_f = (F - 1) // cfg.vae_stride[0] + 1
         lat_f = int(lat_f - (lat_f % chunk_size))
 
         frame_seqlen = (lat_h * lat_w) // (cfg.patch_size[1] * cfg.patch_size[2])
         max_seq_len = chunk_size * frame_seqlen
         head_dim = cfg.dim // cfg.num_heads
-        local_num_heads = cfg.num_heads // self.sp_size
+        local_num_heads = cfg.num_heads // self.heads_div
 
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
@@ -378,14 +444,12 @@ class WanI2VCausal:
         # T5 (umt5-xxl) hidden size; cross-attn projects t5_hidden → cfg.dim.
         t5_hidden = 4096
 
-        warmup_self_kv = self._initialize_self_kv_cache(
-            num_layers=cfg.num_layers,
-            shape=[1, kv_size, local_num_heads, head_dim],
-            dtype=transformer_dtype,
-            device=self.device)
+        warmup_self_kv = self._make_self_kv(
+            cfg.num_layers, 1, kv_size, local_num_heads, head_dim,
+            chunk_size, frame_seqlen, transformer_dtype, self.device)
         warmup_cross_kv = self._initialize_crossattn_cache(
             num_layers=cfg.num_layers,
-            shape=[1, text_seq_len, cfg.num_heads, head_dim],
+            shape=[1, text_seq_len, local_num_heads, head_dim],
             dtype=transformer_dtype,
             device=self.device)
 
@@ -412,11 +476,11 @@ class WanI2VCausal:
         no_sync_model = getattr(self.model, 'no_sync', _noop_no_sync)
 
         if dist.is_initialized():
-            torch.cuda.synchronize()
+            torch.neuron.synchronize()
             dist.barrier()
         t0 = time.perf_counter()
 
-        with torch.amp.autocast('cuda', dtype=self.param_dtype), \
+        with torch.amp.autocast('neuron', dtype=self.param_dtype), \
              torch.no_grad(), \
              no_sync_model():
             _ = self.model(
@@ -428,13 +492,51 @@ class WanI2VCausal:
                 dit_cond_dict={"c2ws_plucker_emb": (dummy_c2ws,)},
                 kv_cache=warmup_self_kv,
                 crossattn_cache=warmup_cross_kv,
+                cross_attn_first_call=True,
                 current_start=0,
                 max_attention_size=kv_size,
                 frame_seqlen=frame_seqlen,
             )
 
+            # WARM EVERY CHUNK POSITION, not just position 0.
+            #
+            # model_fast passes the KV write window as PLAIN INTS so the slice is
+            # a compile-time constant (that is what let a whole block compile at
+            # fullgraph=True). The consequence is one graph PER chunk position, and
+            # if they are compiled lazily inside the denoise loop the compile time
+            # lands in the measured region: the DiT-only replay always feeds chunk
+            # 0 and got 108.0 ms/forward, while the real 21-chunk run measured
+            # GEN 1119.9 s against 705.4 s eager -- ~21 compilations at roughly the
+            # replay's 102.3 s first call accounts for nearly all of the gap.
+            #
+            # the reference implementation builds its destination-specialised graphs up front for the
+            # same reason (reference setup.py:231), "for destination in
+            # range(kv_num_chunks)"). This does the equivalent: touch each
+            # current_start once here, outside the timed window.
+            if True:
+                _n_chunks = max(1, lat_f // max(1, chunk_size))
+                for _c in range(1, _n_chunks):
+                    self.model(
+                        x=[dummy_latent],
+                        t=dummy_t,
+                        context=[dummy_context],
+                        seq_len=max_seq_len,
+                        y=[dummy_y],
+                        dit_cond_dict={"c2ws_plucker_emb": (dummy_c2ws,)},
+                        kv_cache=warmup_self_kv,
+                        crossattn_cache=warmup_cross_kv,
+                        cross_attn_first_call=False,
+                        current_start=_c * chunk_size * frame_seqlen,
+                        max_attention_size=kv_size,
+                        frame_seqlen=frame_seqlen,
+                    )
+                if self.rank == 0:
+                    logging.info(
+                        "prewarm: touched %d chunk positions so their graphs "
+                        "compile here, not inside the denoise loop", _n_chunks)
+
         if dist.is_initialized():
-            torch.cuda.synchronize()
+            torch.neuron.synchronize()
             dist.barrier()
 
         if (not dist.is_initialized()) or dist.get_rank() == 0:
@@ -443,7 +545,7 @@ class WanI2VCausal:
 
         del (warmup_self_kv, warmup_cross_kv, dummy_latent, dummy_y,
              dummy_c2ws, dummy_context, dummy_t)
-        torch.cuda.empty_cache()
+        torch.neuron.empty_cache()
         self._warmed = True
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
@@ -485,8 +587,7 @@ class WanI2VCausal:
         else:
             if convert_model_dtype:
                 model.to(self.param_dtype)
-            if not self.init_on_cpu:
-                model.to(self.device)
+            model._onload_device = self.device
 
         return model
 
@@ -519,13 +620,19 @@ class WanI2VCausal:
                  action_path,
                  chunk_size=3,
                  max_area=480 * 832,
+                 target_hw=None,
+                 denoise_steps=None,
                  frame_num=81,
                  timesteps_index=[0, 250, 500, 750],
                  shift=5.0,
                  seed=-1,
                  offload_model=True,
                  max_sequence_length=512,
-                 max_attention_size=None,):
+                 max_attention_size=None,
+                 save_latents_path=None,
+                 prompt_embeds_path=None,
+                 prompt_embeds=None,
+                 return_latents=False,):
         r"""
         Generates video frames from input image and text prompt.
 
@@ -533,6 +640,21 @@ class WanI2VCausal:
         `self.infer_mode`:
             - "causal_fast": distilled few-step sampling (`_generate_causal_fast`)
             - "causal_pretrain": 40-step CFG sampling (`_generate_causal_pretrain`)
+
+        Both only supported in "causal_fast" mode (the single-torchrun e2e
+        path's DiT->VAE handoff -- see generate.py):
+        save_latents_path (`str`, *optional*): if set, skip VAE decode and
+            dump the pre-decode latent to this path instead (for the
+            width-sharded decode stage, see decode_latents_width_sharded.py).
+        return_latents (`bool`, *optional*): skip VAE decode and return the
+            pre-decode latent tensor directly instead of a video.
+
+        Also "causal_fast"-only, in-process T5-TP handoff (see generate.py):
+        prompt_embeds_path (`str`, *optional*): path to a prompt_embeds.pt
+            saved by encode_prompt_sharded.py. Skips the inline text encoder,
+            loads precomputed embeddings from disk instead.
+        prompt_embeds (*optional*): precomputed embeds passed directly
+            in-memory instead of via prompt_embeds_path.
         """
         gen_fn = (self._generate_causal_fast
                   if self.infer_mode == "causal_fast"
@@ -543,13 +665,19 @@ class WanI2VCausal:
             action_path,
             chunk_size=chunk_size,
             max_area=max_area,
+            target_hw=target_hw,
+            denoise_steps=denoise_steps,
             frame_num=frame_num,
             timesteps_index=timesteps_index,
             shift=shift,
             seed=seed,
             offload_model=offload_model,
             max_sequence_length=max_sequence_length,
-            max_attention_size=max_attention_size)
+            max_attention_size=max_attention_size,
+            save_latents_path=save_latents_path,
+            prompt_embeds_path=prompt_embeds_path,
+            prompt_embeds=prompt_embeds,
+            return_latents=return_latents)
 
     def _generate_causal_fast(self,
                               input_prompt,
@@ -557,13 +685,19 @@ class WanI2VCausal:
                               action_path,
                               chunk_size=3,
                               max_area=480 * 832,
+                              target_hw=None,
                               frame_num=81,
                               timesteps_index=[0, 179, 358, 679],
+                              denoise_steps=None,
                               shift=5.0,
                               seed=-1,
                               offload_model=True,
                               max_sequence_length=512,
-                              max_attention_size=None,):
+                              max_attention_size=None,
+                              save_latents_path=None,
+                              prompt_embeds_path=None,
+                              prompt_embeds=None,
+                              return_latents=False,):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -617,12 +751,23 @@ class WanI2VCausal:
         F = frame_num
         h, w = img.shape[1:]
         aspect_ratio = h / w
-        lat_h = round(
-            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
-            self.patch_size[1] * self.patch_size[1])
-        lat_w = round(
-            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
-            self.patch_size[2] * self.patch_size[2])
+        # An EXACT grid wins over the area fit. max_area cannot express a required
+        # latent shape -- sqrt(area * aspect) follows the image -- and const-max AG
+        # attention needs frame_seqlen to be a whole number of 128-token tiles. See
+        # EXACT_GRID_SIZES in wan/configs.
+        if target_hw is not None:
+            lat_h = target_hw[0] // self.vae_stride[1]
+            lat_w = target_hw[1] // self.vae_stride[2]
+            assert lat_h % self.patch_size[1] == 0 and lat_w % self.patch_size[2] == 0, (
+                f"exact grid {target_hw} gives lat {lat_h}x{lat_w}, not divisible by "
+                f"patch_size {self.patch_size[1:]}")
+        else:
+            lat_h = round(
+                np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+                self.patch_size[1] * self.patch_size[1])
+            lat_w = round(
+                np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+                self.patch_size[2] * self.patch_size[2])
         h = lat_h * self.vae_stride[1]
         w = lat_w * self.vae_stride[2]
         lat_f = (F - 1) // self.vae_stride[0] + 1
@@ -636,8 +781,15 @@ class WanI2VCausal:
         self._cross_attn_initialized = False
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator(device='cpu')
         seed_g.manual_seed(seed)
+        # PHASES COVER THE WHOLE FUNCTION, not just the chunk loop. The first six timers
+        # accounted for 19.8 s of a 32.62 s GEN and left 12.8 s outside all of them, with
+        # nothing left in the loop to blame -- because GEN wraps this entire function and
+        # I had only instrumented the loop inside it.
+        self._gen_phase = {"sched": 0.0, "setup": 0.0, "prep": 0.0, "randn": 0.0,
+                           "addnoise": 0.0, "ctx": 0.0, "encode": 0.0, "cat": 0.0}
+        _g0 = time.perf_counter()
         noise = torch.randn(
             16,
             lat_f,
@@ -645,7 +797,7 @@ class WanI2VCausal:
             lat_w,
             dtype=torch.float32,
             generator=seed_g,
-            device=self.device)
+            device='cpu').to(self.device)
 
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
@@ -658,24 +810,57 @@ class WanI2VCausal:
 
         # 2. Prepare timesteps
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
+        # DENOISE STEPS, the reference implementation's "biggest single lever" (the reference benchmark --steps: "Latency
+        # is ~linear in steps"). Their measured 6.53 fps run used STEPS=2 against a
+        # default of 4, which is also our default here.
+        #
+        # Subsample the schedule keeping BOTH ENDPOINTS: timesteps_index[0] is the
+        # highest-noise step and the last is the lowest, and the loop returns x0 from the
+        # final one -- dropping the tail would return a still-noisy latent.
+        if denoise_steps is not None and 0 < denoise_steps < len(timesteps_index):
+            _n = len(timesteps_index)
+            _sel = [round(i * (_n - 1) / (denoise_steps - 1)) for i in range(denoise_steps)] \
+                if denoise_steps > 1 else [_n - 1]
+            timesteps_index = [timesteps_index[i] for i in sorted(set(_sel))]
+            logging.info(f"denoise steps: {len(timesteps_index)} "
+                         f"(timesteps_index={timesteps_index})")
         timesteps = self.scheduler.timesteps[timesteps_index]
 
         # preprocess
         # T5 cache: skip the encoder entirely if we've seen this exact prompt
-        # before in this pipe instance. Bit-identical: cached tensor is the
-        # same object returned by the prior call.
-        cache_key = hashlib.sha256(input_prompt.encode('utf-8')).hexdigest()
-        if cache_key in self._t5_cache:
+        # (or, with precomputed embeds, this exact file) before in this pipe
+        # instance. Bit-identical: cached tensor is the same object returned
+        # by the prior call. Keyed off prompt_embeds_path rather than
+        # input_prompt when set, since input_prompt is never re-encoded on
+        # that path and isn't even required there (see generate()'s
+        # docstring) — generate.py's EXAMPLE_PROMPT fallback means it may not
+        # be the text actually encoded, so it can't be trusted as a cache key.
+        cache_key = hashlib.sha256(
+            (prompt_embeds_path or input_prompt).encode('utf-8')).hexdigest()
+        if prompt_embeds is not None:
+            context = [t.to(self.device) for t in prompt_embeds]
+        elif cache_key in self._t5_cache:
             context = self._t5_cache[cache_key]
+        elif prompt_embeds_path is not None:
+            # Stage 2 of the two-stage T5-TP pipeline (see generate()'s
+            # docstring): load Stage 1's precomputed embeds instead of
+            # running the (inline, single-process, unsharded) text encoder
+            # at all.
+            _embeds = torch.load(
+                prompt_embeds_path, map_location='cpu', weights_only=False)
+            context = [t.to(self.device) for t in _embeds['prompt_embeds']]
+            logging.info(
+                f"Using precomputed prompt embeds {tuple(context[0].shape)} "
+                f"from {prompt_embeds_path}; text encoder skipped.")
+            self._t5_cache[cache_key] = context
         else:
-            if not self.t5_cpu:
-                self.text_encoder.model.to(self.device)
-                context = self.text_encoder([input_prompt], self.device)
-                if offload_model:
-                    self.text_encoder.model.cpu()
-            else:
-                context = self.text_encoder([input_prompt], torch.device('cpu'))
-                context = [t.to(self.device) for t in context]
+            _t5_t0 = time.perf_counter()
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+            logging.info(
+                f"T5 encode (device): {(time.perf_counter() - _t5_t0) * 1000:.0f} ms")
             self._t5_cache[cache_key] = context
 
         Ks = torch.from_numpy(np.load(os.path.join(action_path, "intrinsics.npy"))).float()
@@ -726,22 +911,46 @@ class WanI2VCausal:
             wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
             c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
 
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0]
-        y = torch.concat([msk, y])
+        torch.neuron.synchronize()
+        self._gen_phase["ctx"] += time.perf_counter() - _g0
+        _e0 = time.perf_counter()
+        # CACHED. Measured at 12.2 s -- 36% of GEN and 2.6x the whole VAE decode -- and
+        # it is the same computation every time: one conditioning image at a fixed
+        # (F, h, w) always yields the same y.
+        #
+        # Two reasons it costs so much, neither of which caching fixes for a first
+        # generation:
+        #   1. It encodes F frames, and F-1 of them are torch.zeros. At frame_num=81
+        #      that is 80 zero frames, so 80/81 of the encoder work is encoding nothing.
+        #   2. The ENCODER is not width-sharded. shard_vae_decoder_width is only ever
+        #      applied to vae.model.decoder, so this runs at single-core width and
+        #      redundantly on all 32 ranks.
+        _ek = (int(img.shape[1]), int(img.shape[2]), int(F), int(h), int(w),
+               hash(img.detach().cpu().numpy().tobytes()))
+        _ec = getattr(self, "_encode_cache", None)
+        if _ec is not None and _ec[0] == _ek:
+            y = _ec[1].clone()
+        else:
+            y = self.vae.encode([
+                torch.concat([
+                    torch.nn.functional.interpolate(
+                        img[None].cpu(), size=(h, w), mode='bicubic').transpose(
+                            0, 1),
+                    torch.zeros(3, F - 1, h, w)
+                ],
+                             dim=1).to(self.device)
+            ])[0]
+            y = torch.concat([msk, y])
+            self._encode_cache = (_ek, y.clone())
+        torch.neuron.synchronize()
+        self._gen_phase["encode"] += time.perf_counter() - _e0
 
         @contextmanager
         def noop_no_sync():
             yield
 
         no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
+
 
         # Initialize KV cache to all zeros
         model_args = self.model.config
@@ -752,31 +961,46 @@ class WanI2VCausal:
         else:
             kv_size = frame_seqlen * lat_f
         head_dim = model_args.dim // model_args.num_heads
-        local_num_heads = model_args.num_heads // self.sp_size
-        self_kv_shape = [batch_size, kv_size, local_num_heads, head_dim]
-        self_kv_cache = self._initialize_self_kv_cache(num_layers=model_args.num_layers,
-                                                       shape=self_kv_shape,
-                                                       dtype=transformer_dtype,
-                                                       device=self.device)
-        cross_kv_shape = [batch_size, max_sequence_length, model_args.num_heads, head_dim]
+        # Self-attention: after the Ulysses all_to_all, each rank holds
+        # num_heads/(sp*tp) local heads.
+        local_num_heads = model_args.num_heads // self.heads_div
+        self_kv_cache = self._make_self_kv(
+            model_args.num_layers, batch_size, kv_size, local_num_heads, head_dim,
+            chunk_size, frame_seqlen, transformer_dtype, self.device)
+        # Cross-attention is TP-only (context, no Ulysses all_to_all), so its
+        # cache holds num_heads/tp heads, NOT divided by sp_size.
+        cross_num_heads = model_args.num_heads // self.tp_degree
+        cross_kv_shape = [batch_size, max_sequence_length, cross_num_heads, head_dim]
         cross_kv_cache = self._initialize_crossattn_cache(num_layers=model_args.num_layers,
                                                           shape=cross_kv_shape,
                                                           dtype=transformer_dtype,
                                                           device=self.device)
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast('neuron', dtype=self.param_dtype),
                 torch.no_grad(),
                 no_sync_model(),
         ):
             # sample videos
             latent = noise
+            self._dit_fwd_ms = []
+            self._dit_fwd_tag = []
+            # WHERE THE NON-DiT TIME GOES.
+            #
+            # GEN is 32.4 s warm and the DiT forwards are 18.8 s of it, so 13.6 s -- 2.8x
+            # the entire VAE -- is spent somewhere in this loop and nothing has measured
+            # it. Every phase below is synced on both sides: torch.neuron dispatch is
+            # async, and an unsynced timer reports host issue time, which is the mistake
+            # the DiT timer made first time round (26.9 ms median against an 82 s max).
+
             latents_chunk = latent.split(chunk_size, dim=1) # [c, f, h, w]
             condition_chunk = y.split(chunk_size, dim=1)
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
             for chunk_id in tqdm(range(num_inference_chunk)):
+                torch.neuron.synchronize()
+                _c0 = time.perf_counter()
                 current_latent = latents_chunk[chunk_id]
                 current_condition = condition_chunk[chunk_id]
                 current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
@@ -798,33 +1022,87 @@ class WanI2VCausal:
                 }
 
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    torch.neuron.empty_cache()
 
+                torch.neuron.synchronize()
+                self._gen_phase["setup"] += time.perf_counter() - _c0
                 for timestep_idx in range(len(timesteps)):
+                    torch.neuron.synchronize()
+                    _p0 = time.perf_counter()
                     latent_model_input = [current_latent.to(self.device)]
                     current_timestep = [timesteps[timestep_idx]]
 
                     timestep = torch.stack(current_timestep).to(self.device)
+                    torch.neuron.synchronize()
+                    self._gen_phase["prep"] += time.perf_counter() - _p0
 
+                    # PER-FORWARD DiT TIME, MEASURED IN THE REAL LOOP.
+                    #
+                    # SYNC BEFORE AND AFTER. The first version of this had neither, on
+                    # the claim that "the next host-side read forces the sync anyway".
+                    # That was wrong: torch.neuron dispatch is async, so it reported
+                    # median=26.9 ms -- how fast the host ISSUED the call -- while the
+                    # synced DiT-only harness measured 184.3 ms of device time for the
+                    # same forward. The total was still real (async work backs up and
+                    # eventually blocks), which is why it read 336.2 s with a 26.9 ms
+                    # median and an 82.4 s max: a few calls absorbed everyone else's
+                    # queued work. Unsynced per-call numbers are meaningless here.
+                    #
+                    # The only DiT-forward numbers on record came from
+                    # profile_dit_from_captured.py, which replays ONE captured chunk-0
+                    # input at FRAME_NUM=21, chunk_size=4 and local_attn_size=-1 -- a
+                    # different frame count, a different token count per forward (6032
+                    # vs 1508) and a different cache design from anything generation
+                    # runs. Comparing them to GEN was invalid, and "[BENCH] DiT time"
+                    # is no help either: it is just LOAD + GEN.
+                    #
+                    # This is the honest number. perf_counter around the call includes
+                    # the device sync that the next host-side read forces anyway, so it
+                    # attributes queueing to the forward rather than hiding it.
+                    torch.neuron.synchronize()
+                    _f0 = time.perf_counter()
                     noise_pred = self.model(
                         x=latent_model_input, t=timestep,
                         cross_attn_first_call=not self._cross_attn_initialized,
                         **kwargs)[0]
+                    torch.neuron.synchronize()
+                    self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
+                    self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}")
                     self._cross_attn_initialized = True
 
                     if offload_model:
-                        torch.cuda.empty_cache()
+                        torch.neuron.empty_cache()
 
+                    torch.neuron.synchronize()
+                    _s0 = time.perf_counter()
                     x0 = self._convert_flow_pred_to_x0(
                         flow_pred=noise_pred,
                         xt=current_latent,
                         timestep=current_timestep[0],
                         scheduler=self.scheduler,
                     )
+                    torch.neuron.synchronize()
+                    self._gen_phase["sched"] += time.perf_counter() - _s0
 
                     if timestep_idx < len(timesteps) - 1:
                         next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
+                        # Split deliberately: the noise is drawn on the CPU and copied to
+                        # device on every step, which is the obvious suspect, but 13.05 s
+                        # over 63 calls is 207 ms each and a 96K-element randn cannot
+                        # cost that. Timing the draw and the scheduler step apart says
+                        # which -- or neither, in which case the time is in the loop
+                        # itself and both suspects are wrong.
+                        torch.neuron.synchronize()
+                        _n0 = time.perf_counter()
+                        _noise = torch.randn(x0.shape, generator=seed_g, device='cpu',
+                                             dtype=x0.dtype).to(x0.device)
+                        torch.neuron.synchronize()
+                        self._gen_phase["randn"] += time.perf_counter() - _n0
+                        _a0 = time.perf_counter()
+                        current_latent = self.scheduler.add_noise(
+                            x0, _noise, next_timestep)
+                        torch.neuron.synchronize()
+                        self._gen_phase["addnoise"] += time.perf_counter() - _a0
                     else:
                         # note return x0
                         break
@@ -834,27 +1112,80 @@ class WanI2VCausal:
                 # Update kv cache
                 context_timestep = [timesteps[-1] * 0.0]
                 timestep = torch.stack(context_timestep).to(self.device)
+                # A FIFTH DiT forward per chunk. len(timesteps) is 4
+                # (timesteps_index=[0, 179, 358, 679]), so the denoise loop above is not
+                # the whole cost -- this cache-commit pass runs the full 40 blocks too.
+                torch.neuron.synchronize()
+                _f0 = time.perf_counter()
                 self.model(x=[x0], t=timestep,
                            cross_attn_first_call=False,
                            **kwargs)
+                torch.neuron.synchronize()
+                self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
+                self._dit_fwd_tag.append(f"c{chunk_id}commit")
 
+            if self._dit_fwd_ms and (not dist.is_initialized() or dist.get_rank() == 0):
+                _m = sorted(self._dit_fwd_ms)
+                _tot = sum(_m) / 1000.0
+                logging.info(
+                    f"[BENCH] DiT forwards: n={len(_m)} total={_tot:.1f} s "
+                    f"median={_m[len(_m) // 2]:.1f} ms min={_m[0]:.1f} max={_m[-1]:.1f} "
+                    f"first={self._dit_fwd_ms[0]:.1f} ms")
+                # WHERE the stalls are. A median of 26.9 ms against an 82.4 s max means
+                # a handful of calls hold nearly all the time, and prewarm was supposed
+                # to have paid for them already. Tagging by chunk/step says which.
+                _top = sorted(zip(self._dit_fwd_ms, self._dit_fwd_tag), reverse=True)[:8]
+                logging.info("[BENCH] DiT slowest: " + ", ".join(
+                    f"{t}={ms / 1000:.1f}s" for ms, t in _top))
+                _big = [ms for ms in self._dit_fwd_ms if ms > 10 * _m[len(_m) // 2]]
+                logging.info(
+                    f"[BENCH] DiT stalls >10x median: {len(_big)} calls, "
+                    f"{sum(_big) / 1000:.1f} s of {_tot:.1f} s total "
+                    f"({100 * sum(_big) / max(_tot * 1000, 1e-9):.0f}%)")
+                _ph = self._gen_phase
+                logging.info(
+                    f"[BENCH] GEN phases: dit={_tot:.1f} s "
+                    f"sched={_ph['sched']:.1f} s setup={_ph['setup']:.1f} s "
+                    f"prep={_ph['prep']:.1f} s randn={_ph['randn']:.1f} s "
+                    f"addnoise={_ph['addnoise']:.1f} s "
+                    f"ctx={_ph['ctx']:.1f} s encode={_ph['encode']:.1f} s "
+                    f"cat={_ph['cat']:.1f} s "
+                    f"accounted={_tot + sum(_ph.values()):.1f} s")
+            _t0 = time.perf_counter()
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
+            torch.neuron.synchronize()
+            self._gen_phase["cat"] += time.perf_counter() - _t0
 
             if offload_model:
                 self.model.cpu()
-                torch.cuda.empty_cache()
+                torch.neuron.empty_cache()
 
+            skip_decode = save_latents_path is not None or return_latents
             if self.rank == 0:
-                videos = self.vae.decode([pred_latent_chunks])
+                if save_latents_path is not None:
+                    save_latents_dir = Path(save_latents_path).parent
+                    if not save_latents_dir.exists():
+                        save_latents_dir.mkdir(parents=True, exist_ok=True)
+                        logging.info(f"Created directory {save_latents_dir} for save_latents_path")
+                    torch.save(pred_latent_chunks.cpu(), save_latents_path)
+                    logging.info(f"Saved pre-decode latent to {save_latents_path}")
+                if not skip_decode:
+                    self.vae.model.to('cpu')
+                    self.vae.mean = self.vae.mean.cpu()
+                    self.vae.std = self.vae.std.cpu()
+                    self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
+                    videos = self.vae.decode([pred_latent_chunks.cpu()])
 
         # del noise, latent, x0
         # del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.neuron.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
+        if skip_decode:
+            return pred_latent_chunks.cpu()
         return videos[0] if self.rank == 0 else None
 
     def _generate_causal_pretrain(self,
@@ -869,12 +1200,20 @@ class WanI2VCausal:
                                   seed=-1,
                                   offload_model=True,
                                   max_sequence_length=512,
-                                  max_attention_size=None,):
+                                  max_attention_size=None,
+                                  save_latents_path=None,
+                                  prompt_embeds_path=None,
+                                  prompt_embeds=None,
+                                  return_latents=False,):
         r"""
         Generates video frames with the pretrained causal model using
         40-step CFG sampling per chunk. `timesteps_index` is unused in this
         mode (kept for signature compatibility with `generate`).
         """
+        assert save_latents_path is None and not return_latents, \
+            "save_latents_path/return_latents only supported in infer_mode='causal_fast'"
+        assert prompt_embeds is None, \
+            "prompt_embeds only supported in infer_mode='causal_fast'"
         guide_scale = 5.0
         n_prompt = "画面突变，色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
@@ -929,17 +1268,24 @@ class WanI2VCausal:
         sample_scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=self.num_train_timesteps, shift=1, use_dynamic_shifting=False)
 
         # preprocess text: cond + uncond
-        if not self.t5_cpu:
+        if prompt_embeds_path is not None:
+            # Stage 2 of the two-stage T5-TP pipeline — see generate()'s
+            # docstring. input_prompt/n_prompt are not required and are not
+            # re-encoded here; this function has no T5 cache to key (unlike
+            # _generate_causal_fast), so nothing else depends on their value.
+            _embeds = torch.load(
+                prompt_embeds_path, map_location='cpu', weights_only=False)
+            context      = [t.to(self.device) for t in _embeds['prompt_embeds']]
+            context_null = [t.to(self.device) for t in _embeds['negative_prompt_embeds']]
+            logging.info(
+                f"Using precomputed prompt embeds {tuple(context[0].shape)} "
+                f"from {prompt_embeds_path}; text encoder skipped.")
+        else:
             self.text_encoder.model.to(self.device)
             context      = self.text_encoder([input_prompt], self.device)
             context_null = self.text_encoder([n_prompt],     self.device)
             if offload_model:
                 self.text_encoder.model.cpu()
-        else:
-            context      = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt],     torch.device('cpu'))
-            context      = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
 
         # cam preparation (only if action_path is provided)
         c2ws_plucker_emb = None
@@ -999,7 +1345,7 @@ class WanI2VCausal:
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
         kv_size = frame_seqlen * lat_f
         head_dim = model_args.dim // model_args.num_heads
-        local_num_heads = model_args.num_heads // self.sp_size
+        local_num_heads = model_args.num_heads // max(self.sp_size, 1)
         self_kv_shape = [batch_size, kv_size, local_num_heads, head_dim]
         cross_kv_shape = [batch_size, max_sequence_length, model_args.num_heads, head_dim]
 
@@ -1026,7 +1372,7 @@ class WanI2VCausal:
             device=self.device)
 
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast('neuron', dtype=self.param_dtype),
                 torch.no_grad(),
                 no_sync_model(),
         ):
@@ -1070,7 +1416,7 @@ class WanI2VCausal:
                 }
 
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    torch.neuron.empty_cache()
 
                 for timestep_idx in tqdm(range(len(timesteps)), desc=f"infer chunk {chunk_id}"):
                     latent_model_input = [current_latent.to(self.device)]
@@ -1085,8 +1431,7 @@ class WanI2VCausal:
                         noise_pred_cond - noise_pred_uncond)
 
                     if offload_model:
-                        torch.cuda.empty_cache()
-
+                        torch.neuron.empty_cache()
                     temp_x0 = sample_scheduler.step(
                         noise_pred.unsqueeze(0), t,
                         current_latent.unsqueeze(0),
@@ -1106,18 +1451,68 @@ class WanI2VCausal:
 
             if offload_model:
                 self.model.cpu()
-                torch.cuda.empty_cache()
+                torch.neuron.empty_cache()
 
             if self.rank == 0:
                 videos = self.vae.decode([pred_latent_chunks])
 
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.neuron.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+    def _make_self_kv(self, num_layers, batch, kv_size, heads, head_dim,
+                      chunk_size, frame_seqlen, dtype, device):
+        """Chunked self-attention KV cache when LINGBOT_CHUNKED_KV=1, else the flat one.
+
+        Chunked is the reference implementation's design; wan/modules/chunked_kv_cache.py records what it buys
+        and why. It only means anything for a BOUNDED window -- with local_attn_size=-1
+        there is no window to chunk, so num_chunks() returns 0 and the flag is ignored.
+        """
+        n = (num_chunks(self.local_attn_size, chunk_size)
+             if os.environ.get("LINGBOT_CHUNKED_KV", "0") == "1" else 0)
+        if n:
+            # PER-LAYER layout, because a hot layer takes the exact-attention path and
+            # reads [B, S, N, D] while its cold neighbours feed the const-max kernel and
+            # need N-major. With FLASH_ATTN_LAYERS unset this is all-True and identical to
+            # the previous n_major=const_max_ag_available().
+            from .modules.model_fast import flash_attn_layers, layer_uses_const_max
+            _n_major = [const_max_ag_available() and layer_uses_const_max(i)
+                        for i in range(num_layers)]
+            cache = allocate_self_kv_chunks(
+                num_layers, batch, chunk_size * frame_seqlen, heads, head_dim,
+                n, dtype, device, n_major=_n_major)
+            _flash = sorted(flash_attn_layers())
+            if _flash:
+                logging.info(
+                    f"hybrid attention: {num_layers - len(_flash)} layers const_max_ag, "
+                    f"{len(_flash)} exact (FLASH_ATTN_LAYERS={_flash})")
+            # Build the fused AG kernels once, now that the chunk size is known. The
+            # replica group is COLLECTIVE (all_gather_object), so every rank reaches it.
+            if const_max_ag_available():
+                from .distributed import tensor_parallel as _tp
+                from .modules.attention import init_const_max_ag
+                # ONE call: replica_groups() is a COLLECTIVE (dist.all_gather_object).
+                # Two calls happened to be safe here only because the f-string is
+                # evaluated on every rank regardless of log level, so all 32 ranks made
+                # both. The harness put the second inside `if rank == 0` and every rank
+                # failed with "replica group signature mismatch for group 0". One call
+                # removes the hazard and a redundant world collective per generation.
+                _rg = _tp.replica_groups("cp")
+                init_const_max_ag(_rg, chunk_size * frame_seqlen)
+                logging.info(
+                    f"const_max_ag: {n} chunks x {chunk_size * frame_seqlen} tokens, "
+                    f"cp replica groups {_rg[:2]}...")
+            logging.info(
+                f"self KV: chunked, {n} x {chunk_size * frame_seqlen} tokens, "
+                f"heads/rank={heads}, {chunk_bytes(cache) / 1e9:.2f} GB")
+            return cache
+        return self._initialize_self_kv_cache(
+            num_layers=num_layers, shape=[batch, kv_size, heads, head_dim],
+            dtype=dtype, device=device)
 
     def _initialize_self_kv_cache(self, num_layers, shape, dtype, device):
         """
@@ -1125,9 +1520,29 @@ class WanI2VCausal:
         """
         self_kv_cache = []
         for _ in range(num_layers):
+            k = torch.zeros(shape, dtype=dtype, device=device)
+            v = torch.zeros(shape, dtype=dtype, device=device)
+            # Pin the data pointers so dynamo does not treat them as changing
+            # inputs. Taken from the reference implementation (kv_cache.py:41)
+            # (NeuronKVCache.preallocate), whose docstring is the reason: the base
+            # class "allocates each block's window lazily on the first write and
+            # returns a slice that grows as the window fills. Neither suits a
+            # compiled region, which takes the buffers as arguments and
+            # re-specializes if a shape changes."
+            #
+            # These buffers already exist up front here and are read whole every
+            # call (attn_lo/attn_hi mask the window rather than slicing it), which
+            # is the reference implementation's other requirement -- "handing attention the whole window
+            # on every call, a constant shape without lying about the write
+            # position". What was missing is the address pinning.
+            for _t in (k, v):
+                try:
+                    torch._dynamo.mark_static_address(_t)
+                except Exception:
+                    pass  # older torch: no-op, cache still correct
             self_kv_cache.append({
-                'k': torch.zeros(shape, dtype=dtype, device=device),
-                'v': torch.zeros(shape, dtype=dtype, device=device),
+                'k': k,
+                'v': v,
                 'global_end_index': torch.tensor([0], dtype=torch.long, device=device),
                 'local_end_index': torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -1141,9 +1556,16 @@ class WanI2VCausal:
         """
         crossattn_cache = []
         for _ in range(num_layers):
+            k = torch.zeros(shape, dtype=dtype, device=device)
+            v = torch.zeros(shape, dtype=dtype, device=device)
+            for _t in (k, v):   # same pinning as the self-attn cache above
+                try:
+                    torch._dynamo.mark_static_address(_t)
+                except Exception:
+                    pass
             crossattn_cache.append({
-                'k': torch.zeros(shape, dtype=dtype, device=device),
-                'v': torch.zeros(shape, dtype=dtype, device=device),
+                'k': k,
+                'v': v,
                 'is_init': torch.tensor(0, dtype=torch.int32, device=device),
             })
 

@@ -81,7 +81,7 @@ def create_meshgrid(
     height: int, 
     width: int, 
     bias: float = 0.5, 
-    device='cuda', 
+    device='cpu', 
     dtype=torch.float32,
 ) -> torch.Tensor:
     x_range = torch.arange(width, device=device, dtype=dtype)
