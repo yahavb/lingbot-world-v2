@@ -642,7 +642,9 @@ class WanI2VCausal:
                  prompt_embeds_path=None,
                  prompt_embeds=None,
                  return_latents=False,
-                 chunk_callback=None,):
+                 chunk_callback=None,
+                 chunk_control=None,
+                 max_chunks=None,):
         r"""
         Generates video frames from input image and text prompt.
 
@@ -668,11 +670,23 @@ class WanI2VCausal:
         chunk_callback (*optional*): "causal_fast" only. Called on every rank as
             chunk_callback(chunk_id, x0) with each denoised latent chunk
             [C, chunk_size, H, W] as soon as it is ready, for streaming decode.
+        chunk_control (*optional*): "causal_fast" only. Called on every rank as
+            chunk_control(chunk_id) before each chunk. Return None to carry on,
+            {"stop": True} to end, or {"context": prompt_embeds} to switch the
+            text conditioning from this chunk on. With chunk_control set, chunks
+            are not accumulated and generate() returns None.
+        max_chunks (*optional*): "causal_fast" only. Run this many chunks instead
+            of the frame_num worth; chunks past the camera path repeat its last
+            chunk's camera motion and image conditioning.
         """
         extra = {}
         if chunk_callback is not None:
             assert self.infer_mode == "causal_fast", "chunk_callback requires infer_mode='causal_fast'"
             extra["chunk_callback"] = chunk_callback
+        if chunk_control is not None or max_chunks is not None:
+            assert self.infer_mode == "causal_fast", "chunk_control/max_chunks require infer_mode='causal_fast'"
+            extra["chunk_control"] = chunk_control
+            extra["max_chunks"] = max_chunks
         gen_fn = (self._generate_causal_fast
                   if self.infer_mode == "causal_fast"
                   else self._generate_causal_pretrain)
@@ -716,7 +730,9 @@ class WanI2VCausal:
                               prompt_embeds_path=None,
                               prompt_embeds=None,
                               return_latents=False,
-                              chunk_callback=None,):
+                              chunk_callback=None,
+                              chunk_control=None,
+                              max_chunks=None,):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -1028,12 +1044,26 @@ class WanI2VCausal:
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
-            for chunk_id in tqdm(range(num_inference_chunk)):
+            n_chunks = num_inference_chunk if max_chunks is None else max_chunks
+            for chunk_id in tqdm(range(n_chunks)):
+                if chunk_control is not None:
+                    ctl = chunk_control(chunk_id)
+                    if ctl is not None and ctl.get("stop"):
+                        break
+                    if ctl is not None and ctl.get("context") is not None:
+                        context = [t.to(self.device) for t in ctl["context"]]
+                        self._cross_attn_initialized = False
                 torch.neuron.synchronize()
                 _c0 = time.perf_counter()
-                current_latent = latents_chunk[chunk_id]
-                current_condition = condition_chunk[chunk_id]
-                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
+                k = min(chunk_id, num_inference_chunk - 1)
+                if chunk_id < num_inference_chunk:
+                    current_latent = latents_chunk[chunk_id]
+                else:
+                    current_latent = torch.randn(
+                        latents_chunk[-1].shape, generator=seed_g, device='cpu',
+                        dtype=torch.float32).to(self.device)
+                current_condition = condition_chunk[k]
+                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[k]
 
                 dit_cond_dict = {
                     "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
@@ -1151,7 +1181,8 @@ class WanI2VCausal:
                         # note return x0
                         break
 
-                pred_latent_chunks.append(x0)
+                if chunk_control is None:
+                    pred_latent_chunks.append(x0)
                 if chunk_callback is not None:
                     chunk_callback(chunk_id, x0)
 
@@ -1202,6 +1233,11 @@ class WanI2VCausal:
                     f"ctx={_ph['ctx']:.1f} s encode={_ph['encode']:.1f} s "
                     f"cat={_ph['cat']:.1f} s kvinit={_ph['kvinit']:.1f} s "
                     f"accounted={_tot + sum(_ph.values()):.1f} s")
+            if chunk_control is not None:
+                # Streaming: every chunk already went to chunk_callback.
+                if dist.is_initialized():
+                    dist.barrier()
+                return None
             _t0 = time.perf_counter()
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
             torch.neuron.synchronize()

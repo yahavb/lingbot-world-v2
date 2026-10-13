@@ -21,6 +21,13 @@ prompts extend the same scene.
     POST /generate/stream  {"prompt": str, "continue": bool, "seed": int}
         -> text/event-stream of
            {"frame_index", "frame"(base64 JPEG)}, ... {"done", "frames", "seconds"}
+
+Live mode is one continuous generation: memory, camera motion and scene carry
+on, and a new prompt takes effect at the next chunk.
+
+    POST /live             {"prompt": str, "seed": int} -> same event stream, until stopped
+    POST /live/prompt      {"prompt": str}  switch the running stream's prompt
+    POST /live/stop
     GET  /health
     GET  /readiness
 """
@@ -48,14 +55,17 @@ PORT = int(os.environ.get("PORT", "8000"))
 VAE_URL = os.environ.get("VAE_URL")
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 IDLE_S = 60
+LIVE_MAX_S = int(os.environ.get("LIVE_MAX_S", "600"))
+LIVE_MAX_CHUNKS = 900
 
 
 class Job:
 
-    def __init__(self, prompt, cont, seed):
+    def __init__(self, prompt, cont, seed, live=False):
         self.prompt = prompt
         self.cont = cont
         self.seed = seed
+        self.live = live
         self.frames = queue.Queue()
 
 
@@ -67,9 +77,14 @@ class Scheduler:
         self.pending = None
         self.busy = False
         self.ready = False
+        self.live = None          # the running live job
+        self.live_prompt = None   # prompt to switch to at the next chunk
+        self.live_stop = False
 
     def submit(self, job):
         with self.cv:
+            if self.live is not None:
+                self.live_stop = True
             if self.pending is not None:
                 self.pending.frames.put({"superseded": True})
                 self.pending.frames.put(None)
@@ -84,11 +99,20 @@ class Scheduler:
                 return None
             job, self.pending = self.pending, None
             self.busy = True
+            if job.live:
+                self.live, self.live_prompt, self.live_stop = job, None, False
             return job
 
     def finish(self):
         with self.cv:
             self.busy = False
+            self.live = None
+
+    def control(self):
+        """Rank 0, between chunks: (prompt to switch to or None, stop?)."""
+        with self.cv:
+            prompt, self.live_prompt = self.live_prompt, None
+            return prompt, self.live_stop
 
 
 class RemoteDecoder:
@@ -171,6 +195,41 @@ def run_server(sched):
                 yield f"data: {json.dumps(item)}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    class LiveRequest(BaseModel):
+        prompt: str
+        seed: int = 42
+
+    @app.post("/live")
+    def live(req: LiveRequest):
+        if not sched.ready:
+            raise HTTPException(status_code=503, detail="warming up")
+        job = Job(req.prompt, False, req.seed, live=True)
+        sched.submit(job)
+
+        def events():
+            while True:
+                item = job.frames.get()
+                if item is None:
+                    return
+                yield f"data: {json.dumps(item)}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/live/prompt")
+    def live_prompt(req: LiveRequest):
+        with sched.cv:
+            if sched.live is None:
+                raise HTTPException(status_code=409, detail="no live stream running")
+            sched.live_prompt = req.prompt
+        logging.info(f"live prompt queued: {req.prompt[:80]!r}")
+        return {"status": "queued for the next chunk"}
+
+    @app.post("/live/stop")
+    def live_stop():
+        with sched.cv:
+            sched.live_stop = True
+        return {"status": "stopping"}
 
     @app.get("/health")
     def health():
@@ -279,10 +338,64 @@ def main():
             chunk_callback=on_chunk)
         return remote.drain() if remote is not None else None
 
+    def run_live(prompt, img, seed, emit, control):
+        """One continuous generation on every rank until control() says stop.
+
+        control(chunk_id) runs on rank 0 and returns (new prompt or None, stop?);
+        its answer is broadcast so every rank switches or stops at the same chunk.
+        """
+        embeds = [t.cpu() for t in t5([prompt], dev)]
+
+        def on_chunk(chunk_id, x0):
+            if VAE_URL is None:
+                decode_local(chunk_id, x0, emit)
+            elif remote is not None:
+                remote.submit(chunk_id, x0.cpu(), emit)
+
+        def chunk_control(chunk_id):
+            c = [control(chunk_id) if rank == 0 else None]
+            dist.broadcast_object_list(c, src=0)
+            new_prompt, stop = c[0]
+            if stop:
+                return {"stop": True}
+            if new_prompt is not None:
+                if rank == 0:
+                    logging.info(f"live: chunk {chunk_id} switches to {new_prompt[:80]!r}")
+                return {"context": [t.cpu() for t in t5([new_prompt], dev)]}
+            return None
+
+        pipe.generate(
+            prompt, img,
+            action_path=args.action_path,
+            chunk_size=args.chunk_size,
+            max_area=max_area,
+            target_hw=target_hw,
+            denoise_steps=args.denoise_steps,
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            seed=seed,
+            offload_model=False,
+            max_attention_size=args.max_attention_size,
+            prompt_embeds=embeds,
+            return_latents=True,
+            chunk_callback=on_chunk,
+            chunk_control=chunk_control,
+            max_chunks=LIVE_MAX_CHUNKS)
+        return remote.drain() if remote is not None else None
+
     t0 = time.perf_counter()
     err = run_segment(args.prompt, first_img, args.base_seed, lambda f: None)
     if rank == 0:
         logging.info(f"warmup segment: {time.perf_counter() - t0:.1f} s"
+                     + (f" (remote decode failed: {err})" if err else ""))
+
+    # Live warmup: switch prompts at chunks 4, 5 and 6 so the first-call cross-attention
+    # graph is compiled for every rotating KV slot, not inside a user's stream.
+    t0 = time.perf_counter()
+    err = run_live(args.prompt, first_img, args.base_seed, lambda f: None,
+                   lambda i: (args.prompt if i in (4, 5, 6) else None, i >= 9))
+    if rank == 0:
+        logging.info(f"live warmup: {time.perf_counter() - t0:.1f} s"
                      + (f" (remote decode failed: {err})" if err else ""))
 
     sched = Scheduler()
@@ -302,7 +415,7 @@ def main():
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             msg = [{"prompt": job.prompt, "seed": job.seed, "png": buf.getvalue(),
-                    "skip_first": cont}]
+                    "skip_first": cont, "live": job.live}]
         dist.broadcast_object_list(msg, src=0)
         m = msg[0]
         if m is None:
@@ -319,7 +432,16 @@ def main():
             job.frames.put({"frame_index": seen["n"] - 1, "frame": frame})
 
         try:
-            err = run_segment(m["prompt"], img, m["seed"], emit)
+            if m["live"]:
+                t_live = time.perf_counter()
+
+                def control(chunk_id):
+                    prompt, stop = sched.control()
+                    return prompt, stop or time.perf_counter() - t_live > LIVE_MAX_S
+
+                err = run_live(m["prompt"], img, m["seed"], emit, control)
+            else:
+                err = run_segment(m["prompt"], img, m["seed"], emit)
             if rank == 0:
                 if err:
                     job.frames.put({"error": err})
