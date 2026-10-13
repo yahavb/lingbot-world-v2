@@ -24,6 +24,8 @@ spec:
       labels:
         app: lbw-v2-gradio
     spec:
+      nodeSelector:
+        node-type: m5
       containers:
         - name: app
           image: python:3.11-slim
@@ -47,17 +49,20 @@ spec:
             httpGet:
               path: /
               port: 7860
+            initialDelaySeconds: 30
             periodSeconds: 10
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /
               port: 7860
+            initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /
               port: 7860
+            initialDelaySeconds: 10
             periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3
