@@ -88,8 +88,12 @@ spec:
             claims:
               - name: neuroncores
             requests:
+              cpu: "180"
+              memory: 1800Gi
               ephemeral-storage: 600Gi
             limits:
+              cpu: "190"
+              memory: 1900Gi
               ephemeral-storage: 600Gi
           volumeMounts:
             - name: dshm
@@ -97,6 +101,8 @@ spec:
           env:
             - name: BRANCH
               value: "main"
+            - name: VAE_URL
+              value: "http://lbw-v2-vae.default.svc.cluster.local:8000"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC

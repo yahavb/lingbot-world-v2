@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lbw-v2-vae
+spec:
+  selector:
+    app: lbw-v2-vae
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lbw-v2-vae
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: lbw-v2-vae
+  template:
+    metadata:
+      labels:
+        app: lbw-v2-vae
+    spec:
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: xxl-lnc2
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              cd /tmp/lingbot
+              CKPT=/tmp/ckpt/lingbot-world-v2-14b-causal-fast
+              export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              export HF_HOME=/tmp/hf-cache
+
+              pip install -q -r requirements_neuron.txt fastapi uvicorn
+              python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
+              hf download robbyant/lingbot-world-v2-14b-causal-fast Wan2.1_VAE.pth --local-dir "$CKPT"
+
+              NEURON_LOGICAL_NC_CONFIG="$LNC" exec torchrun --nproc_per_node="$NPROC" vae_serve.py \
+                --ckpt_dir "$CKPT" --lat_h "$LAT_H" --lat_w "$LAT_W" --chunk_size "$CHUNK_SIZE"
+          ports:
+            - containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            periodSeconds: 30
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 10
+          resources:
+            claims:
+              - name: neuroncores
+            requests:
+              cpu: "180"
+              memory: 1800Gi
+              ephemeral-storage: 600Gi
+            limits:
+              cpu: "190"
+              memory: 1900Gi
+              ephemeral-storage: 600Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+            - name: BRANCH
+              value: "main"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NPROC
+              value: "64"
+            - name: LNC
+              value: "2"
+            - name: LAT_H
+              value: "60"
+            - name: LAT_W
+              value: "96"
+            - name: CHUNK_SIZE
+              value: "3"
+            - name: NEURON_CC_FLAGS
+              value: "--internal-backend-options=--disable-cb-before-global-cc"
+            - name: NKI_COMPILER_FRONTEND
+              value: "tracer"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "1"
+            - name: TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION
+              value: "1"
+            - name: NEURON_RT_EXEC_TIMEOUT
+              value: "600"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_LOAD_CONCURRENCY
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+                  optional: true
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi

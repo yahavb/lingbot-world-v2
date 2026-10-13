@@ -2,9 +2,15 @@
 
     torchrun --nproc_per_node=<N> serve.py <generate.py flags>
 
-Every rank runs T5, DiT and VAE in lockstep. Rank 0 also serves HTTP from a
+Every rank runs T5 and the DiT in lockstep. Rank 0 also serves HTTP from a
 background thread and hands jobs to the main loop, which broadcasts each job to
 the other ranks, so all device work stays on each rank's main thread.
+
+Decode runs in one of two places:
+  - VAE_URL unset: on the same ranks, between chunks (width-sharded).
+  - VAE_URL set:   on a separate vae_serve.py. Rank 0 posts each latent chunk
+    from a sender thread, so the DiT moves on to the next chunk while the
+    previous one decodes.
 
 One segment generates at a time. A request that arrives while a segment is
 generating waits for it to finish; if several arrive, only the newest waits and
@@ -39,6 +45,7 @@ from wan.modules.t5 import T5EncoderModel, init_t5_parallel_group
 from wan.modules.vae2_1_sharded import gather_video_width, width_shard_latent
 
 PORT = int(os.environ.get("PORT", "8000"))
+VAE_URL = os.environ.get("VAE_URL")
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 IDLE_S = 60
 
@@ -82,6 +89,46 @@ class Scheduler:
     def finish(self):
         with self.cv:
             self.busy = False
+
+
+class RemoteDecoder:
+    """Rank 0: decodes chunks on the VAE server, in order, off the DiT's path."""
+
+    def __init__(self, url):
+        import requests
+        self.session = requests.Session()
+        self.url = url
+        self.q = queue.Queue()
+        self.error = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, chunk_id, x0, emit):
+        self.q.put((chunk_id, x0, emit))
+
+    def drain(self):
+        """Block until every submitted chunk is decoded; return and clear the first error."""
+        self.q.join()
+        err, self.error = self.error, None
+        return err
+
+    def _run(self):
+        while True:
+            chunk_id, x0, emit = self.q.get()
+            try:
+                if self.error is None:
+                    buf = io.BytesIO()
+                    torch.save(x0, buf)
+                    r = self.session.post(f"{self.url}/decode",
+                                          params={"first": int(chunk_id == 0)},
+                                          data=buf.getvalue(), timeout=600)
+                    r.raise_for_status()
+                    for frame in r.json()["frames"]:
+                        emit(frame)
+            except Exception as e:
+                logging.exception("remote decode failed")
+                self.error = str(e)
+            finally:
+                self.q.task_done()
 
 
 def to_pil(frame):
@@ -181,27 +228,36 @@ def main():
                  frame_num=args.frame_num, chunk_size=args.chunk_size,
                  text_seq_len=cfg.text_len)
 
+    remote = RemoteDecoder(VAE_URL) if (VAE_URL and rank == 0) else None
+
+    def decode_local(chunk_id, x0, emit):
+        lat_w = x0.shape[-1]
+        vae, vae_world, pad_w = G._width_sharded_vae(args, cfg, dev, rank, world, lat_w)
+        if vae is not None:
+            z = x0
+            if pad_w != lat_w:
+                z = torch.cat([z, z[..., -1:].expand(*z.shape[:-1], pad_w - lat_w)], dim=-1)
+            video = gather_video_width(vae.decode_chunk(
+                width_shard_latent(z.to(dev), rank=rank, world=vae_world),
+                first=(chunk_id == 0)))
+            if rank == 0:
+                video = video[..., :lat_w * cfg.vae_stride[2]]
+                for t in range(video.shape[1]):
+                    emit(b64_jpeg(to_pil(video[:, t])))
+        dist.barrier()
+
     def run_segment(prompt, img, seed, emit):
-        """Generate one segment on every rank; rank 0 passes each decoded frame to emit."""
+        """Generate one segment on every rank; rank 0 passes each frame (base64 JPEG) to emit.
+
+        Returns an error string on rank 0 if remote decode failed, else None.
+        """
         embeds = [t.cpu() for t in t5([prompt], dev)]
-        state = {"last": None}
 
         def on_chunk(chunk_id, x0):
-            lat_w = x0.shape[-1]
-            vae, vae_world, pad_w = G._width_sharded_vae(args, cfg, dev, rank, world, lat_w)
-            if vae is not None:
-                z = x0
-                if pad_w != lat_w:
-                    z = torch.cat([z, z[..., -1:].expand(*z.shape[:-1], pad_w - lat_w)], dim=-1)
-                video = gather_video_width(vae.decode_chunk(
-                    width_shard_latent(z.to(dev), rank=rank, world=vae_world),
-                    first=(chunk_id == 0)))
-                if rank == 0:
-                    video = video[..., :lat_w * cfg.vae_stride[2]]
-                    for t in range(video.shape[1]):
-                        state["last"] = to_pil(video[:, t])
-                        emit(state["last"])
-            dist.barrier()
+            if VAE_URL is None:
+                decode_local(chunk_id, x0, emit)
+            elif remote is not None:
+                remote.submit(chunk_id, x0.cpu(), emit)
 
         pipe.generate(
             prompt, img,
@@ -218,12 +274,13 @@ def main():
             prompt_embeds=embeds,
             return_latents=True,
             chunk_callback=on_chunk)
-        return state["last"]
+        return remote.drain() if remote is not None else None
 
     t0 = time.perf_counter()
-    run_segment(args.prompt, first_img, args.base_seed, lambda f: None)
+    err = run_segment(args.prompt, first_img, args.base_seed, lambda f: None)
     if rank == 0:
-        logging.info(f"warmup segment: {time.perf_counter() - t0:.1f} s")
+        logging.info(f"warmup segment: {time.perf_counter() - t0:.1f} s"
+                     + (f" (remote decode failed: {err})" if err else ""))
 
     sched = Scheduler()
     if rank == 0:
@@ -237,31 +294,37 @@ def main():
         job = sched.take(IDLE_S) if rank == 0 else None
         msg = [None]
         if job is not None:
-            img = last_frame if (job.cont and last_frame is not None) else first_img
+            cont = job.cont and last_frame is not None
+            img = last_frame if cont else first_img
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             msg = [{"prompt": job.prompt, "seed": job.seed, "png": buf.getvalue(),
-                    "skip_first": img is last_frame}]
+                    "skip_first": cont}]
         dist.broadcast_object_list(msg, src=0)
         m = msg[0]
         if m is None:
             continue
         img = Image.open(io.BytesIO(m["png"])).convert("RGB")
-        count = [0]
+        seen = {"n": 0, "last": None}
         t0 = time.perf_counter()
 
         def emit(frame):
-            count[0] += 1
-            if m["skip_first"] and count[0] == 1:
+            seen["n"] += 1
+            seen["last"] = frame
+            if m["skip_first"] and seen["n"] == 1:
                 return
-            job.frames.put({"frame_index": count[0] - 1, "frame": b64_jpeg(frame)})
+            job.frames.put({"frame_index": seen["n"] - 1, "frame": frame})
 
         try:
-            last = run_segment(m["prompt"], img, m["seed"], emit)
+            err = run_segment(m["prompt"], img, m["seed"], emit)
             if rank == 0:
-                last_frame = last
-                job.frames.put({"done": True, "frames": count[0],
-                                "seconds": round(time.perf_counter() - t0, 2)})
+                if err:
+                    job.frames.put({"error": err})
+                else:
+                    if seen["last"] is not None:
+                        last_frame = Image.open(io.BytesIO(base64.b64decode(seen["last"]))).convert("RGB")
+                    job.frames.put({"done": True, "frames": seen["n"],
+                                    "seconds": round(time.perf_counter() - t0, 2)})
         except Exception as e:
             logging.exception("segment failed")
             if rank == 0:
