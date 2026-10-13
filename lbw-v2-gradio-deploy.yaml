@@ -24,8 +24,6 @@ spec:
       labels:
         app: lbw-v2-gradio
     spec:
-      nodeSelector:
-        node-type: m5
       containers:
         - name: app
           image: python:3.11-slim
