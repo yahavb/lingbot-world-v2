@@ -58,12 +58,13 @@ spec:
               python3 scripts/analysis/qk_gamma_temperature.py --ckpt_dir "$CKPT" | tee /tmp/qk.txt
               export FLASH_ATTN_LAYERS=$(grep -oE "CANDIDATE HOT LAYERS \([0-9]+\): [0-9,]+" /tmp/qk.txt | sed -E "s/.*: //" || true)
 
-              NEURON_LOGICAL_NC_CONFIG="$LNC" exec torchrun --nproc_per_node="$NPROC" serve.py \
+              NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun --nproc_per_node="$NPROC" serve.py \
                 --task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT" \
                 --size "$SIZE" --frame_num "$FRAME_NUM" --chunk_size "$CHUNK_SIZE" \
                 --image examples/03/image.jpg --action_path examples/03 --prompt "$PROMPT" \
                 --tp_degree "$TP" --cp_size "$CP" --denoise_steps "$DENOISE_STEPS" \
-                --local_attn_size "$LOCAL_ATTN_SIZE" --sink_size "$SINK_SIZE" --base_seed 42
+                --local_attn_size "$LOCAL_ATTN_SIZE" --sink_size "$SINK_SIZE" --base_seed 42 2>&1 \
+                | tee -a /logs/serve.log | grep --line-buffered -avE "AliasingInfo|Mutated inputs|Detected collective"
           ports:
             - containerPort: 8000
           startupProbe:
@@ -98,6 +99,8 @@ spec:
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
+            - name: logs
+              mountPath: /logs
           env:
             - name: BRANCH
               value: "main"
@@ -166,6 +169,8 @@ spec:
                   key: HF_TOKEN
                   optional: true
       volumes:
+        - name: logs
+          emptyDir: {}
         - name: dshm
           emptyDir:
             medium: Memory
