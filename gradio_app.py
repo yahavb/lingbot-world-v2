@@ -9,7 +9,9 @@ gallery accumulates them, and the whole stream becomes a playable mp4 when it en
 import base64
 import json
 import os
+import queue
 import tempfile
+import threading
 import time
 
 import gradio as gr
@@ -51,40 +53,68 @@ def to_video(paths):
 
 
 def start(prompt, scene):
+    """Show the newest frame, keep every frame.
+
+    A reader thread drains the server stream into a queue as fast as it arrives, so the
+    live view never falls behind the generator: each update shows the newest frame and
+    the frames in between go only to disk, the gallery and the final mp4.
+    """
     outdir = tempfile.mkdtemp(prefix="lbw_")
-    paths, t0, next_show = [], time.time(), 0.0
+    events, quit_ = queue.Queue(), threading.Event()
+    resp = requests.post(f"{LBW_URL}/live", stream=True, timeout=3600,
+                         json={"prompt": prompt, "scene": SCENES[scene]})
+    resp.raise_for_status()
+
+    def reader():
+        try:
+            for line in resp.iter_lines():
+                if quit_.is_set():
+                    break
+                if line.startswith(b"data: "):
+                    events.put(json.loads(line[6:]))
+        except Exception as e:
+            events.put({"error": str(e)})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    paths, t0, last_gallery, msg = [], time.time(), 0, None
     yield None, [], None, "waiting for the model..."
-    with requests.post(f"{LBW_URL}/live", stream=True, timeout=3600,
-                       json={"prompt": prompt, "scene": SCENES[scene]}) as r:
-        r.raise_for_status()
-        for line in r.iter_lines():
-            if not line.startswith(b"data: "):
-                continue
-            ev = json.loads(line[6:])
-            if "error" in ev:
-                yield gr.update(), gr.update(), gr.update(), f"error: {ev['error']}"
-                break
-            if ev.get("superseded"):
-                yield gr.update(), gr.update(), gr.update(), "replaced by a newer stream"
-                break
-            if ev.get("done"):
-                break
-            path = os.path.join(outdir, f"{len(paths):06d}.jpg")
-            with open(path, "wb") as f:
-                f.write(base64.b64decode(ev["frame"]))
-            paths.append(path)
-            wait = next_show - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            next_show = time.time() + 1.0 / PLAYBACK_FPS
-            n = len(paths)
-            status = f"live: {n} frames, {n / (time.time() - t0):.1f} fps"
-            # The gallery re-sends its whole list, so refresh it once per chunk, not per frame.
-            gallery = paths[-GALLERY_MAX:] if n % 12 == 0 else gr.update()
-            yield path, gallery, gr.update(), status
+    try:
+        while msg is None:
+            batch = [events.get()]
+            while not events.empty():
+                batch.append(events.get())
+            for ev in batch:
+                if ev is None or ev.get("done"):
+                    msg = "stopped"
+                    break
+                if "error" in ev:
+                    msg = f"error: {ev['error']}"
+                    break
+                if ev.get("superseded"):
+                    msg = "replaced by a newer stream"
+                    break
+                path = os.path.join(outdir, f"{len(paths):06d}.jpg")
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(ev["frame"]))
+                paths.append(path)
+            if paths and msg is None:
+                n = len(paths)
+                gallery = gr.update()
+                if n - last_gallery >= 12:
+                    gallery, last_gallery = paths[-GALLERY_MAX:], n
+                yield paths[-1], gallery, gr.update(), \
+                    f"live: {n} frames, {n / (time.time() - t0):.1f} fps"
+                time.sleep(1.0 / PLAYBACK_FPS)
+    finally:
+        quit_.set()
+        resp.close()
     if paths:
         yield paths[-1], paths[-GALLERY_MAX:], to_video(paths), \
-            f"stopped after {len(paths)} frames ({time.time() - t0:.0f} s) - press play on Whole stream"
+            f"{msg} after {len(paths)} frames ({time.time() - t0:.0f} s) - press play on Whole stream"
+    else:
+        yield gr.update(), gr.update(), gr.update(), msg
 
 
 def change_prompt(prompt):

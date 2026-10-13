@@ -213,11 +213,19 @@ def run_server(sched):
         sched.submit(job)
 
         def events():
-            while True:
-                item = job.frames.get()
-                if item is None:
-                    return
-                yield f"data: {json.dumps(item)}\n\n"
+            try:
+                while True:
+                    item = job.frames.get()
+                    if item is None:
+                        return
+                    yield f"data: {json.dumps(item)}\n\n"
+            finally:
+                # Also runs when the client disconnects: stop this stream at the next chunk.
+                with sched.cv:
+                    if sched.live is job:
+                        sched.live_stop = True
+                    if sched.pending is job:
+                        sched.pending = None
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
