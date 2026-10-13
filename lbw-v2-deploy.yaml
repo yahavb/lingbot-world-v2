@@ -101,6 +101,8 @@ spec:
           env:
             - name: BRANCH
               value: "main"
+            - name: VAE_URL
+              value: "http://lbw-v2-vae.default.svc.cluster.local:8000"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
