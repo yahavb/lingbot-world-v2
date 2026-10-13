@@ -346,6 +346,56 @@ def _encode_prompt_tp(args, cfg, device, rank, world_size):
     return prompt_embeds
 
 
+def _width_sharded_vae(args, cfg, device, rank, world_size, lat_w):
+    """Build (once per shape) the width-sharded VAE decoder for latent width `lat_w`.
+
+    Returns (vae, vae_world, pad_w). `vae` is None on ranks outside the decode group;
+    `pad_w` > `lat_w` means the caller replicate-pads the latent to `pad_w` and crops
+    the decoded video back to `lat_w * vae_stride[2]`.
+    """
+    _pad_w = ((lat_w + world_size - 1) // world_size) * world_size
+    if _pad_w != lat_w and world_size > math.gcd(lat_w, world_size):
+        vae_world = world_size
+    else:
+        _pad_w = lat_w
+        vae_world = math.gcd(lat_w, world_size)
+    _key = (vae_world, args.ckpt_dir, cfg.vae_checkpoint)
+    _cached = getattr(_width_sharded_vae, "_built", None)
+    if _cached is None or _cached[0] != _key:
+        group = None
+        if world_size > 1:
+            # dist.new_group is COLLECTIVE: every rank must call it, member or not.
+            group = dist.new_group(ranks=list(range(vae_world)))
+        if rank == 0:
+            if _pad_w != lat_w:
+                logging.info(
+                    "VAE width-shard: latent width %d padded to %d (replicate) so all "
+                    "%d ranks participate, %d px each; cropped after gather.",
+                    lat_w, _pad_w, vae_world, _pad_w // vae_world)
+            elif vae_world != world_size:
+                logging.info(
+                    "VAE width-shard: latent width %d does not divide world %d; "
+                    "decoding on %d ranks (%d px each), %d idle.",
+                    lat_w, world_size, vae_world, lat_w // vae_world,
+                    world_size - vae_world)
+        if rank >= vae_world:
+            _width_sharded_vae._built = (_key, None, None)
+            return None, vae_world, _pad_w
+        _set_vae_group(group)
+        vae = Wan2_1_VAE(
+            vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=device,
+            dtype=torch.bfloat16)
+        if vae_world > 1:
+            shard_vae_decoder_width(vae.model.decoder)
+        _width_sharded_vae._built = (_key, vae, group)
+    else:
+        _, vae, group = _cached
+        if vae is not None:
+            _set_vae_group(group)
+    return vae, vae_world, _pad_w
+
+
+
 def _decode_latents_width_sharded(args, cfg, device, rank, world_size, latent):
     """Inline width-sharded VAE decode for the single-torchrun e2e path
     (tp_degree>1, no --save_latents_path given). Same logic as
@@ -389,52 +439,16 @@ def _decode_latents_width_sharded(args, cfg, device, rank, world_size, latent):
     # cropped after the gather, but the true edge is still affected within the decoder's
     # receptive field. Compare the mp4 against an unpadded run before trusting it.
     lat_w = latent.shape[-1]
-    _pad_w = ((lat_w + world_size - 1) // world_size) * world_size
-    if _pad_w != lat_w and world_size > math.gcd(lat_w, world_size):
+    vae, vae_world, _pad_w = _width_sharded_vae(args, cfg, device, rank, world_size, lat_w)
+    if vae is None:
+        return None
+    if _pad_w != lat_w:
         # Explicit edge replicate. F.pad(mode="replicate") rejects a 2-tuple at 4-D or
-        # 5-D ("Padding size 2 is not supported for 4D input tensor") and would have
-        # crashed in the pod; a cat of the repeated last column is rank-agnostic.
+        # 5-D ("Padding size 2 is not supported for 4D input tensor"); a cat of the
+        # repeated last column is rank-agnostic.
         latent = torch.cat(
             [latent, latent[..., -1:].expand(*latent.shape[:-1], _pad_w - lat_w)],
             dim=-1)
-        vae_world = world_size
-    else:
-        _pad_w = lat_w
-        vae_world = math.gcd(lat_w, world_size)
-    _key = (vae_world, args.ckpt_dir, cfg.vae_checkpoint)
-    _cached = getattr(_decode_latents_width_sharded, "_built", None)
-    if _cached is None or _cached[0] != _key:
-        group = None
-        if world_size > 1:
-            # dist.new_group is COLLECTIVE: every rank must call it, member or not.
-            group = dist.new_group(ranks=list(range(vae_world)))
-        if rank == 0:
-            if _pad_w != lat_w:
-                logging.info(
-                    "VAE width-shard: latent width %d padded to %d (replicate) so all "
-                    "%d ranks participate, %d px each; cropped after gather.",
-                    lat_w, _pad_w, vae_world, _pad_w // vae_world)
-            elif vae_world != world_size:
-                logging.info(
-                    "VAE width-shard: latent width %d does not divide world %d; "
-                    "decoding on %d ranks (%d px each), %d idle.",
-                    lat_w, world_size, vae_world, lat_w // vae_world,
-                    world_size - vae_world)
-        if rank >= vae_world:
-            _decode_latents_width_sharded._built = (_key, None, None)
-            return None
-        _set_vae_group(group)
-        vae = Wan2_1_VAE(
-            vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=device,
-            dtype=torch.bfloat16)
-        if vae_world > 1:
-            shard_vae_decoder_width(vae.model.decoder)
-        _decode_latents_width_sharded._built = (_key, vae, group)
-    else:
-        _, vae, group = _cached
-        if vae is None:
-            return None
-        _set_vae_group(group)
 
     latent = latent.to(device)
     latent_local = width_shard_latent(latent, rank=rank, world=vae_world)
@@ -633,13 +647,8 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
     return _result
 
 
-def generate(args):
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
-    _init_logging(rank)
-
+def _init_distributed(args, rank, world_size, local_rank):
+    """Process group, sequence/tensor-parallel mesh and arg validation. Returns cfg."""
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
         logging.info(
@@ -701,6 +710,17 @@ def generate(args):
         else:
             assert args.tp_degree == world_size, "tp_degree must equal world_size when --sp_size is not used."
             assert cfg.num_heads % args.tp_degree == 0
+    return cfg
+
+
+def generate(args):
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    device = local_rank
+    _init_logging(rank)
+
+    cfg = _init_distributed(args, rank, world_size, local_rank)
 
     logging.info(f"Generation job args: {args}")
     logging.info(f"Generation model config: {cfg}")

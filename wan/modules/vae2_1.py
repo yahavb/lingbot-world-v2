@@ -571,6 +571,30 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
+    def decode_chunk(self, z, scale, first):
+        """Decode latent frames, continuing the causal cache of the previous call.
+
+        Calling this on consecutive chunks of a latent (``first=True`` on the
+        first) gives the same frames as one ``decode`` of the whole latent.
+        """
+        if first:
+            self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+        x = self.conv2(z)
+        out = []
+        for i in range(x.shape[2]):
+            self._conv_idx = [0]
+            out.append(
+                self.decoder(
+                    x[:, :, i:i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx))
+        return torch.cat(out, 2)
+
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
@@ -665,3 +689,9 @@ class Wan2_1_VAE:
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
                 for u in zs
             ]
+
+    def decode_chunk(self, z, first):
+        """z: [C, T, H, W] latent chunk; see WanVAE_.decode_chunk."""
+        with amp.autocast(dtype=self.dtype):
+            return self.model.decode_chunk(
+                z.unsqueeze(0), self.scale, first).float().clamp_(-1, 1).squeeze(0)

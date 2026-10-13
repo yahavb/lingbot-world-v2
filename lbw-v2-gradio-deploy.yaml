@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lbw-v2-gradio
+spec:
+  type: NodePort
+  selector:
+    app: lbw-v2-gradio
+  ports:
+    - port: 7860
+      targetPort: 7860
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lbw-v2-gradio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lbw-v2-gradio
+  template:
+    metadata:
+      labels:
+        app: lbw-v2-gradio
+    spec:
+      containers:
+        - name: app
+          image: python:3.11-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              apt-get update -qq && apt-get install -y -qq git >/dev/null
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /app
+              pip install -q gradio requests numpy pillow imageio imageio-ffmpeg
+              exec python -u /app/gradio_app.py
+          env:
+            - name: BRANCH
+              value: "main"
+            - name: LBW_URL
+              value: "http://lbw-v2.default.svc.cluster.local:8000"
+          ports:
+            - containerPort: 7860
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7860
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi

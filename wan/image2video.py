@@ -287,7 +287,6 @@ class WanI2VCausal:
                     config.t5_checkpoint, checkpoint_dir, assets_dir),
                 tokenizer_path=_resolve_asset_path(
                     config.t5_tokenizer, checkpoint_dir, assets_dir),
-                shard_fn=shard_fn if t5_fsdp else None,
             )
 
         self.vae_stride = config.vae_stride
@@ -642,7 +641,8 @@ class WanI2VCausal:
                  save_latents_path=None,
                  prompt_embeds_path=None,
                  prompt_embeds=None,
-                 return_latents=False,):
+                 return_latents=False,
+                 chunk_callback=None,):
         r"""
         Generates video frames from input image and text prompt.
 
@@ -665,7 +665,14 @@ class WanI2VCausal:
             loads precomputed embeddings from disk instead.
         prompt_embeds (*optional*): precomputed embeds passed directly
             in-memory instead of via prompt_embeds_path.
+        chunk_callback (*optional*): "causal_fast" only. Called on every rank as
+            chunk_callback(chunk_id, x0) with each denoised latent chunk
+            [C, chunk_size, H, W] as soon as it is ready, for streaming decode.
         """
+        extra = {}
+        if chunk_callback is not None:
+            assert self.infer_mode == "causal_fast", "chunk_callback requires infer_mode='causal_fast'"
+            extra["chunk_callback"] = chunk_callback
         gen_fn = (self._generate_causal_fast
                   if self.infer_mode == "causal_fast"
                   else self._generate_causal_pretrain)
@@ -687,7 +694,8 @@ class WanI2VCausal:
             save_latents_path=save_latents_path,
             prompt_embeds_path=prompt_embeds_path,
             prompt_embeds=prompt_embeds,
-            return_latents=return_latents)
+            return_latents=return_latents,
+            **extra)
 
     def _generate_causal_fast(self,
                               input_prompt,
@@ -707,7 +715,8 @@ class WanI2VCausal:
                               save_latents_path=None,
                               prompt_embeds_path=None,
                               prompt_embeds=None,
-                              return_latents=False,):
+                              return_latents=False,
+                              chunk_callback=None,):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -1143,6 +1152,8 @@ class WanI2VCausal:
                         break
 
                 pred_latent_chunks.append(x0)
+                if chunk_callback is not None:
+                    chunk_callback(chunk_id, x0)
 
                 # Update kv cache
                 context_timestep = [timesteps[-1] * 0.0]
