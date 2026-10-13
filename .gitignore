@@ -8,4 +8,5 @@ logs/
 *.mp4
 *.json
 *.pth
-*.zipresults/
+*.zip
+results/
