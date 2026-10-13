@@ -4,7 +4,7 @@ metadata:
   name: lbw-v2-i2v
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 14400
+  activeDeadlineSeconds: 100800
   template:
     spec:
       restartPolicy: Never
@@ -24,6 +24,7 @@ spec:
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
               OUT=/tmp/results; mkdir -p "$OUT"
+              trap 'echo "kubectl cp $(hostname):$OUT ./results"; sleep "$KEEP_ALIVE_SECONDS"' EXIT
               CKPT=/tmp/ckpt/lingbot-world-v2-14b-causal-fast
               SAVE="$OUT/lingbot_i2v_cp${CP}xtp${TP}_${SIZE//\*/x}_${FRAME_NUM}f.mp4"
               LATENTS=/tmp/latents.pt
@@ -61,7 +62,6 @@ spec:
 
               python3 tests/smoke_test_video.py --skip-run --save-file "$SAVE" \
                 --expected-frame-num "$FRAME_NUM" --expected-fps 16 --size "$SIZE"
-              sleep "$HOLD_SECONDS"
           resources:
             claims:
               - name: neuroncores
@@ -77,8 +77,8 @@ spec:
               value: "main"
             - name: PYTHONUNBUFFERED
               value: "1"
-            - name: HOLD_SECONDS
-              value: "0"
+            - name: KEEP_ALIVE_SECONDS
+              value: "86400"
             - name: NPROC
               value: "32"
             - name: LNC
