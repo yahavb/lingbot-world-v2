@@ -174,12 +174,15 @@ def run_server(sched):
 
     @app.get("/health")
     def health():
+        logging.info("probe /health: healthy")
         return {"status": "healthy"}
 
     @app.get("/readiness")
     def readiness():
         if not sched.ready:
+            logging.info("probe /readiness: warming up (503)")
             raise HTTPException(status_code=503, detail="warming up")
+        logging.info(f"probe /readiness: ready, busy={sched.busy}")
         return {"status": "ready", "busy": sched.busy}
 
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

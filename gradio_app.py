@@ -1,6 +1,6 @@
 """Gradio front end for serve.py: streams frames into one live view.
 
-    LBW_URL=http://lbw-v2:8000 python gradio_app.py
+    LBW_URL=http://lbw-v2-dit-t5:8000 python gradio_app.py
 """
 
 import base64
@@ -16,7 +16,7 @@ import numpy as np
 import requests
 from PIL import Image
 
-LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2.default.svc.cluster.local:8000")
+LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 PLAYBACK_FPS = 16
 DEFAULT_PROMPT = (
     "gentle ripples spreading across the calm lake water, tree leaves swaying softly "

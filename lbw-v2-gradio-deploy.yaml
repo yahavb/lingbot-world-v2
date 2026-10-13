@@ -42,7 +42,7 @@ spec:
             - name: BRANCH
               value: "main"
             - name: LBW_URL
-              value: "http://lbw-v2.default.svc.cluster.local:8000"
+              value: "http://lbw-v2-dit-t5.default.svc.cluster.local:8000"
           ports:
             - containerPort: 7860
           startupProbe:

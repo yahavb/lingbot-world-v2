@@ -52,12 +52,15 @@ def run_server(jobs, state):
 
     @app.get("/health")
     def health():
+        logging.info("probe /health: healthy")
         return {"status": "healthy"}
 
     @app.get("/readiness")
     def readiness():
         if not state["ready"]:
+            logging.info("probe /readiness: warming up (503)")
             raise HTTPException(status_code=503, detail="warming up")
+        logging.info("probe /readiness: ready")
         return {"status": "ready"}
 
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
