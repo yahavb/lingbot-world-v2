@@ -248,11 +248,17 @@ class AttentionBlock(nn.Module):
                                                          3, dim=-1)
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        if x.device.type == "neuron":
+            attn = torch.softmax(
+                (q.float() @ k.float().transpose(-2, -1)) * q.size(-1)**-0.5,
+                dim=-1)
+            x = (attn @ v.float()).to(v.dtype)
+        else:
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+            )
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
