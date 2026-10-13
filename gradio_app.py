@@ -19,10 +19,26 @@ import requests
 LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 PLAYBACK_FPS = 16
 GALLERY_MAX = int(os.environ.get("GALLERY_MAX", "600"))
-DEFAULT_PROMPT = (
+EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
+SCENES = {
+    "02 · city alley, game-style walk": "02",
+    "01 · Stonehenge": "01",
+    "00 · fantasy jungle castle": "00",
+    "05 · dragon flight": "05",
+    "04": "04",
+    "03 · lake": "03",
+}
+LAKE_PROMPT = (
     "gentle ripples spreading across the calm lake water, tree leaves swaying softly "
     "in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera "
     "push-in, serene natural motion")
+
+
+def scene_info(label):
+    d = os.path.join(EXAMPLES, SCENES[label])
+    p = os.path.join(d, "prompt.txt")
+    prompt = open(p).read().strip() if os.path.isfile(p) else LAKE_PROMPT
+    return os.path.join(d, "image.jpg"), prompt
 
 
 def to_video(paths):
@@ -34,12 +50,12 @@ def to_video(paths):
     return out
 
 
-def start(prompt):
+def start(prompt, scene):
     outdir = tempfile.mkdtemp(prefix="lbw_")
     paths, t0, next_show = [], time.time(), 0.0
     yield None, [], None, "waiting for the model..."
     with requests.post(f"{LBW_URL}/live", stream=True, timeout=3600,
-                       json={"prompt": prompt}) as r:
+                       json={"prompt": prompt, "scene": SCENES[scene]}) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line.startswith(b"data: "):
@@ -87,7 +103,14 @@ def stop():
 with gr.Blocks(title="LingBot-World v2 on AWS Trainium") as demo:
     gr.Markdown("# LingBot-World v2 on AWS Trainium\nOne continuous stream. "
                 "**Change prompt** steers the scene from the next chunk on.")
-    prompt = gr.Textbox(label="Prompt", value=DEFAULT_PROMPT, lines=3)
+    first_scene = next(iter(SCENES))
+    first_img, first_prompt = scene_info(first_scene)
+    with gr.Row():
+        scene = gr.Dropdown(list(SCENES), value=first_scene, label="Scene (start image + camera path)")
+        start_img = gr.Image(value=first_img, label="Start image", type="filepath", height=160,
+                             interactive=False)
+    prompt = gr.Textbox(label="Prompt", value=first_prompt, lines=4)
+    scene.change(scene_info, [scene], [start_img, prompt])
     with gr.Row():
         start_btn = gr.Button("Start", variant="primary")
         change_btn = gr.Button("Change prompt")
@@ -98,7 +121,7 @@ with gr.Blocks(title="LingBot-World v2 on AWS Trainium") as demo:
     status = gr.Textbox(label="Stream", interactive=False)
     control = gr.Textbox(label="Control", interactive=False)
     gallery = gr.Gallery(label="Frames so far", columns=8, height=360, object_fit="contain")
-    start_btn.click(start, [prompt], [live, gallery, video, status], concurrency_limit=None)
+    start_btn.click(start, [prompt, scene], [live, gallery, video, status], concurrency_limit=None)
     change_btn.click(change_prompt, [prompt], [control], concurrency_limit=None)
     stop_btn.click(stop, [], [control], concurrency_limit=None)
 
