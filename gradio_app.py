@@ -1,15 +1,18 @@
-"""Gradio front end for serve.py's live mode: one continuous stream, prompts change on the fly.
+"""Gradio front end for serve.py: a session of ~5 s segments that continue one generation.
 
-Frames are kept as the server's JPEGs on disk: the live view shows the newest, the
-gallery accumulates them, and the whole stream becomes a playable mp4 when it ends.
+Start generates the first segment; Continue (any time, also while one is still
+generating) extends the same generation with the prompt in the box. Each segment
+arrives as one mp4 and plays at a steady 16 fps; the whole session is rebuilt
+after every segment.
 
     LBW_URL=http://lbw-v2-dit-t5:8000 python gradio_app.py
 """
 
 import base64
+import glob
 import json
 import os
-import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -20,7 +23,6 @@ import requests
 
 LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 PLAYBACK_FPS = 16
-GALLERY_MAX = int(os.environ.get("GALLERY_MAX", "600"))
 EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
 SCENES = {
     "02 · city alley, game-style walk": "02",
@@ -34,6 +36,8 @@ LAKE_PROMPT = (
     "gentle ripples spreading across the calm lake water, tree leaves swaying softly "
     "in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera "
     "push-in, serene natural motion")
+PLAYBACK = {}   # session dir -> wall time the segment now playing finishes
+LOCK = threading.Lock()
 
 
 def scene_info(label):
@@ -43,96 +47,83 @@ def scene_info(label):
     return os.path.join(d, "image.jpg"), prompt
 
 
-def to_video(paths):
-    out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+def to_video(frames, out):
     with imageio.get_writer(out, fps=PLAYBACK_FPS, codec="libx264", macro_block_size=8,
                             output_params=["-pix_fmt", "yuv420p"]) as w:
-        for p in paths:
+        for p in frames:
             w.append_data(imageio.imread(p))
     return out
 
 
-def start(prompt, scene):
-    """Show the newest frame, keep every frame.
-
-    A reader thread drains the server stream into a queue as fast as it arrives, so the
-    live view never falls behind the generator: each update shows the newest frame and
-    the frames in between go only to disk, the gallery and the final mp4.
-    """
-    outdir = tempfile.mkdtemp(prefix="lbw_")
-    events, quit_ = queue.Queue(), threading.Event()
-    resp = requests.post(f"{LBW_URL}/live", stream=True, timeout=3600,
-                         json={"prompt": prompt, "scene": SCENES[scene]})
-    resp.raise_for_status()
-
-    def reader():
-        try:
-            for line in resp.iter_lines():
-                if quit_.is_set():
-                    break
-                if line.startswith(b"data: "):
-                    events.put(json.loads(line[6:]))
-        except Exception as e:
-            events.put({"error": str(e)})
-        finally:
-            events.put(None)
-
-    threading.Thread(target=reader, daemon=True).start()
-    paths, t0, last_gallery, msg = [], time.time(), 0, None
-    yield None, [], None, "waiting for the model..."
-    try:
-        while msg is None:
-            batch = [events.get()]
-            while not events.empty():
-                batch.append(events.get())
-            for ev in batch:
-                if ev is None or ev.get("done"):
-                    msg = "stopped"
-                    break
-                if "error" in ev:
-                    msg = f"error: {ev['error']}"
-                    break
-                if ev.get("superseded"):
-                    msg = "replaced by a newer stream"
-                    break
-                path = os.path.join(outdir, f"{len(paths):06d}.jpg")
-                with open(path, "wb") as f:
-                    f.write(base64.b64decode(ev["frame"]))
-                paths.append(path)
-            if paths and msg is None:
-                n = len(paths)
-                gallery = gr.update()
-                if n - last_gallery >= 12:
-                    gallery, last_gallery = paths[-GALLERY_MAX:], n
-                yield paths[-1], gallery, gr.update(), \
-                    f"live: {n} frames, {n / (time.time() - t0):.1f} fps"
-                time.sleep(1.0 / PLAYBACK_FPS)
-    finally:
-        quit_.set()
-        resp.close()
-    if paths:
-        yield paths[-1], paths[-GALLERY_MAX:], to_video(paths), \
-            f"{msg} after {len(paths)} frames ({time.time() - t0:.0f} s) - press play on Whole stream"
-    else:
-        yield gr.update(), gr.update(), gr.update(), msg
+def segment(path, body, sdir):
+    """Stream one segment from the server; yield (now playing, whole session, status)."""
+    tmp = tempfile.mkdtemp(dir=sdir)
+    n, t0, seg = 0, time.time(), None
+    yield gr.update(), gr.update(), "generating..."
+    with requests.post(f"{LBW_URL}{path}", json=body, stream=True, timeout=3600) as r:
+        if r.status_code == 409:
+            yield gr.update(), gr.update(), "no session - press Start first"
+            return
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line.startswith(b"data: "):
+                continue
+            ev = json.loads(line[6:])
+            if "error" in ev:
+                yield gr.update(), gr.update(), f"error: {ev['error']}"
+                return
+            if ev.get("superseded"):
+                yield gr.update(), gr.update(), f"skipped: {ev['superseded']}"
+                return
+            if ev.get("done"):
+                seg = ev["segment"]
+                break
+            with open(os.path.join(tmp, f"{n:06d}.jpg"), "wb") as f:
+                f.write(base64.b64decode(ev["frame"]))
+            n += 1
+            if n % 12 == 0:
+                yield gr.update(), gr.update(), \
+                    f"generating: {n} frames ({n / (time.time() - t0):.1f} fps)"
+    if seg is None:
+        return
+    sd = os.path.join(sdir, f"seg_{seg:03d}")
+    os.rename(tmp, sd)
+    clip = to_video(sorted(glob.glob(os.path.join(sd, "*.jpg"))),
+                    os.path.join(sdir, f"seg_{seg:03d}.mp4"))
+    whole = to_video(sorted(glob.glob(os.path.join(sdir, "seg_*", "*.jpg"))),
+                     os.path.join(sdir, f"session_{seg:03d}.mp4"))
+    # Don't cut the segment now playing off: wait until it has finished.
+    with LOCK:
+        until = PLAYBACK.get(sdir, 0)
+    if until > time.time():
+        yield gr.update(), gr.update(), f"segment {seg} ready, plays after the current one"
+        time.sleep(until - time.time())
+    with LOCK:
+        PLAYBACK[sdir] = time.time() + n / PLAYBACK_FPS
+    yield clip, whole, f"segment {seg}: {n} frames generated in {time.time() - t0:.1f} s"
 
 
-def change_prompt(prompt):
-    r = requests.post(f"{LBW_URL}/live/prompt", json={"prompt": prompt}, timeout=30)
-    if r.status_code == 409:
-        return "no stream running - press Start"
-    r.raise_for_status()
-    return f"next chunk uses: {prompt[:80]}"
+def start(prompt, scene, sdir):
+    if sdir:
+        shutil.rmtree(sdir, ignore_errors=True)
+    sdir = tempfile.mkdtemp(prefix="lbw_session_")
+    for clip, whole, status in segment("/session", {"prompt": prompt, "scene": SCENES[scene]}, sdir):
+        yield clip, whole, status, sdir
 
 
-def stop():
-    requests.post(f"{LBW_URL}/live/stop", timeout=30).raise_for_status()
-    return "stopping at the next chunk"
+def cont(prompt, sdir):
+    if not sdir:
+        yield gr.update(), gr.update(), "press Start first", sdir
+        return
+    for clip, whole, status in segment("/continue", {"prompt": prompt}, sdir):
+        yield clip, whole, status, sdir
 
 
 with gr.Blocks(title="LingBot-World v2 on AWS Trainium") as demo:
-    gr.Markdown("# LingBot-World v2 on AWS Trainium\nOne continuous stream. "
-                "**Change prompt** steers the scene from the next chunk on.")
+    gr.Markdown("# LingBot-World v2 on AWS Trainium\n**Start** generates ~5 s. "
+                "**Continue** extends the same scene with the prompt in the box - press it any "
+                "time, the next segment is generated while this one plays.")
+    sdir = gr.State("")
     first_scene = next(iter(SCENES))
     first_img, first_prompt = scene_info(first_scene)
     with gr.Row():
@@ -143,17 +134,13 @@ with gr.Blocks(title="LingBot-World v2 on AWS Trainium") as demo:
     scene.change(scene_info, [scene], [start_img, prompt])
     with gr.Row():
         start_btn = gr.Button("Start", variant="primary")
-        change_btn = gr.Button("Change prompt")
-        stop_btn = gr.Button("Stop", variant="stop")
+        cont_btn = gr.Button("Continue")
+    status = gr.Textbox(label="Status", interactive=False)
     with gr.Row():
-        live = gr.Image(label="Live", type="filepath", height=480)
-        video = gr.Video(label="Whole stream (ready when it stops)", height=480)
-    status = gr.Textbox(label="Stream", interactive=False)
-    control = gr.Textbox(label="Control", interactive=False)
-    gallery = gr.Gallery(label="Frames so far", columns=8, height=360, object_fit="contain")
-    start_btn.click(start, [prompt, scene], [live, gallery, video, status], concurrency_limit=None)
-    change_btn.click(change_prompt, [prompt], [control], concurrency_limit=None)
-    stop_btn.click(stop, [], [control], concurrency_limit=None)
+        now = gr.Video(label="Now playing", autoplay=True, height=420)
+        whole = gr.Video(label="Whole session", height=420)
+    start_btn.click(start, [prompt, scene, sdir], [now, whole, status, sdir], concurrency_limit=None)
+    cont_btn.click(cont, [prompt, sdir], [now, whole, status, sdir], concurrency_limit=None)
 
 demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", "7860")),
                     root_path=os.environ.get("ROOT_PATH", ""))
