@@ -29,7 +29,7 @@ spec:
         node-type: trn3-dev1
       resourceClaims:
         - name: neuroncores
-          resourceClaimTemplateName: xxl-lnc2
+          resourceClaimTemplateName: l-lnc1
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -75,13 +75,13 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "180"
-              memory: 1800Gi
-              ephemeral-storage: 600Gi
+              cpu: "44"
+              memory: 450Gi
+              ephemeral-storage: 100Gi
             limits:
-              cpu: "190"
-              memory: 1900Gi
-              ephemeral-storage: 600Gi
+              cpu: "47"
+              memory: 475Gi
+              ephemeral-storage: 100Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -91,9 +91,9 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
-              value: "64"
+              value: "32"
             - name: LNC
-              value: "2"
+              value: "1"
             - name: LAT_H
               value: "60"
             - name: LAT_W
