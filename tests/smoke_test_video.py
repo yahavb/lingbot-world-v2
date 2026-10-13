@@ -62,7 +62,7 @@ def read_all_frames(path):
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     cap.release()
 
-    return {"fps": fps, "width": width, "height": height, "frame_count": len(frames)}, frames
+    return {"playback_fps": fps, "width": width, "height": height, "frame_count": len(frames)}, frames
 
 
 def shannon_entropy(gray):
@@ -97,7 +97,7 @@ def check_video(
     if expected_frame_num is not None:
         checks["frame_count_matches"] = meta["frame_count"] == expected_frame_num
     if expected_fps is not None:
-        checks["fps_matches"] = abs(meta["fps"] - expected_fps) < 0.5
+        checks["fps_matches"] = abs(meta["playback_fps"] - expected_fps) < 0.5
     if expected_area is not None:
         actual_area = meta["width"] * meta["height"]
         meta["area"] = actual_area
