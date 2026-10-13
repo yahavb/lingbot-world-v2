@@ -26,6 +26,9 @@ from wan.modules.attention import (
     const_max_ag_attention,
     const_max_ag_available,
     exact_attention,
+    exact_attention_chunks,
+    fa2_ag_attention,
+    fa2_ag_available,
 )
 from wan.modules.chunked_kv_cache import chunk_routing, ordered_chunks_by_block
 
@@ -70,6 +73,65 @@ def layer_uses_const_max(layer_index):
     return int(layer_index) not in _FLASH_ATTN_LAYERS
 
 
+# PER-RANK TOKEN PADDING. Measured (scripts/profiling/bench_prologue_variants.py, one core, compiled):
+# the block's fp32 norm/modulate + q/k/v + RMSNorm prologue costs 1.01 ms at 540 tokens (cp8) but
+# 0.20 ms at 640 -- any fp32 elementwise work on a token count that is not a multiple of 128 falls
+# off a lowering cliff (the device trace shows LNC2 cross-core DMA-accumulate of fp32 partials).
+# So the residual stream is padded to a multiple of LINGBOT_TOKEN_PAD inside the block stack:
+# Q / cross-attn / FFN / camera run on the padded rows, K/V are sliced back to the real tokens
+# before the cache write and the attention kernels, and the head sees the real tokens only.
+# Padded rows never reach a real row (attention keys exclude them; everything else is per-row).
+# 0 disables.
+_TOKEN_PAD = int(os.environ.get("LINGBOT_TOKEN_PAD", "128"))
+# LINGBOT_CAM_HOIST=1 (default): compute each block's camera FiLM params once per chunk instead of
+# inside every block call (see WanModelFast._cam_films). 0 restores the in-block computation.
+_CAM_HOIST = os.environ.get("LINGBOT_CAM_HOIST", "1") == "1"
+_RESIDUAL_BF16 = os.environ.get("LINGBOT_RESIDUAL_BF16", "0") == "1"
+_REAL_TOKENS = [None]   # this forward's real per-rank token count when padded, else None
+_ROWMAX_STATS = os.environ.get("LINGBOT_ROWMAX_STATS")   # dir; eager runs only
+_ROWMAX = {}   # (layer, global_head) -> dict of running stats
+_ROWMAX_ON = [False]   # set per forward: only REAL generation forwards (not prewarm's zero inputs)
+
+
+def _record_rowmax(attn, q, k_new, kv_chunks, cp_enabled, sp_group, grid):
+    """Runtime row-max statistics of the SCALED self-attention scores, per (layer, head),
+    over the full KV window this forward attends to (leading chunks + the new chunk,
+    CP-gathered). With across-heads QK-RMSNorm (d=5120) the weight-only Cauchy-Schwarz
+    bound is too loose, so classify hot/cold from measured row-max. Eager only (it materialises the scores)."""
+    import atexit, json
+    if cp_enabled:
+        cp = sp_group_dist_size(sp_group)
+        k_new = _gather_w(k_new, grid[0], grid[1], grid[2] // cp, sp_group, cp)
+    k_chunks = kv_chunks[0]
+    lead = []
+    for kc in k_chunks[:-1]:
+        lead.append(kc.permute(2, 0, 1).unsqueeze(0) if kc.dim() == 3 else kc)  # N-major [N,d,S] -> [1,S,N,d]
+    k = torch.cat(lead + [k_new], dim=1).float()            # [1, Sk, n, d]
+    qf = q.float()                                          # [1, Sq, n, d]
+    n, d = qf.shape[2], qf.shape[3]
+    s = torch.einsum("bqnd,bknd->bnqk", qf, k) * (d ** -0.5)
+    rm = s.amax(-1)[0].cpu()                                # [n, Sq]
+    tp_r = tp.tp_rank(_TP_GROUP) if getattr(attn, "tp_enabled", False) else 0
+    layer = int(getattr(attn, "layer_index", -1))
+    for h in range(n):
+        r = rm[h]
+        key = (layer, tp_r * n + h)
+        st = _ROWMAX.setdefault(key, {"max": -1e30, "min": 1e30, "sum": 0.0, "cnt": 0,
+                                      "gt60": 0, "gt88": 0, "lt_m65": 0, "sk": 0})
+        st["max"] = max(st["max"], float(r.max())); st["min"] = min(st["min"], float(r.min()))
+        st["sum"] += float(r.sum()); st["cnt"] += r.numel(); st["sk"] = max(st["sk"], int(k.shape[1]))
+        st["gt60"] += int((r > 60).sum()); st["gt88"] += int((r > 88).sum())
+        st["lt_m65"] += int((r < -65).sum())
+    if not getattr(_record_rowmax, "_registered", False):
+        _record_rowmax._registered = True
+        def _dump():
+            os.makedirs(_ROWMAX_STATS, exist_ok=True)
+            rank = int(os.environ.get("RANK", "0"))
+            out = {f"{l}:{h}": v for (l, h), v in _ROWMAX.items()}
+            json.dump(out, open(os.path.join(_ROWMAX_STATS, f"rowmax_rank{rank}.json"), "w"))
+        atexit.register(_dump)
+
+
 def assign_layer_attention(blocks):
     """Stamp each block's self-attention with its index and its kernel choice.
 
@@ -86,6 +148,26 @@ def assign_layer_attention(blocks):
 
 def causal_rope_grids(freqs, grid_sizes, device, start_frame=0, dtype=torch.float32,
                       w_shard=None):
+    """Memoized _causal_rope_grids_build. The grids depend only on (freqs, grid, start_frame,
+    shard, dtype), which repeat for all 5 forwards of a chunk and across GEN passes, while a
+    rebuild costs a ~10 ms freqs.cpu() D2H sync plus CPU work and an H2D copy every forward."""
+    grid_key = tuple(tuple(int(v) for v in row) for row in
+                     (grid_sizes.tolist() if torch.is_tensor(grid_sizes) else grid_sizes))
+    key = (id(freqs), tuple(freqs.shape), grid_key, str(device), int(start_frame), dtype,
+           None if w_shard is None else tuple(w_shard))
+    hit = _ROPE_GRID_CACHE.get(key)
+    if hit is not None and hit[0] is freqs:
+        return hit[1]
+    out = _causal_rope_grids_build(freqs, grid_sizes, device, start_frame, dtype, w_shard)
+    _ROPE_GRID_CACHE[key] = (freqs, out)
+    return out
+
+
+_ROPE_GRID_CACHE = {}
+
+
+def _causal_rope_grids_build(freqs, grid_sizes, device, start_frame=0, dtype=torch.float32,
+                             w_shard=None):
     """Precompute per-batch cos/sin rotary grids. Independent of x.
 
     `grid_sizes` is always the FULL patch grid. `w_shard=(cp, rank)` then slices
@@ -436,6 +518,10 @@ class CausalWanSelfAttention(nn.Module):
         """
         return const_max_ag_available() and getattr(self, "use_const_max", True)
 
+    def _fa2_here(self):
+        """Hot layer served by the fused AG FlashAttention-2 kernel (LINGBOT_HOT_ATTN=fa2_ag)."""
+        return (not self._const_max_here()) and fa2_ag_available()
+
     def forward(
         self,
         x,
@@ -542,6 +628,9 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(k, rope_grid, freqs, start_frame=_csf,
                                           w_shard=cp_w_shard).type_as(v)
 
+        if _REAL_TOKENS[0] is not None and roped_key.shape[1] > _REAL_TOKENS[0]:
+            roped_key = roped_key[:, :_REAL_TOKENS[0]]
+            v = v[:, :_REAL_TOKENS[0]]
         if cp_enabled:
             # Gather K/V to the FULL chunk across CP, on the WIDTH axis inside a
             # reshaped [B, f, h, w_loc, ...] view. A flat cat on dim 1 would
@@ -562,12 +651,15 @@ class CausalWanSelfAttention(nn.Module):
             # PER-LAYER, not global: a hot layer takes the exact-attention path and so
             # still needs the CP gather done here, even though const_max_ag is loaded and
             # the other 36 layers skip it.
-            if not self._const_max_here():
+            if not self._const_max_here() and not self._fa2_here():
                 roped_key = _gather_w(roped_key, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
                 v = _gather_w(v, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
 
         if not cp_enabled:
             _cp_shard_k, _cp_shard_v = roped_key, v
+        if kv_chunks is not None and _ROWMAX_STATS and _ROWMAX_ON[0] and not torch.compiler.is_compiling():
+            _record_rowmax(self, roped_query, _cp_shard_k, kv_chunks, cp_enabled, sp_group,
+                           _g if cp_enabled else None)
         # CHUNKED CACHE (the reference implementation (kv_cache.py)). No offset of any kind: the
         # destination is a whole tensor and the write lands at its own index 0, so
         # nothing position-dependent enters the graph. wan/modules/chunked_kv_cache.py
@@ -591,6 +683,15 @@ class CausalWanSelfAttention(nn.Module):
                 if return_cache and not getattr(self, 'tp_enabled', False):
                     return out, _ka, _va
                 return out
+            if self._fa2_here() and cp_enabled:
+                # Hot layer, exact attention: same fused-AG contract as const-max above, but
+                # online softmax (FA2 kernel), so no constant-max assumption.
+                x, _ka, _va = fa2_ag_attention(
+                    roped_query, _cp_shard_k, _cp_shard_v, k_chunks, v_chunks)
+                out = self._out_proj(x, _async_out)
+                if return_cache and not getattr(self, 'tp_enabled', False):
+                    return out, _ka, _va
+                return out
             # Destination is LAST in the ordering. A whole-tensor copy_ into a base
             # tensor is what "direct must-alias output binding" needs (kv_cache.py:100);
             # writing a slice of a larger parent is the case that comment rules out.
@@ -604,8 +705,7 @@ class CausalWanSelfAttention(nn.Module):
             # const_max_ag is not loaded). exact_attention prefers attention_cte over
             # SDPA because SDPA materialises the [B, N, Sq, Sk] scores -- 1.270 GB at
             # 768*1152, which OOM'd on the first denoise forward once 7 layers took it.
-            x = exact_attention(roped_query, torch.cat(k_chunks, dim=1),
-                                torch.cat(v_chunks, dim=1))
+            x = exact_attention_chunks(roped_query, k_chunks, v_chunks)
             # PRECEDENCE, mirroring the flat path's "if cp_enabled / elif sp_enabled".
             # cp_enabled is `sp_enabled and _SEQ_MODE == "cp"`, so BOTH are true under
             # CP and a bare `if sp_enabled` fires there -- wrong twice over. Token-axis
@@ -925,6 +1025,17 @@ class CausalWanAttentionBlock(nn.Module):
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
+    def cam_film(self, c2ws_plucker_emb):
+        """Camera FiLM parameters (cam_scale, cam_shift) of this block. A function of the chunk's
+        camera condition and the weights only: no x, no timestep."""
+        cam_hidden = torch_F.silu(self.cam_injector_layer1(c2ws_plucker_emb))
+        if getattr(self, 'tp_enabled', False):
+            c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden)
+        else:
+            c2ws_hidden_states = self.cam_injector_layer2(cam_hidden)
+        c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
+        return self.cam_scale_layer(c2ws_hidden_states), self.cam_shift_layer(c2ws_hidden_states)
+
     def forward(
         self,
         x,
@@ -963,6 +1074,7 @@ class CausalWanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
+        _rdt = x.dtype   # residual-stream dtype (fp32, or bf16 with LINGBOT_RESIDUAL_BF16=1)
         with torch.amp.autocast('neuron', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
@@ -987,19 +1099,16 @@ class CausalWanAttentionBlock(nn.Module):
             grid_ints=grid_ints)
 
         # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            cam_hidden = torch_F.silu(self.cam_injector_layer1(c2ws_plucker_emb))
-            if getattr(self, 'tp_enabled', False):
-                c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden)
+        if dit_cond_dict is not None and ("cam_film" in dit_cond_dict or "c2ws_plucker_emb" in dit_cond_dict):
+            if "cam_film" in dit_cond_dict:
+                # Hoisted (LINGBOT_CAM_HOIST): the FiLM params depend only on the chunk's camera,
+                # so they were computed once per chunk by cam_film() outside this graph.
+                cam_scale, cam_shift = dit_cond_dict["cam_film"]
             else:
-                c2ws_hidden_states = self.cam_injector_layer2(cam_hidden)
-            c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
-            cam_scale = self.cam_scale_layer(c2ws_hidden_states)
-            cam_shift = self.cam_shift_layer(c2ws_hidden_states)
+                cam_scale, cam_shift = self.cam_film(dit_cond_dict["c2ws_plucker_emb"])
             y = y.wait() if hasattr(y, 'wait') else y
             with torch.amp.autocast('neuron', dtype=torch.float32):
-                x = x + y * e[2].squeeze(2)
+                x = (x + y * e[2].squeeze(2)).to(_rdt)
             if getattr(self, 'tp_enabled', False):
                 # cam_scale/cam_shift are column-parallel, so each rank holds
                 # only its own output-feature slice. The update is elementwise
@@ -1023,7 +1132,7 @@ class CausalWanAttentionBlock(nn.Module):
         else:
             y = y.wait() if hasattr(y, 'wait') else y
             with torch.amp.autocast('neuron', dtype=torch.float32):
-                x = x + y * e[2].squeeze(2)
+                x = (x + y * e[2].squeeze(2)).to(_rdt)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None,
@@ -1041,7 +1150,7 @@ class CausalWanAttentionBlock(nn.Module):
             else:
                 y = self.ffn(ffn_input)
             with torch.amp.autocast('neuron', dtype=torch.float32):
-                x = x + y * e[5].squeeze(2)
+                x = (x + y * e[5].squeeze(2)).to(_rdt)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache,
@@ -1270,6 +1379,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         if self.model_type == 'i2v':
             assert y is not None
 
+        _ROWMAX_ON[0] = getattr(self, "_t_host_key", None) is not None
         # Flag bf16 RoPE temporaries when the chunk is large (960x1664),
         # halving the fp32 transient peak that OOMs the DiT. Seed-parity
         set_bf16_rope_for_forward(seq_len)
@@ -1278,9 +1388,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
         device = getattr(self, '_onload_device', self.patch_embedding.weight.device)
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
-        for _name, _mod in self.named_children():
-            if _name != 'blocks':
-                _mod.to(device)
+        # Non-block children are moved once per device, not on every forward (each .to walks
+        # every parameter on the host).
+        if getattr(self, "_children_on", None) != str(device):
+            for _name, _mod in self.named_children():
+                if _name != 'blocks':
+                    _mod.to(device)
+            self._children_on = str(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -1321,7 +1435,17 @@ class WanModelFast(ModelMixin, ConfigMixin):
         if t.dim() == 1:
             t = t.expand(t.size(0), 1)
         e_seq = t.size(1)
-        with torch.amp.autocast('neuron', dtype=torch.float32):
+        # Host-side cache of e/e0 keyed by the timestep VALUE the caller knows on the host
+        # (image2video sets self._t_host_key). Only 5 values occur (4 denoise steps + the
+        # cache-commit t=0), and the fp64 sinusoid runs as CPU-fallback ops with D2H/H2D
+        # copies every forward. Same ops, same inputs -> identical result.
+        _tkey = getattr(self, "_t_host_key", None)
+        _tkey = None if _tkey is None else (_tkey, tuple(t.shape), str(device))
+        _thit = getattr(self, "_t_emb_cache", {}).get(_tkey) if _tkey is not None else None
+        if _thit is not None:
+            e, e0 = _thit
+        else:
+          with torch.amp.autocast('neuron', dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(
@@ -1331,18 +1455,42 @@ class WanModelFast(ModelMixin, ConfigMixin):
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
             e = e.to(device)
             e0 = e0.to(device)
+          if _tkey is not None:
+            if not hasattr(self, "_t_emb_cache"):
+                self._t_emb_cache = {}
+            self._t_emb_cache[_tkey] = (e, e0)
 
-        # context
+        # context: constant for the whole generation, so embed it once per context tensor.
+        _ckey = (id(context[0]), tuple(context[0].shape)) if len(context) == 1 else None
+        _chit = getattr(self, "_ctx_emb_cache", None)
+        if _ckey is not None and _chit is not None and _chit[0] == _ckey and _chit[1] is context[0]:
+            context = _chit[2]
+        else:
+            _ctx_in = context[0] if len(context) == 1 else None
+            context_lens = None
+            context = self.text_embedding(
+                torch.stack([
+                    torch.cat(
+                        [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]))
+            if _ckey is not None:
+                self._ctx_emb_cache = (_ckey, _ctx_in, context)
         context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
+
+        # cam: the condition is per CHUNK (same tuple object for its 5 forwards), so the
+        # embedded + sharded result is reused within the chunk.
+        _cam_in = None
+        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+            _cam_in = dit_cond_dict["c2ws_plucker_emb"]
+            _camhit = getattr(self, "_cam_emb_cache", None)
+            if _camhit is not None and _camhit[0] is _cam_in:
+                dit_cond_dict = dict(dit_cond_dict)
+                dit_cond_dict["c2ws_plucker_emb"] = _camhit[1]
+                _cam_in = None
 
         # cam
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+        if _cam_in is not None:
             c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
             c2ws_plucker_emb = [
                 rearrange(
@@ -1397,6 +1545,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                     c2ws_plucker_emb = c2ws_plucker_emb[:, _s0:_s1].contiguous()
             dit_cond_dict = dict(dit_cond_dict)
             dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb
+            self._cam_emb_cache = (_cam_in, c2ws_plucker_emb)
 
         # seq_lens_int for signature parity with the legacy sequence_parallel
         # module; not consumed by the in-model SP path below.
@@ -1589,7 +1738,20 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # makes every block see the same dtype and halves the graph count, without
         # losing precision: the residual stream was already fp32 for 39 of 40
         # blocks, and each block's first op is self.norm1(x).float() regardless.
-        x = x.float()
+        # LINGBOT_RESIDUAL_BF16=1 keeps the residual stream in bf16 between blocks (norm and
+        # modulation math still run in fp32 inside each block). Default fp32.
+        x = x.to(torch.bfloat16) if _RESIDUAL_BF16 else x.float()
+        _REAL_TOKENS[0] = None
+        _L = x.shape[1]
+        if _TOKEN_PAD and _chunked and _L % _TOKEN_PAD:
+            _Lp = -(-_L // _TOKEN_PAD) * _TOKEN_PAD
+            x = torch_F.pad(x, (0, 0, 0, _Lp - _L))
+            _cd = kwargs.get("dit_cond_dict")
+            if _cd is not None and "c2ws_plucker_emb" in _cd and _cd["c2ws_plucker_emb"].shape[1] == _L:
+                _cd = dict(_cd)
+                _cd["c2ws_plucker_emb"] = torch_F.pad(_cd["c2ws_plucker_emb"], (0, 0, 0, _Lp - _L))
+                kwargs["dit_cond_dict"] = _cd
+            _REAL_TOKENS[0] = _L
         if _chunked:
             # Chunked cache: hand each block its (leading..., destination) buffers.
             # current_start is passed as 0 ON PURPOSE -- the census showed it was the
@@ -1602,11 +1764,16 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 x = _stacks[_dest](x, _ks, _vs, tuple(crossattn_cache),
                                    self._stack_tokens[_dest], kwargs)
             else:
+                _films = self._cam_films(kwargs.get("dit_cond_dict"))
                 for block_index, block in enumerate(self.blocks):
+                    _kw = kwargs
+                    if _films is not None:
+                        _kw = dict(kwargs)
+                        _kw["dit_cond_dict"] = {"cam_film": _films[block_index]}
                     x = block(x, kv_cache=None,
                               kv_chunks=(list(_ks[block_index]), list(_vs[block_index])),
                               crossattn_cache=crossattn_cache[block_index],
-                              current_start=0, **kwargs)
+                              current_start=0, **_kw)
         else:
             for block_index, block in enumerate(self.blocks):
                 block_is_sharded = getattr(block, 'tp_enabled', False)
@@ -1623,6 +1790,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 if not block_is_sharded:
                     block.to('cpu')
 
+        if _REAL_TOKENS[0] is not None:
+            x = x[:, :_REAL_TOKENS[0]]
+            _REAL_TOKENS[0] = None
         # head
         x = self.head(x, e)
 
@@ -1644,6 +1814,35 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         return [u.float() for u in x]
 
+
+    def _cam_films(self, dit_cond_dict):
+        """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).
+
+        cam_film() reads only the chunk's camera condition, which is the same object for all
+        forwards of a chunk (see _cam_emb_cache), so its 4 matmuls and 1 all-reduce per block
+        need not run in every denoise step. Returns a list (one (scale, shift) per block) or
+        None to keep the in-block computation."""
+        if not _CAM_HOIST or dit_cond_dict is None or "c2ws_plucker_emb" not in dit_cond_dict:
+            return None
+        c2ws = dit_cond_dict["c2ws_plucker_emb"]
+        src = getattr(self, "_cam_emb_cache", None)
+        key = (id(src[1]) if src is not None else id(c2ws), tuple(c2ws.shape))
+        hit = getattr(self, "_cam_film_cache", None)
+        if hit is not None and hit[0] == key and hit[2] is (src[1] if src is not None else c2ws):
+            return hit[1]
+        fns = getattr(self, "_cam_film_fns", None)
+        if fns is None:
+            raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+            if os.environ.get("LINGBOT_COMPILE_DIT", "0") == "1":
+                fns = [torch.compile(b.cam_film, backend="neuron", fullgraph=True, dynamic=False)
+                       for b in raw]
+            else:
+                fns = [b.cam_film for b in raw]
+            self._cam_film_fns = fns
+        films = [fn(c2ws) for fn in fns]
+        # Hold a reference to the key object so its id cannot be reused while cached.
+        self._cam_film_cache = (key, films, src[1] if src is not None else c2ws)
+        return films
 
     def _block_stacks(self, n_chunks):
         """Compiled block stacks (one shared by default), or None if compile is off.

@@ -12,7 +12,7 @@ spec:
         node-type: trn3-dev1
       resourceClaims:
         - name: neuroncores
-          resourceClaimTemplateName: xl-lnc2
+          resourceClaimTemplateName: xxl-lnc2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -80,15 +80,15 @@ spec:
             - name: KEEP_ALIVE_SECONDS
               value: "86400"
             - name: NPROC
-              value: "32"
+              value: "64"
             - name: LNC
               value: "2"
             - name: CP
-              value: "4"
+              value: "8"
             - name: TP
               value: "8"
             - name: SIZE
-              value: "480*832"
+              value: "480*768"
             - name: FRAME_NUM
               value: "81"
             - name: CHUNK_SIZE

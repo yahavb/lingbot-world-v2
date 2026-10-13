@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import math
+import contextlib
 import os
 import random
 import sys
@@ -604,6 +605,15 @@ class WanI2VCausal:
         """
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
+        if flow_pred.device.type == "neuron" and os.environ.get("LINGBOT_HOST_SCHED", "1") == "1":
+            # The form below asks for fp64, but on Neuron it is computed in fp32 and every op
+            # runs with its own D2H/H2D pair. Measured (scripts/profiling/check_sched_parity.py):
+            # looking sigma_t up on the host tables and doing the fp32 multiply-subtract on
+            # device is bit-identical to it (max|d| = 0), with no copies and no sync.
+            _ts = scheduler.timesteps.cpu().double()
+            _tid = torch.argmin((_ts - timestep.cpu().double()).abs())
+            _sig = float(scheduler.sigmas.cpu().double()[_tid])
+            return (xt - _sig * flow_pred).to(original_dtype)
         flow_pred, xt, sigmas, timesteps = map(
             lambda x: x.double().to(flow_pred.device), [flow_pred, xt, scheduler.sigmas, scheduler.timesteps]
         )
@@ -788,7 +798,8 @@ class WanI2VCausal:
         # nothing left in the loop to blame -- because GEN wraps this entire function and
         # I had only instrumented the loop inside it.
         self._gen_phase = {"sched": 0.0, "setup": 0.0, "prep": 0.0, "randn": 0.0,
-                           "addnoise": 0.0, "ctx": 0.0, "encode": 0.0, "cat": 0.0}
+                           "addnoise": 0.0, "ctx": 0.0, "encode": 0.0, "cat": 0.0,
+                           "kvinit": 0.0}
         _g0 = time.perf_counter()
         noise = torch.randn(
             16,
@@ -953,6 +964,7 @@ class WanI2VCausal:
 
 
         # Initialize KV cache to all zeros
+        _k0 = time.perf_counter()
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1]// 4)
@@ -975,6 +987,8 @@ class WanI2VCausal:
                                                           shape=cross_kv_shape,
                                                           dtype=transformer_dtype,
                                                           device=self.device)
+        torch.neuron.synchronize()
+        self._gen_phase["kvinit"] += time.perf_counter() - _k0
         # evaluation mode
         with (
                 torch.amp.autocast('neuron', dtype=self.param_dtype),
@@ -984,6 +998,13 @@ class WanI2VCausal:
             # sample videos
             latent = noise
             self._dit_fwd_ms = []
+            # Optional single-forward profile (set by generate.py LINGBOT_PROFILE_FORWARD).
+            _pf = getattr(self, "_profile_forward", None)
+            self._profile_forward = None
+            def _fwd_ctx():
+                if _pf is not None and len(self._dit_fwd_ms) == _pf[0]:
+                    return _pf[1]()
+                return contextlib.nullcontext()
             self._dit_fwd_tag = []
             # WHERE THE NON-DiT TIME GOES.
             #
@@ -1059,13 +1080,15 @@ class WanI2VCausal:
                     # This is the honest number. perf_counter around the call includes
                     # the device sync that the next host-side read forces anyway, so it
                     # attributes queueing to the forward rather than hiding it.
+                    self.model._t_host_key = float(current_timestep[0])
                     torch.neuron.synchronize()
                     _f0 = time.perf_counter()
-                    noise_pred = self.model(
-                        x=latent_model_input, t=timestep,
-                        cross_attn_first_call=not self._cross_attn_initialized,
-                        **kwargs)[0]
-                    torch.neuron.synchronize()
+                    with _fwd_ctx():
+                        noise_pred = self.model(
+                            x=latent_model_input, t=timestep,
+                            cross_attn_first_call=not self._cross_attn_initialized,
+                            **kwargs)[0]
+                        torch.neuron.synchronize()
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                     self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}")
                     self._cross_attn_initialized = True
@@ -1099,8 +1122,20 @@ class WanI2VCausal:
                         torch.neuron.synchronize()
                         self._gen_phase["randn"] += time.perf_counter() - _n0
                         _a0 = time.perf_counter()
-                        current_latent = self.scheduler.add_noise(
-                            x0, _noise, next_timestep)
+                        if os.environ.get("LINGBOT_HOST_SCHED", "1") == "1":
+                            # add_noise with the sigma lookup done on the host tables
+                            # (index_for_timestep's nonzero/.item() synced the device), then
+                            # the same fp32 alpha*x0 + sigma*noise on device.
+                            _sch = self.scheduler
+                            _sig = _sch.sigmas.to(dtype=x0.dtype, device="cpu")
+                            _idx = _sch.index_for_timestep(
+                                next_timestep.cpu() if torch.is_tensor(next_timestep) else next_timestep,
+                                _sch.timesteps.cpu())
+                            _a, _s = _sch._sigma_to_alpha_sigma_t(_sig[_idx])
+                            current_latent = float(_a) * x0 + float(_s) * _noise
+                        else:
+                            current_latent = self.scheduler.add_noise(
+                                x0, _noise, next_timestep)
                         torch.neuron.synchronize()
                         self._gen_phase["addnoise"] += time.perf_counter() - _a0
                     else:
@@ -1115,12 +1150,14 @@ class WanI2VCausal:
                 # A FIFTH DiT forward per chunk. len(timesteps) is 4
                 # (timesteps_index=[0, 179, 358, 679]), so the denoise loop above is not
                 # the whole cost -- this cache-commit pass runs the full 40 blocks too.
+                self.model._t_host_key = float(context_timestep[0])
                 torch.neuron.synchronize()
                 _f0 = time.perf_counter()
-                self.model(x=[x0], t=timestep,
-                           cross_attn_first_call=False,
-                           **kwargs)
-                torch.neuron.synchronize()
+                with _fwd_ctx():
+                    self.model(x=[x0], t=timestep,
+                               cross_attn_first_call=False,
+                               **kwargs)
+                    torch.neuron.synchronize()
                 self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                 self._dit_fwd_tag.append(f"c{chunk_id}commit")
 
@@ -1137,6 +1174,9 @@ class WanI2VCausal:
                 _top = sorted(zip(self._dit_fwd_ms, self._dit_fwd_tag), reverse=True)[:8]
                 logging.info("[BENCH] DiT slowest: " + ", ".join(
                     f"{t}={ms / 1000:.1f}s" for ms, t in _top))
+                # Every forward in call order, so window-filling vs full-window cost is visible.
+                logging.info("[BENCH] DiT all: " + " ".join(
+                    f"{t}={ms:.0f}" for ms, t in zip(self._dit_fwd_ms, self._dit_fwd_tag)))
                 _big = [ms for ms in self._dit_fwd_ms if ms > 10 * _m[len(_m) // 2]]
                 logging.info(
                     f"[BENCH] DiT stalls >10x median: {len(_big)} calls, "
@@ -1149,7 +1189,7 @@ class WanI2VCausal:
                     f"prep={_ph['prep']:.1f} s randn={_ph['randn']:.1f} s "
                     f"addnoise={_ph['addnoise']:.1f} s "
                     f"ctx={_ph['ctx']:.1f} s encode={_ph['encode']:.1f} s "
-                    f"cat={_ph['cat']:.1f} s "
+                    f"cat={_ph['cat']:.1f} s kvinit={_ph['kvinit']:.1f} s "
                     f"accounted={_tot + sum(_ph.values()):.1f} s")
             _t0 = time.perf_counter()
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
@@ -1161,6 +1201,7 @@ class WanI2VCausal:
                 torch.neuron.empty_cache()
 
             skip_decode = save_latents_path is not None or return_latents
+            _post0 = time.perf_counter()
             if self.rank == 0:
                 if save_latents_path is not None:
                     save_latents_dir = Path(save_latents_path).parent
@@ -1184,6 +1225,9 @@ class WanI2VCausal:
         if dist.is_initialized():
             dist.barrier()
 
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logging.info(f"[BENCH] GEN post (latents .cpu() + save + barrier): "
+                         f"{(time.perf_counter() - _post0) * 1000:.0f} ms")
         if skip_decode:
             return pred_latent_chunks.cpu()
         return videos[0] if self.rank == 0 else None
@@ -1480,7 +1524,9 @@ class WanI2VCausal:
             # need N-major. With FLASH_ATTN_LAYERS unset this is all-True and identical to
             # the previous n_major=const_max_ag_available().
             from .modules.model_fast import flash_attn_layers, layer_uses_const_max
-            _n_major = [const_max_ag_available() and layer_uses_const_max(i)
+            from .modules.attention import fa2_ag_available
+            # FA2 AG hot layers read the same N-major cache as the const-max layers.
+            _n_major = [const_max_ag_available() and (layer_uses_const_max(i) or fa2_ag_available())
                         for i in range(num_layers)]
             cache = allocate_self_kv_chunks(
                 num_layers, batch, chunk_size * frame_seqlen, heads, head_dim,
@@ -1503,6 +1549,10 @@ class WanI2VCausal:
                 # removes the hazard and a redundant world collective per generation.
                 _rg = _tp.replica_groups("cp")
                 init_const_max_ag(_rg, chunk_size * frame_seqlen)
+                from .modules.attention import fa2_ag_available, init_fa2_ag
+                if fa2_ag_available() and _flash:
+                    init_fa2_ag(_rg, chunk_size * frame_seqlen)
+                    logging.info(f"hot layers {_flash}: fa2_ag (fused AG FlashAttention-2)")
                 logging.info(
                     f"const_max_ag: {n} chunks x {chunk_size * frame_seqlen} tokens, "
                     f"cp replica groups {_rg[:2]}...")

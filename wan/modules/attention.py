@@ -167,6 +167,48 @@ def const_max_ag_available():
     return _CONST_MAX_AG_AVAILABLE
 
 
+# ── HOT-LAYER ATTENTION: FA2 all-gather ─────────────────────────────────────
+# LINGBOT_HOT_ATTN=fa2_ag (default with const_max_ag) runs the FLASH_ATTN_LAYERS through the fused
+# all-gather FlashAttention-2 kernel (kernels/fa2_ag.py): exact online softmax, the
+# CP gather of the new chunk inside the kernel, and the same N-major chunk cache as the const-max
+# layers -- so no _gather_w, no torch.cat, no layout transposes in the graph.
+# LINGBOT_HOT_ATTN=cte keeps the previous path (CP gather + exact_attention_chunks/attention_cte).
+_HOT_ATTN = os.environ.get("LINGBOT_HOT_ATTN", "fa2_ag").strip().lower()
+_FA2_AG_AVAILABLE = False
+_FA2_KERNELS = None
+if ATTENTION_BACKEND == "const_max_ag" and _HOT_ATTN == "fa2_ag":
+    try:
+        from kernels.fa2_ag import ag_fa2_attention, build_fa2_ag_kernels
+        _FA2_AG_AVAILABLE = True
+        _log_kernel_ok("[attention.py] kernel: fa2_ag (fused AG FlashAttention-2) for hot layers")
+    except Exception as e:
+        print(f"[attention.py] fa2_ag: FAILED rank={_RANK} ({e}) -- hot layers use attention_cte")
+
+
+def fa2_ag_available():
+    return _FA2_AG_AVAILABLE
+
+
+def init_fa2_ag(cp_replica_groups, kv_chunk_tokens):
+    """Build the four fixed-arity FA2 AG callables (same contract as init_const_max_ag)."""
+    global _FA2_KERNELS
+    import math as _math
+    import nki.collectives as ncc
+    rg = ncc.ReplicaGroup([list(g) for g in cp_replica_groups])
+    _FA2_KERNELS = build_fa2_ag_kernels(rg, 1.0 / _math.sqrt(ATTENTION_TILE_SIZE), kv_chunk_tokens)
+    return _FA2_KERNELS
+
+
+def fa2_ag_attention(q, k_shard, v_shard, k_chunks, v_chunks):
+    """Fused AG FA2 over `(leading..., destination)` N-major chunks; mirrors const_max_ag_attention."""
+    if _FA2_KERNELS is None:
+        raise RuntimeError("call init_fa2_ag() before fa2_ag_attention()")
+    lead = len(k_chunks) - 1
+    return ag_fa2_attention(
+        q, k_shard, v_shard, tuple(k_chunks[:-1]), tuple(v_chunks[:-1]),
+        _FA2_KERNELS[lead], k_chunks[-1], v_chunks[-1])
+
+
 def init_const_max_ag(cp_replica_groups, kv_chunk_tokens, softmax_max=15.0):
     """Build the four fixed-arity kernel callables. Call once, after the mesh exists.
 
@@ -372,6 +414,50 @@ def _cte_attention(q, k, v, kv_lo=None, kv_hi=None, dtype=torch.bfloat16):
         out = out[0]
     out = out[:, :lq]                                    # drop padded queries
     return out.permute(1, 0, 2).unsqueeze(0)             # [1, Lq, n, d]
+
+
+def _cte_attention_chunks(q, k_chunks, v_chunks, dtype=torch.bfloat16):
+    """_cte_attention over a LIST of KV chunks, without torch.cat or F.pad.
+
+    Same math and the same zero padding as _cte_attention(q, cat(k), cat(v)). The difference
+    is only in how K/V are built: each chunk is permuted straight into its slice of one
+    preallocated, already-padded [n, Lkv_padded, d] buffer. At cp8 the cat + permute + pad form
+    lowered (inside the compiled hot block) to spill/reload DMAs at ~1.7 GB/s and cost ~23 ms
+    per KV chunk; the same form at cp4 ran at ~40 GB/s. LINGBOT_HOT_KV_CAT=1 restores the cat.
+    """
+    b, lq, n, d = q.shape
+    assert b == 1, "attention_cte path assumes batch_size=1 (heads occupy batch)"
+    lkv = sum(int(c.shape[1]) for c in k_chunks)
+    Q_ALIGN, KV_ALIGN = 128, 512
+    pad_q = (Q_ALIGN - lq % Q_ALIGN) % Q_ALIGN
+    lkv_p = lkv + (KV_ALIGN - lkv % KV_ALIGN) % KV_ALIGN
+    softmax_scale = 1.0 / math.sqrt(d)
+    q_c = (q[0].float() * softmax_scale).permute(1, 0, 2).contiguous().to(dtype)
+    if pad_q:
+        q_c = F.pad(q_c, (0, 0, 0, pad_q))
+    k_c = q.new_zeros((n, lkv_p, d), dtype=dtype)
+    v_c = q.new_zeros((n, lkv_p, d), dtype=dtype)
+    off = 0
+    for kc, vc in zip(k_chunks, v_chunks):
+        L = int(kc.shape[1])
+        k_c[:, off:off + L] = kc[0].permute(1, 0, 2).to(dtype)
+        v_c[:, off:off + L] = vc[0].permute(1, 0, 2).to(dtype)
+        off += L
+    out = _attention_cte(q_c, k_c, v_c, scale=1.0, causal_mask=False,
+                         tp_q=True, tp_k=True, tp_out=False)
+    if isinstance(out, tuple):
+        out = out[0]
+    out = out[:, :lq]
+    return out.permute(1, 0, 2).unsqueeze(0)
+
+
+def exact_attention_chunks(q, k_chunks, v_chunks, dtype=torch.bfloat16):
+    """exact_attention over a list of KV chunks (see _cte_attention_chunks)."""
+    if (q.device.type == "neuron" and (_CTE_FOR_EXACT_AVAILABLE or _CTE_AVAILABLE)
+            and os.environ.get("LINGBOT_HOT_KV_CAT", "0") != "1"):
+        return _cte_attention_chunks(q, list(k_chunks), list(v_chunks), dtype=dtype)
+    return exact_attention(q, torch.cat(list(k_chunks), dim=1), torch.cat(list(v_chunks), dim=1),
+                           dtype=dtype)
 
 
 def exact_attention(q, k, v, dtype=torch.bfloat16):

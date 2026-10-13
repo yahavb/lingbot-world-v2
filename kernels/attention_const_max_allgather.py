@@ -461,7 +461,7 @@ def _attention_const_max_compute(
 
     # The core loads the KV block before firing the callback, so when the gathered chunk is
     # also chunk 0 the transpose-load would read k_last_tmp before the all_gather writes it.
-    # Hoist instead. O2 hits this at lead_count=0, the first chunk of a fresh KV window.
+    # Hoist instead. This happens at lead_count=0, the first chunk of a fresh KV window.
     hoist_collectives = num_chunks == 1 and collective_callbacks_by_head is not None
     if hoist_collectives:
         for head_idx in range(Nq):
@@ -509,7 +509,7 @@ def _attention_const_max_compute(
 
                 # Fire this head's collective once, on its first chunk / first Q-block, so it
                 # overlaps compute and completes before the last (gathered) chunk is consumed.
-                # O2: skipped when hoisted above (num_chunks == 1).
+                # Skipped when hoisted above (num_chunks == 1).
                 collective_callback = None
                 if (
                     collective_callbacks_by_head is not None

@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import logging
 import math
 import gc
@@ -528,8 +529,39 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
     #
     # LINGBOT_BENCH_RUNS=1 restores the single-pass behaviour.
     _runs = max(1, int(os.environ.get("LINGBOT_BENCH_RUNS", "2")))
+    # LINGBOT_TORCH_PROFILE_DIR=<dir>: torch profiler + Neuron RUNTIME (system) and DEVICE (ntff)
+    # traces around the LAST GEN pass only, so compile/warmup is not in the trace. Only
+    # LINGBOT_PROFILE_RANK (default 0) records; the other ranks run the identical pass unprofiled because they take part in every collective.
+    _prof_dir = os.environ.get("LINGBOT_TORCH_PROFILE_DIR")
+    _prof_rank = int(os.environ.get("LINGBOT_PROFILE_RANK", "0"))
     _gen_ms = []
     for _r in range(_runs):
+        _prof_ctx = contextlib.nullcontext()
+        if _prof_dir and _r == _runs - 1 and rank == _prof_rank:
+            from torch.profiler import ProfilerActivity, profile as _tprofile
+            from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
+            _pdir = os.path.join(_prof_dir, f"rank{rank}")
+            os.makedirs(_pdir, exist_ok=True)
+            _modes = [ProfileMode.RUNTIME]
+            if os.environ.get("LINGBOT_PROFILE_DEVICE", "1") == "1":
+                _modes.append(ProfileMode.DEVICE)
+            _pcfg = NeuronConfig(modes=_modes, profile_output_dir=_pdir,
+                                 max_events_per_nc=int(os.environ.get("LINGBOT_PROFILE_MAX_EVENTS", "12000000")))
+            _make_prof = lambda: _tprofile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+                                           experimental_config=_pcfg,
+                                           on_trace_ready=NeuronProfiler(_pcfg).export_trace)
+            # LINGBOT_PROFILE_FORWARD=<n>: profile ONLY DiT forward n of this pass (0-based,
+            # in call order; 20 = a full-window denoise step), not the whole pass.
+            _one = os.environ.get("LINGBOT_PROFILE_FORWARD")
+            if _one not in (None, ""):
+                wan_i2v._profile_forward = (int(_one), _make_prof)
+                print(f"[PROFILE] only DiT forward {_one} of run{_r + 1}")
+            else:
+                _prof_ctx = _make_prof()
+            print(f"[PROFILE] run{_r + 1} rank{rank} modes={[m.name for m in _modes]} -> {_pdir}")
+        if dist.is_initialized():
+            dist.barrier()
+        _prof_ctx.__enter__()
         _gen_start = time.perf_counter()
         _result = wan_i2v.generate(
             args.prompt,
@@ -552,6 +584,7 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             torch.neuron.synchronize()
             dist.barrier()
         _gen_ms.append((time.perf_counter() - _gen_start) * 1000)
+        _prof_ctx.__exit__(None, None, None)
         if rank == 0:
             _tag = ("compile+warmup, NOT latency" if _r == 0 and _runs > 1
                     else "steady state" if _runs > 1 else "single pass")
