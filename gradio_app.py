@@ -1,4 +1,4 @@
-"""Gradio front end for serve.py: a session of ~5 s segments that continue one generation.
+"""Gradio front end for serve.py: a session of ~10 s segments that continue one generation.
 
 Start generates the first segment; Continue (any time, also while one is still
 generating) extends the same generation with the prompt in the box. Each segment
@@ -120,7 +120,7 @@ def cont(prompt, sdir):
 
 
 with gr.Blocks(title="LingBot-World v2 on AWS Trainium") as demo:
-    gr.Markdown("# LingBot-World v2 on AWS Trainium\n**Start** generates ~5 s. "
+    gr.Markdown("# LingBot-World v2 on AWS Trainium\n**Start** generates ~10 s. "
                 "**Continue** extends the same scene with the prompt in the box - press it any "
                 "time, the next segment is generated while this one plays.")
     sdir = gr.State("")
