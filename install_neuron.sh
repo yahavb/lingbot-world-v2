@@ -49,6 +49,6 @@ if [ -z "${TORCHVISION_REF:-}" ]; then
 fi
 echo "torchvision: building $TORCHVISION_REF for torch $TORCH_MM"
 TORCHVISION_BUILD_DIR="$(mktemp -d)"
-git clone --depth 1 --branch "$TORCHVISION_REF" https://github.com/pytorch/vision.git "$TORCHVISION_BUILD_DIR"
+git -c advice.detachedHead=false clone -q --depth 1 --branch "$TORCHVISION_REF" https://github.com/pytorch/vision.git "$TORCHVISION_BUILD_DIR"
 pip install "$TORCHVISION_BUILD_DIR" --no-build-isolation --no-deps
 rm -rf "$TORCHVISION_BUILD_DIR"
