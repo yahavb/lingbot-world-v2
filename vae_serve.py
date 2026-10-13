@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 import torch
 import torch.distributed as dist
@@ -122,9 +123,12 @@ def main():
         if msg[0] is None:
             continue
         try:
+            t0 = time.perf_counter()
             z = torch.load(io.BytesIO(msg[0]["z"]), map_location="cpu")
             frames = decode(z, msg[0]["first"])
             if rank == 0:
+                logging.info(f"decode first={int(msg[0]['first'])} latent={tuple(z.shape)} "
+                             f"-> {len(frames)} frames in {(time.perf_counter() - t0) * 1000:.0f} ms")
                 job[2].put(frames)
         except Exception as e:
             logging.exception("decode failed")
