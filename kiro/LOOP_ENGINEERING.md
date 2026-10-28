@@ -9,19 +9,37 @@ seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1`
 | | Code | Layout | GEN (s) | VAE (s) | Total (s) | fps |
 |---|---|---|---|---|---|---|
 | Baseline (the job) | upstream `main` @ `6cf1011` | TP8 × CP8 | 8.95 | 2.95 | 11.90 | 6.81 |
+| Baseline with `const_max_ag` (estimate, not measured; see below) | upstream `main` | TP8 × CP8 | ~6.7 | 2.95 | ~9.7 | ~8.4 |
 | Layout change only | `loop_engineering`, flags off | TP4 × CP16 | 22.46 | 3.01 | 25.47 | 3.18 |
+| This branch, the job's layout | `loop_engineering`, flags on | TP8 × CP8 | 5.73 | 3.04 | 8.76 | 9.24 |
 | **This branch** | `loop_engineering`, flags on | TP4 × CP16 | **5.75** | 3.01 | **8.75** | **9.26** |
 
-**1.56× on GEN and 1.36× end to end (6.81 → 9.26 fps) against the job's own layout.**
+**Measured: 1.36× end to end against `main` as it runs on this host (6.81 → 9.26 fps), 1.56× on
+GEN. Assumed: ~1.1× against `main` with its default `const_max_ag` kernel, which does not run
+here; this is the conservative estimate and the number to quote.** With our flags the two
+layouts give the same result (5.73 vs 5.75 s GEN), so on 16 devices the gain is the code.
+
+**The `const_max_ag` estimate.** `main` defaults to `ATTENTION_BACKEND=const_max_ag`, a fused
+CP all-gather + attention kernel that subtracts an assumed row max (15.0) instead of computing
+it. On this host it fails while compiling (see below), so `main` was measured with `cte`.
+Upstream measured it 9.8% faster per DiT forward than `cte` (TP8 × CP4, 768 res). At this
+setting it would also skip the `cte` KV assembly that makes `main`'s second chunk slow (482 vs
+~150 ms per forward, ~1.66 s of 8.95 s), in 36 of 40 layers (the 4 hot layers stay exact):
+8.95 − 1.49 = 7.46 s, × 0.902 = 6.73 s GEN, 9.68 s total, 8.37 fps → 9.68 / 8.75 = 1.106×.
+Applying only the 9.8% gives ~1.26×; the lower figure is the one assumed.
 
 - GEN is the steady-state second pass (`[BENCH] GEN time`). VAE is the steady-state call of
   `decode_latents_width_sharded.py`. fps = 81 / (GEN + VAE). These are the job's own definitions
   (`lbw-v2-i2v-job.yaml`); `kiro/run_job16.sh` runs the job's two steps with its args and env.
-- All three use `ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte` and launch asynchronously
+- All measured runs use `ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte` and launch asynchronously
   (`NEURON_LAUNCH_BLOCKING=0` is torch-neuronx's default; the job does not set it). This
-  branch's flags: `LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1`.
-- The VAE step is the same code in all three; 2.95–3.01 s is run-to-run spread.
-- All three videos pass `tests/smoke_test_video.py` (81 frames, 768×480, not blank, not frozen).
+  branch's flags: `LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1`. Both TP8 × CP8 runs use
+  the core order and precomputed prompt embeddings described below.
+- The VAE step is the same code in every run; 2.95–3.04 s is run-to-run spread.
+- Every measured video passes `tests/smoke_test_video.py` (81 frames, 768×480, not blank, not
+  frozen).
+- Startup, not in the numbers above: with `LINGBOT_LOAD_CONCURRENCY=16` the 64-rank weight load
+  takes ~27 s instead of ~380 s (one rank at a time, the default).
 
 Per DiT forward (ms; a chunk is 5 forwards):
 
@@ -29,7 +47,8 @@ Per DiT forward (ms; a chunk is 5 forwards):
 |---|---|---|---|---|---|
 | Baseline, TP8 × CP8 | ~140 | ~482 | ~165 | ~191 | +35 |
 | Layout change only | ~117 | ~3140 | ~160 | ~203 | +25 |
-| This branch | ~100 | ~117 | ~125 | ~136 | +25 |
+| This branch, TP8 × CP8 | ~109 | ~116 | ~130 | ~136 | +35 |
+| This branch, TP4 × CP16 | ~100 | ~117 | ~125 | ~136 | +25 |
 
 The layout change alone is slower: the upstream `cte` path's KV assembly lowers pathologically for
 the two-chunk window at CP16 (3.1 s per forward, 15.7 s of that run's 22.5 s). The merged
@@ -130,6 +149,7 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_FILM_FULL=1` | full-width FiLM params once per chunk without SP |
 | `LINGBOT_AR_BF16=1` | row-parallel reductions in bf16 (no measured gain) |
 | `LINGBOT_PRE_ENCODE` (default 1) | VAE-encode the conditioning image before the DiT loads |
+| `LINGBOT_LOAD_CONCURRENCY=N` | N ranks load the DiT weights per turn (default 1); needs ~10–13 GB host RAM per loading rank |
 | `LINGBOT_DUMP_LATENTS=<path>`, `LINGBOT_MEMLOG=1` | diagnostics |
 
 ## Scripts (`kiro/`)
@@ -164,4 +184,10 @@ bash /work/repo/kiro/run_job16.sh /work/repo base16_off TP=4 CP=16 \
 bash /work/repo/kiro/run_job16.sh /work/repo ours16 TP=4 CP=16 \
   ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1 \
   NEURON_LAUNCH_BLOCKING=0
+# this branch on the job's layout
+bash /work/repo/kiro/run_job16.sh /work/repo ours16_tp8 TP=8 CP=8 \
+  ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1 \
+  NEURON_LAUNCH_BLOCKING=0 DEC_DEFAULT_CORES=1 LINGBOT_LOAD_CONCURRENCY=16 \
+  NEURON_RT_VISIBLE_CORES=$(python3 /work/repo/kiro/core_order.py) \
+  PROMPT_EMBEDS=/work/out/prompt_embeds_job.pt
 ```

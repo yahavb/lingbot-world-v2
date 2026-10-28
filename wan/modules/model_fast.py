@@ -2640,8 +2640,17 @@ def load_tp_wan_model_fast(checkpoint_dir, subfolder, tp_degree, dtype,
     # One WORLD rank loads at a time (barrier between each): under an sp x tp
     # mesh the TP-group-local rank collides across SP cells, so guard on the
     # global rank to keep a single concurrent multi-GB checkpoint load.
-    for turn in range(world_size):
-        if global_rank == turn:
+    #
+    # LINGBOT_LOAD_CONCURRENCY=N lets N ranks load per turn instead (default 1, the
+    # behaviour above). At 64 ranks one-at-a-time is ~10 s per rank, 10.5 min in all; the
+    # OOM it guards against is HOST memory on a memory-limited pod, so raise it only where
+    # host RAM allows (each rank holds ~10-13 GB of CPU tensors while it loads). A turn
+    # takes ranks with the same (rank % turns), i.e. one rank per device at LNC2, so the
+    # host-to-device copies of a turn spread over every device's link.
+    conc = max(1, min(world_size, int(os.environ.get("LINGBOT_LOAD_CONCURRENCY", "1"))))
+    n_turns = -(-world_size // conc)
+    for turn in range(n_turns):
+        if global_rank % n_turns == turn:
             if pth_path is not None:
                 config = WanModelFast.load_config(checkpoint_dir, subfolder=subfolder)
                 with torch.device("meta"):
@@ -2679,6 +2688,9 @@ def load_tp_wan_model_fast(checkpoint_dir, subfolder, tp_degree, dtype,
             ], dim=1)
 
             model.load_state_dict(sharded_sd, strict=True)
+            # Free this rank's CPU shard now rather than when the function returns: with
+            # turns, every finished rank used to keep its copy alive until the last turn.
+            del sharded_sd
             # Eager device placement only safe when actually sharded small;
             # at tp_degree<=1 forward()'s per-block loop streams it instead.
             model = model.to(dtype=dtype)
