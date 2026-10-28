@@ -748,6 +748,21 @@ def generate(args):
     if args.image is not None:
         img = Image.open(args.image).convert("RGB")
         logging.info(f"Input image: {args.image}")
+    if (img is not None and args.infer_mode == "causal_fast" and dist.is_initialized()
+            and os.environ.get("LINGBOT_PRE_ENCODE", "1") == "1"):
+        # Conditioning encode BEFORE the DiT load: the unsharded fp32 encoder OOM'd a TP4 rank
+        # with the DiT resident. Same latent as the in-loop encode (see pre_encode_condition).
+        from wan.image2video import pre_encode_condition
+        _t = time.perf_counter()
+        pre_encode_condition(
+            os.path.join(args.ckpt_dir, cfg.vae_checkpoint), torch.device(f"neuron:{local_rank}"),
+            img, args.action_path, args.frame_num, args.chunk_size, MAX_AREA_CONFIGS[args.size],
+            EXACT_GRID_SIZES.get(args.size), cfg.vae_stride, cfg.patch_size)
+        dist.barrier()
+        if rank == 0:
+            print(f"[BENCH] PRE-ENCODE time: {(time.perf_counter() - _t) * 1000:.1f} ms")
+        from wan.image2video import memlog
+        memlog("after pre-encode")
 
     dit_start = time.perf_counter()
     video = run_causal(args, cfg, img, device, rank, mode=args.infer_mode,
@@ -759,6 +774,12 @@ def generate(args):
         print(f"[BENCH] DiT time: {(time.perf_counter() - dit_start) * 1000:.1f} ms")
 
     if e2e_vae:
+        # LINGBOT_DUMP_LATENTS=<path>: rank 0 saves the final latents of the last GEN pass, so
+        # configurations can be compared numerically (outside every timed window).
+        _dump = os.environ.get("LINGBOT_DUMP_LATENTS")
+        if _dump and rank == 0 and video is not None:
+            torch.save(video.detach().float().cpu(), _dump)
+            print(f"[BENCH] latents saved to {_dump} {tuple(video.shape)}")
         destroy_dit_parallel_group()
         torch.neuron.empty_cache()
         if dist.is_initialized():

@@ -86,6 +86,30 @@ _TOKEN_PAD = int(os.environ.get("LINGBOT_TOKEN_PAD", "128"))
 # LINGBOT_CAM_HOIST=1 (default): compute each block's camera FiLM params once per chunk instead of
 # inside every block call (see WanModelFast._cam_films). 0 restores the in-block computation.
 _CAM_HOIST = os.environ.get("LINGBOT_CAM_HOIST", "1") == "1"
+# LINGBOT_FILM_FULL=1 (with LINGBOT_CAM_HOIST): all-gather each block's column-parallel camera
+# FiLM scale/shift once per chunk instead of all-gathering the fp32 residual x in every block of
+# every forward. Exact (the same elementwise update); costs 2 x [L, dim] bf16 per block of HBM.
+_FILM_FULL = os.environ.get("LINGBOT_FILM_FULL", "0") == "1"
+# LINGBOT_SP=1: Megatron sequence parallelism inside the TP group (chunked-cache path only): the
+# residual stream is token-sharded across the TP ranks between the blocks; see
+# CausalWanAttentionBlock.forward. The camera FiLM params become [1, S, C] token shards.
+_SP_ON = os.environ.get("LINGBOT_SP", "0") == "1"
+
+
+def sp_token_shard(x, tp_size, tp_rank):
+    """[1, Lp, C] -> this TP rank's contiguous token shard [1, Lp/tp, C]."""
+    s = x.shape[1] // tp_size
+    assert s * tp_size == x.shape[1], f"padded tokens {x.shape[1]} not divisible by tp {tp_size}"
+    return x[:, tp_rank * s:(tp_rank + 1) * s].contiguous()
+
+
+def film_full_width(scale_local, shift_local):
+    """Column-parallel FiLM params -> full feature width (rank order = feature order)."""
+    return (tp.all_gather_last_dim(scale_local.contiguous(), _TP_GROUP),
+            tp.all_gather_last_dim(shift_local.contiguous(), _TP_GROUP))
+# LINGBOT_FILM_A2A=1 (with LINGBOT_SP): build the per-chunk FiLM token shards with an all-to-all
+# inside each block's compiled cam_film graph (cam_film_sp) instead of an eager all-gather + slice.
+_FILM_A2A = os.environ.get("LINGBOT_FILM_A2A", "0") == "1"
 _RESIDUAL_BF16 = os.environ.get("LINGBOT_RESIDUAL_BF16", "0") == "1"
 _REAL_TOKENS = [None]   # this forward's real per-rank token count when padded, else None
 _ROWMAX_STATS = os.environ.get("LINGBOT_ROWMAX_STATS")   # dir; eager runs only
@@ -410,7 +434,7 @@ def set_bf16_rope_for_forward(seq_len):
         mark_bf16_rope()
 
 
-def _tp_row_parallel(linear, x):
+def _tp_row_parallel(linear, x, scatter=False):
     """Row-parallel Linear + all-reduce.
 
     The matmul dtype is an A/B knob. Default (fp32, historical behaviour) wraps
@@ -452,7 +476,11 @@ def _tp_row_parallel(linear, x):
     # upcast does not survive this: there was no upcast.
     with torch.amp.autocast('neuron', dtype=torch.float32):
         y = linear(x)
-    if tp.has_mesh():
+    if scatter:
+        # Sequence parallel (LINGBOT_SP): reduce-scatter the partial sums to this rank's
+        # token shard instead of all-reducing the full sequence.
+        y = tp.reduce_scatter_tokens(y, "tp")
+    elif tp.has_mesh():
         # Traceable, OUT-OF-PLACE reduce over the DeviceMesh submesh, so this
         # Linear can sit inside a fullgraph=True compiled block. dist.all_reduce
         # below is in-place and untraceable, which is what forced the DiT eager.
@@ -547,6 +575,7 @@ class CausalWanSelfAttention(nn.Module):
         kv_chunks=None,
         return_cache=False,
         grid_ints=None,
+        _sp_scatter=False,
     ):
         r"""
         Args:
@@ -679,7 +708,7 @@ class CausalWanSelfAttention(nn.Module):
             if self._const_max_here() and cp_enabled:
                 x, _ka, _va = const_max_ag_attention(
                     roped_query, _cp_shard_k, _cp_shard_v, k_chunks, v_chunks)
-                out = self._out_proj(x, _async_out)
+                out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                 if return_cache and not getattr(self, 'tp_enabled', False):
                     return out, _ka, _va
                 return out
@@ -688,15 +717,25 @@ class CausalWanSelfAttention(nn.Module):
                 # online softmax (FA2 kernel), so no constant-max assumption.
                 x, _ka, _va = fa2_ag_attention(
                     roped_query, _cp_shard_k, _cp_shard_v, k_chunks, v_chunks)
-                out = self._out_proj(x, _async_out)
+                out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                 if return_cache and not getattr(self, 'tp_enabled', False):
                     return out, _ka, _va
                 return out
             # Destination is LAST in the ordering. A whole-tensor copy_ into a base
             # tensor is what "direct must-alias output binding" needs (kv_cache.py:100);
             # writing a slice of a larger parent is the case that comment rules out.
-            k_chunks[-1].copy_(roped_key)
-            v_chunks[-1].copy_(v)
+            if k_chunks[-1].dim() == 3:
+                # N-major chunks (LINGBOT_CTE_MERGE=1, the const-max cache layout: K [n, d, L],
+                # V [n, L, d]). The merged cte path reads them in place, so the layout change
+                # happens once here, on the new chunk only.
+                if int(k_chunks[-1].shape[1]) == int(roped_key.shape[-1]):
+                    k_chunks[-1].copy_(roped_key[0].permute(1, 2, 0))
+                else:
+                    k_chunks[-1].copy_(roped_key[0].permute(1, 0, 2))
+                v_chunks[-1].copy_(v[0].permute(1, 0, 2))
+            else:
+                k_chunks[-1].copy_(roped_key)
+                v_chunks[-1].copy_(v)
             # Every token in the concatenation is written, so no attn_mask and no
             # bound_min/bound_max -- the flat cache needed those only to hide its
             # unwritten tail. Length is len(order) x chunk_tokens: it grows while the
@@ -718,7 +757,7 @@ class CausalWanSelfAttention(nn.Module):
             # all_to_all first.
             if sp_enabled and not cp_enabled:
                 x = dt_util.all_to_all(x, 1, 2, group=sp_group)
-            out = self._out_proj(x, _async_out)
+            out = self._out_proj(x, _async_out, scatter=_sp_scatter)
             if return_cache and not getattr(self, 'tp_enabled', False):
                 return out, k_chunks[-1], v_chunks[-1]
             return out
@@ -883,7 +922,7 @@ class CausalWanSelfAttention(nn.Module):
             return out, kv_cache["k"], kv_cache["v"]
         return out
 
-    def _out_proj(self, x, _async_out=False):
+    def _out_proj(self, x, _async_out=False, scatter=False):
         """Shared o-projection tail for the flat- and chunked-cache paths.
 
         Lifted out of forward() unchanged so the chunked branch reaches the same
@@ -892,6 +931,12 @@ class CausalWanSelfAttention(nn.Module):
         was already the behaviour and stays that way.
         """
         x = x.flatten(2)
+        if scatter and getattr(self, 'tp_enabled', False):
+            # Sequence parallel (LINGBOT_SP): reduce-scatter to this rank's token shard.
+            orig_dtype = x.dtype
+            with torch.amp.autocast('neuron', dtype=torch.float32):
+                y = self.o(x)
+            return tp.reduce_scatter_tokens(y, "tp").to(orig_dtype)
         if getattr(self, 'tp_enabled', False):
             # fp32 Linear -> all-reduce -> downcast to the pre-Linear activation
             # dtype, matching _tp_row_parallel exactly. With _async_out (the
@@ -922,7 +967,7 @@ class CausalWanSelfAttention(nn.Module):
 class WanCrossAttention(WanSelfAttention):
 
     def forward(self, x, context, context_lens, crossattn_cache=None,
-                cross_attn_first_call=None):
+                cross_attn_first_call=None, _sp_scatter=False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -974,7 +1019,7 @@ class WanCrossAttention(WanSelfAttention):
         # output
         x = x.flatten(2)
         if getattr(self, 'tp_enabled', False):
-            x = _tp_row_parallel(self.o, x)
+            x = _tp_row_parallel(self.o, x, scatter=_sp_scatter)
         else:
             x = self.o(x)
         return x
@@ -1036,6 +1081,13 @@ class CausalWanAttentionBlock(nn.Module):
         c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
         return self.cam_scale_layer(c2ws_hidden_states), self.cam_shift_layer(c2ws_hidden_states)
 
+    def cam_film_sp(self, c2ws_plucker_emb):
+        """cam_film() already in the sequence-parallel form the SP block consumes: this rank's
+        token shard at full width, via one all-to-all per tensor inside the same graph
+        (LINGBOT_FILM_A2A=1) instead of an eager full-width all-gather + slice + clone."""
+        scale, shift = self.cam_film(c2ws_plucker_emb)
+        return tp.cols_to_token_shard(scale, "tp"), tp.cols_to_token_shard(shift, "tp")
+
     def forward(
         self,
         x,
@@ -1078,6 +1130,43 @@ class CausalWanAttentionBlock(nn.Module):
         with torch.amp.autocast('neuron', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
+        if _SP_ON and getattr(self, 'tp_enabled', False) and kv_chunks is not None:
+            # MEGATRON SEQUENCE PARALLELISM inside the TP group (LINGBOT_SP=1; Wan2.2 FAST_SP).
+            # x is this rank's TOKEN SHARD [1, S, C] of the padded chunk. Each column-parallel
+            # projection gets the all-gathered normed input; each row-parallel projection
+            # reduce-scatters its partial sums back to the shard (the bytes of the all-reduce it
+            # replaces). Norms, modulation, gates, camera FiLM and residual adds run on S tokens
+            # instead of all of them, and the per-block fp32 FiLM all-gather of x disappears.
+            # Attention, QK-norm, RoPE and the KV write still see all tokens of this rank's heads.
+            xs = x
+            h = self.norm1(xs).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+            hf = tp.all_gather_tokens(h.to(torch.bfloat16), "tp")
+            y = self.self_attn(
+                hf, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
+                frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int, _async_out=False,
+                sp_start_row=sp_start_row, sp_rows=sp_rows,
+                rope_grids=rope_grids, rope_local_grid=rope_local_grid,
+                kv_write_start=kv_write_start, kv_write_end=kv_write_end,
+                kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
+                kv_current_end=kv_current_end, kv_chunks=kv_chunks,
+                grid_ints=grid_ints, _sp_scatter=True)
+            with torch.amp.autocast('neuron', dtype=torch.float32):
+                xs = (xs + y * e[2].squeeze(2)).to(_rdt)
+            if dit_cond_dict is not None and "cam_film" in dit_cond_dict:
+                # [1, S, C]: this rank's tokens, full width (built once per chunk by _cam_films).
+                cam_scale, cam_shift = dit_cond_dict["cam_film"]
+                xs = (1.0 + cam_scale) * xs + cam_shift
+            hf = tp.all_gather_tokens(self.norm3(xs).to(torch.bfloat16), "tp")
+            xs = xs + self.cross_attn(hf, context, context_lens, crossattn_cache=crossattn_cache,
+                                      cross_attn_first_call=cross_attn_first_call,
+                                      _sp_scatter=True)
+            h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
+                self.ffn[0].weight.dtype)
+            hf = tp.all_gather_tokens(h, "tp")
+            y = _tp_row_parallel(self.ffn[2], self.ffn[1](self.ffn[0](hf)), scatter=True)
+            with torch.amp.autocast('neuron', dtype=torch.float32):
+                xs = (xs + y * e[5].squeeze(2)).to(_rdt)
+            return xs
         # self-attention o-projection row-parallel all-reduce can be issued
         # ASYNC (overlap the x-independent cam-injector MLP while the reduce is
         # in flight). MEASURED on TRN3: net-zero to ~4s SLOWER --
@@ -1109,7 +1198,11 @@ class CausalWanAttentionBlock(nn.Module):
             y = y.wait() if hasattr(y, 'wait') else y
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 x = (x + y * e[2].squeeze(2)).to(_rdt)
-            if getattr(self, 'tp_enabled', False):
+            if getattr(self, 'tp_enabled', False) and cam_scale.shape[-1] == x.shape[-1]:
+                # Full-width FiLM params (LINGBOT_FILM_FULL=1, gathered once per chunk by
+                # _cam_films): the same per-feature update on every rank, no collective.
+                x = (1.0 + cam_scale) * x + cam_shift
+            elif getattr(self, 'tp_enabled', False):
                 # cam_scale/cam_shift are column-parallel, so each rank holds
                 # only its own output-feature slice. The update is elementwise
                 # per feature, so apply it to the matching slice of x (x is
@@ -1742,6 +1835,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # modulation math still run in fp32 inside each block). Default fp32.
         x = x.to(torch.bfloat16) if _RESIDUAL_BF16 else x.float()
         _REAL_TOKENS[0] = None
+        _head_done = False
         _L = x.shape[1]
         if _TOKEN_PAD and _chunked and _L % _TOKEN_PAD:
             _Lp = -(-_L // _TOKEN_PAD) * _TOKEN_PAD
@@ -1765,6 +1859,11 @@ class WanModelFast(ModelMixin, ConfigMixin):
                                    self._stack_tokens[_dest], kwargs)
             else:
                 _films = self._cam_films(kwargs.get("dit_cond_dict"))
+                _tpd = tp.tp_degree(_TP_GROUP)
+                _sp = _SP_ON and _tpd > 1
+                if _sp:
+                    assert _films is not None, "LINGBOT_SP needs the hoisted camera FiLM (LINGBOT_CAM_HOIST=1)"
+                    x = sp_token_shard(x, _tpd, tp.tp_rank(_TP_GROUP))
                 for block_index, block in enumerate(self.blocks):
                     _kw = kwargs
                     if _films is not None:
@@ -1774,6 +1873,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
                               kv_chunks=(list(_ks[block_index]), list(_vs[block_index])),
                               crossattn_cache=crossattn_cache[block_index],
                               current_start=0, **_kw)
+                if _sp:
+                    # Head on the token shard, then gather the small projected tokens (64 wide).
+                    x = tp.all_gather_tokens(self.head(x, e), "tp")
+                    if _REAL_TOKENS[0] is not None:
+                        x = x[:, :_REAL_TOKENS[0]]
+                        _REAL_TOKENS[0] = None
+                    _head_done = True
         else:
             for block_index, block in enumerate(self.blocks):
                 block_is_sharded = getattr(block, 'tp_enabled', False)
@@ -1790,11 +1896,12 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 if not block_is_sharded:
                     block.to('cpu')
 
-        if _REAL_TOKENS[0] is not None:
-            x = x[:, :_REAL_TOKENS[0]]
-            _REAL_TOKENS[0] = None
-        # head
-        x = self.head(x, e)
+        if not _head_done:
+            if _REAL_TOKENS[0] is not None:
+                x = x[:, :_REAL_TOKENS[0]]
+                _REAL_TOKENS[0] = None
+            # head
+            x = self.head(x, e)
 
         # Gather the full sequence before unpatchify. The axis must match the one
         # that was sharded:
@@ -1830,16 +1937,39 @@ class WanModelFast(ModelMixin, ConfigMixin):
         hit = getattr(self, "_cam_film_cache", None)
         if hit is not None and hit[0] == key and hit[2] is (src[1] if src is not None else c2ws):
             return hit[1]
+        _tpd = tp.tp_degree(_TP_GROUP)
+        # SP + LINGBOT_FILM_A2A: each block's FiLM params come out of ONE compiled graph already
+        # token-sharded (cam_film_sp), so the eager gather/slice/clone below is skipped.
+        _a2a = _SP_ON and _FILM_A2A and _tpd > 1 and tp.has_mesh()
         fns = getattr(self, "_cam_film_fns", None)
         if fns is None:
             raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+            meth = "cam_film_sp" if _a2a else "cam_film"
             if os.environ.get("LINGBOT_COMPILE_DIT", "0") == "1":
-                fns = [torch.compile(b.cam_film, backend="neuron", fullgraph=True, dynamic=False)
-                       for b in raw]
+                fns = [torch.compile(getattr(b, meth), backend="neuron", fullgraph=True,
+                                     dynamic=False) for b in raw]
             else:
-                fns = [b.cam_film for b in raw]
+                fns = [getattr(b, meth) for b in raw]
             self._cam_film_fns = fns
-        films = [fn(c2ws) for fn in fns]
+        _full = (_FILM_FULL or _SP_ON) and _tpd > 1 and not _a2a
+        _r = tp.tp_rank(_TP_GROUP) if (_full and _SP_ON) else None
+        # One block at a time, so at most one block's full-width pair is alive (the old
+        # list-at-once form held 40 x 2 full-width [1, L, C] tensors per rank).
+        films = []
+        for fn in fns:
+            s, sh = fn(c2ws)
+            if _full:
+                # Gather the column-parallel FiLM params to full width ONCE PER CHUNK, so each
+                # of the chunk's 5 forwards applies them to the full x with no per-block
+                # all-gather.
+                s, sh = film_full_width(s, sh)
+                if _r is not None:
+                    # Sequence parallel: keep only this rank's tokens. clone(), not
+                    # sp_token_shard's .contiguous(): a dim-1 slice of [1, L, C] is already
+                    # contiguous, so the view would pin the whole full-width tensor in the cache.
+                    s = sp_token_shard(s, _tpd, _r).clone()
+                    sh = sp_token_shard(sh, _tpd, _r).clone()
+            films.append((s, sh))
         # Hold a reference to the key object so its id cannot be reused while cached.
         self._cam_film_cache = (key, films, src[1] if src is not None else c2ws)
         return films

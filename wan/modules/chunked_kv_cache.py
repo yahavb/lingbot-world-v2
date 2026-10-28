@@ -28,6 +28,8 @@ Here a chunk is a whole tensor written at its own index 0, so no integer offset 
 enters the graph.
 """
 
+import os
+
 import torch
 
 
@@ -127,7 +129,11 @@ def allocate_self_kv_chunks(num_layers, batch, chunk_tokens, heads, head_dim,
         # Only the N-major (const-max) branch changes. The exact-attention branch keeps
         # [B, S, N, D] because attention_cte reads that layout, and hybrid per-layer
         # attention means both exist in the same stack.
-        k_shape = ((heads, head_dim, chunk_tokens) if n_major
+        # LINGBOT_CTE_MERGE_K=nld keeps K un-transposed [N, tokens, d] for the merged cte path
+        # (tp_k=True): a cheaper write (no L<->d transpose) for a costlier kernel read.
+        _k_nld = n_major and os.environ.get("LINGBOT_CTE_MERGE_K", "ndl") == "nld"
+        k_shape = ((heads, chunk_tokens, head_dim) if _k_nld
+                   else (heads, head_dim, chunk_tokens) if n_major
                    else (batch, chunk_tokens, heads, head_dim))
         v_shape = ((heads, chunk_tokens, head_dim) if n_major
                    else (batch, chunk_tokens, heads, head_dim))

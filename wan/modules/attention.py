@@ -451,8 +451,73 @@ def _cte_attention_chunks(q, k_chunks, v_chunks, dtype=torch.bfloat16):
     return out.permute(1, 0, 2).unsqueeze(0)
 
 
+def cte_merge_enabled():
+    """LINGBOT_CTE_MERGE=1: N-major KV chunks + one attention_cte call per chunk, merged (see
+    _cte_attention_chunks_merged). Read by the cache allocators and by the KV write."""
+    return os.environ.get("LINGBOT_CTE_MERGE", "0") == "1"
+
+
+def _cte_attention_chunks_merged(q, k_chunks, v_chunks, dtype=torch.bfloat16):
+    """Exact attention over N-MAJOR KV chunks [n, L_c, d], without assembling them.
+
+    One attention_cte call per chunk returns the UNNORMALIZED output exp(s - m_c) @ V_c with its
+    row max m_c and denominator S_c (cache_softmax + skip_output_normalization, the ring-attention
+    contract); the chunks are merged in fp32 with the usual running-max rescale:
+        out = sum_c exp(m_c - M) O_c / sum_c exp(m_c - M) S_c.
+    Versus _cte_attention_chunks this drops (a) the per-block copy of every chunk into a zero-filled
+    buffer -- on the critical path before the kernel, 1.7 ms of a 10.4 ms block at TP4xCP2, and
+    the source of the chunk-1 slowdown -- and (b) the 512-alignment KV padding, whose zero keys
+    were attended (no bounds were passed) and added n_pad * exp(-m) to every softmax denominator.
+    The kernel handles a ragged last K tile itself; Q is still padded to 128 (cache_softmax tiles
+    Q in 128s), and the padded rows are dropped.
+    """
+    b, lq, n, d = q.shape
+    assert b == 1, "attention_cte path assumes batch_size=1 (heads occupy batch)"
+    softmax_scale = 1.0 / math.sqrt(d)
+    q_c = (q[0].float() * softmax_scale).permute(1, 0, 2).contiguous().to(dtype)  # [n, Lq, d]
+    pad_q = (128 - lq % 128) % 128
+    if pad_q:
+        q_c = F.pad(q_c, (0, 0, 0, pad_q))
+    lq_p = lq + pad_q
+    outs, maxs, sums = [], [], []
+    for kc, vc in zip(k_chunks, v_chunks):
+        # K is [n, d, L] (pre-transposed, the const-max cache layout: tp_k=False, no transpose
+        # inside the kernel) or [n, L, d] (tp_k=True). V is always [n, L, d].
+        tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
+        o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
+                                       tp_q=True, tp_k=tp_k, tp_out=False,
+                                       cache_softmax=True, skip_output_normalization=True)
+        outs.append(o)
+        maxs.append(-neg_max.float())     # [n, 128, Lq/128], query = group * 128 + row
+        sums.append(s.float())
+    if len(outs) == 1:
+        lam = [1.0 / sums[0]]
+    else:
+        # All the softmax bookkeeping on the SMALL stats tensors; the full-size work is then a
+        # single weighted sum of the chunk outputs. (A running merge with full-size fp32
+        # rescales and a full-size divide lowered to 1.5 ms of a 10.5 ms block.)
+        m_all = maxs[0]
+        for m in maxs[1:]:
+            m_all = torch.maximum(m_all, m)
+        w = [torch.exp(m - m_all) for m in maxs]
+        den = w[0] * sums[0]
+        for wc, sc in zip(w[1:], sums[1:]):
+            den = den + wc * sc
+        inv = 1.0 / den
+        lam = [wc * inv for wc in w]
+    lam = [l_.transpose(1, 2).reshape(n, lq_p, 1) for l_ in lam]
+    out = lam[0] * outs[0].float()
+    for l_, o in zip(lam[1:], outs[1:]):
+        out = out + l_ * o.float()
+    return out[:, :lq].permute(1, 0, 2).unsqueeze(0).to(dtype)
+
+
 def exact_attention_chunks(q, k_chunks, v_chunks, dtype=torch.bfloat16):
-    """exact_attention over a list of KV chunks (see _cte_attention_chunks)."""
+    """exact_attention over a list of KV chunks (see _cte_attention_chunks). N-major (3-D) chunks
+    come from LINGBOT_CTE_MERGE=1 and take the copy-free merged path."""
+    if (q.device.type == "neuron" and (_CTE_FOR_EXACT_AVAILABLE or _CTE_AVAILABLE)
+            and k_chunks[0].dim() == 3):
+        return _cte_attention_chunks_merged(q, list(k_chunks), list(v_chunks), dtype=dtype)
     if (q.device.type == "neuron" and (_CTE_FOR_EXACT_AVAILABLE or _CTE_AVAILABLE)
             and os.environ.get("LINGBOT_HOT_KV_CAT", "0") != "1"):
         return _cte_attention_chunks(q, list(k_chunks), list(v_chunks), dtype=dtype)

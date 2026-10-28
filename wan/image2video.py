@@ -50,6 +50,85 @@ from .utils.cam_utils import (
 from einops import rearrange
 
 
+# Conditioning-image VAE latents encoded BEFORE the DiT was loaded (generate.py, LINGBOT_PRE_ENCODE=1),
+# keyed like WanI2VCausal._encode_cache. The encode is unsharded and fp32, and with the DiT
+# resident it ran a TP4 rank (9.7 GB of weights) out of device memory; before the DiT load it fits.
+_PRE_ENCODED = {}
+
+
+def memlog(tag):
+    """LINGBOT_MEMLOG=1: rank 0's device allocator usage at `tag`."""
+    if os.environ.get("LINGBOT_MEMLOG", "0") != "1":
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    try:
+        a, r = torch.neuron.memory_allocated() / 1e9, torch.neuron.memory_reserved() / 1e9
+        p = torch.neuron.max_memory_allocated() / 1e9
+    except Exception as e:  # diagnostics only
+        logging.info(f"[MEM] {tag}: unavailable ({e})")
+        return
+    logging.info(f"[MEM] {tag}: allocated {a:.2f} GB, reserved {r:.2f} GB, peak {p:.2f} GB")
+
+
+def condition_geometry(img_hw, action_path, frame_num, chunk_size, max_area, target_hw,
+                       vae_stride, patch_size):
+    """(F, h, w, lat_f, lat_h, lat_w) exactly as _generate_causal_fast derives them."""
+    c2ws = np.load(os.path.join(action_path, "poses.npy"))
+    len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
+    frame_num = ((frame_num - 1) // 4) * 4 + 1
+    F = min(frame_num, len_c2ws)
+    h, w = img_hw
+    aspect_ratio = h / w
+    if target_hw is not None:
+        lat_h = target_hw[0] // vae_stride[1]
+        lat_w = target_hw[1] // vae_stride[2]
+    else:
+        lat_h = round(np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
+        lat_w = round(np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+    h, w = lat_h * vae_stride[1], lat_w * vae_stride[2]
+    lat_f = (F - 1) // vae_stride[0] + 1
+    lat_f = int(lat_f - (lat_f % chunk_size))
+    F = (lat_f - 1) * 4 + 1
+    return F, h, w, lat_f, lat_h, lat_w
+
+
+def encode_key(img, F, h, w):
+    """Cache key of a conditioning encode; `img` is the normalized [3, H, W] image tensor."""
+    return (int(img.shape[1]), int(img.shape[2]), int(F), int(h), int(w),
+            hash(img.detach().cpu().numpy().tobytes()))
+
+
+def vae_encode_condition(vae, img, F, h, w, device):
+    """VAE latent of [image, F-1 zero frames] at (h, w) -- the conditioning `y` without the mask."""
+    return vae.encode([
+        torch.concat([
+            torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode='bicubic').transpose(0, 1),
+            torch.zeros(3, F - 1, h, w)
+        ], dim=1).to(device)
+    ])[0]
+
+
+def pre_encode_condition(vae_pth, device, img_pil, action_path, frame_num, chunk_size, max_area,
+                         target_hw, vae_stride, patch_size):
+    """Encode the conditioning image on `device` with a throwaway VAE, before the DiT is loaded, and
+    park the latent on the host for _generate_causal_fast. Same ops and inputs as the in-loop
+    encode, so the latent is identical."""
+    img = TF.to_tensor(img_pil).sub_(0.5).div_(0.5)
+    F, h, w, _, _, _ = condition_geometry(tuple(img.shape[1:]), action_path, frame_num, chunk_size,
+                                          max_area, target_hw, vae_stride, patch_size)
+    key = encode_key(img, F, h, w)
+    if key in _PRE_ENCODED:
+        return key
+    vae = Wan2_1_VAE(vae_pth=vae_pth, device=device)
+    with torch.no_grad():
+        _PRE_ENCODED[key] = vae_encode_condition(vae, img, F, h, w, device).cpu()
+    del vae
+    gc.collect()
+    torch.neuron.empty_cache()
+    return key
+
+
 def _resolve_asset_path(filename, checkpoint_dir, assets_dir=None):
     """Resolve T5 / VAE / tokenizer paths, falling back to ``assets_dir``.
 
@@ -332,6 +411,7 @@ class WanI2VCausal:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+        memlog("after DiT load")
 
         self.scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.num_train_timesteps,
@@ -543,9 +623,17 @@ class WanI2VCausal:
             dt_ms = (time.perf_counter() - t0) * 1000.0
             logging.info(f"WanI2VCausal.prewarm: {dt_ms:.0f} ms")
 
+        memlog("prewarm end, before free")
         del (warmup_self_kv, warmup_cross_kv, dummy_latent, dummy_y,
              dummy_c2ws, dummy_context, dummy_t)
+        # The camera caches hold the dummy chunk's embedding and per-block FiLM params; no
+        # generation can hit them (different key), so release them with the dummy inputs.
+        for _attr in ("_cam_film_cache", "_cam_emb_cache"):
+            if getattr(self.model, _attr, None) is not None:
+                setattr(self.model, _attr, None)
+        gc.collect()
         torch.neuron.empty_cache()
+        memlog("prewarm end, after free")
         self._warmed = True
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
@@ -961,21 +1049,16 @@ class WanI2VCausal:
         #   2. The ENCODER is not width-sharded. shard_vae_decoder_width is only ever
         #      applied to vae.model.decoder, so this runs at single-core width and
         #      redundantly on all 32 ranks.
-        _ek = (int(img.shape[1]), int(img.shape[2]), int(F), int(h), int(w),
-               hash(img.detach().cpu().numpy().tobytes()))
+        _ek = encode_key(img, F, h, w)
         _ec = getattr(self, "_encode_cache", None)
         if _ec is not None and _ec[0] == _ek:
             y = _ec[1].clone()
         else:
-            y = self.vae.encode([
-                torch.concat([
-                    torch.nn.functional.interpolate(
-                        img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                            0, 1),
-                    torch.zeros(3, F - 1, h, w)
-                ],
-                             dim=1).to(self.device)
-            ])[0]
+            _pre = _PRE_ENCODED.pop(_ek, None)
+            if _pre is not None:
+                y = _pre.to(self.device)
+            else:
+                y = vae_encode_condition(self.vae, img, F, h, w, self.device)
             y = torch.concat([msk, y])
             self._encode_cache = (_ek, y.clone())
         torch.neuron.synchronize()
@@ -1001,6 +1084,7 @@ class WanI2VCausal:
         # Self-attention: after the Ulysses all_to_all, each rank holds
         # num_heads/(sp*tp) local heads.
         local_num_heads = model_args.num_heads // self.heads_div
+        memlog("generate, before self KV alloc")
         self_kv_cache = self._make_self_kv(
             model_args.num_layers, batch_size, kv_size, local_num_heads, head_dim,
             chunk_size, frame_seqlen, transformer_dtype, self.device)
@@ -1242,6 +1326,12 @@ class WanI2VCausal:
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
             torch.neuron.synchronize()
             self._gen_phase["cat"] += time.perf_counter() - _t0
+            memlog("generate, after chunk loop")
+            # The last chunk's camera embedding / FiLM params cannot be hit again (the next
+            # generation has new camera tensors); free them before the VAE decode needs the room.
+            for _attr in ("_cam_film_cache", "_cam_emb_cache"):
+                if getattr(self.model, _attr, None) is not None:
+                    setattr(self.model, _attr, None)
 
             if offload_model:
                 self.model.cpu()
@@ -1573,8 +1663,11 @@ class WanI2VCausal:
             from .modules.model_fast import flash_attn_layers, layer_uses_const_max
             from .modules.attention import fa2_ag_available
             # FA2 AG hot layers read the same N-major cache as the const-max layers.
-            _n_major = [const_max_ag_available() and (layer_uses_const_max(i) or fa2_ag_available())
-                        for i in range(num_layers)]
+            from .modules.attention import cte_merge_enabled
+            # LINGBOT_CTE_MERGE=1 puts the exact-attention layers on the same N-major layout:
+            # the merged attention_cte path reads the chunks in place (no per-block assembly).
+            _n_major = [(const_max_ag_available() and (layer_uses_const_max(i) or fa2_ag_available()))
+                        or cte_merge_enabled() for i in range(num_layers)]
             cache = allocate_self_kv_chunks(
                 num_layers, batch, chunk_size * frame_seqlen, heads, head_dim,
                 n, dtype, device, n_major=_n_major)

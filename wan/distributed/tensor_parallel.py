@@ -170,11 +170,59 @@ def all_reduce_fn(tensor, dim="tp"):
     m = mesh_submesh(dim)
     if m is None:
         return tensor
-    if tensor.dtype in (torch.bfloat16, torch.float16):
+    if tensor.dtype in (torch.bfloat16, torch.float16) and not _AR_NATIVE_DTYPE:
         # Match all_reduce's fp32 promotion: stacked per-layer bf16 reductions
         # compound rounding (see all_reduce's docstring).
         return fc.all_reduce(tensor.float(), "sum", m).to(tensor.dtype)
     return fc.all_reduce(tensor, "sum", m)
+
+
+# LINGBOT_AR_BF16=1: in-graph all-reduces of bf16 tensors stay bf16 (half the bytes). Wan2.2's
+# compiled DiT reduces in bf16 and measured inside the bf16 accuracy band against an fp32 reference.
+_AR_NATIVE_DTYPE = os.environ.get("LINGBOT_AR_BF16", "0") == "1"
+
+
+def all_gather_tokens(x, dim="tp"):
+    """Traceable all-gather of token shards [1, S, C] -> [1, n*S, C] over a mesh submesh, in rank
+    order (Megatron sequence parallelism). Gathers on dim 0 of the 2-D view, which avoids the
+    Dynamo-skipped chunk-cat helper (see all_gather_fn)."""
+    m = mesh_submesh(dim)
+    if m is None:
+        return x
+    assert x.shape[0] == 1, "token gather assumes batch 1"
+    g = fc.all_gather_tensor(x[0].contiguous(), 0, m)
+    return g.unsqueeze(0)
+
+
+def cols_to_token_shard(x, dim="tp"):
+    """Traceable column shard [1, L, C/n] -> this rank's token shard at full width [1, L/n, C],
+    with ONE all-to-all. Same result as sp_token_shard(all_gather_last_dim(x)) -- a pure data move,
+    so bit-identical -- but each rank receives L/n x C instead of L x C. Column order is rank
+    order (shard_column_parallel's), token shards are contiguous in rank order (sp_token_shard's).
+    """
+    m = mesh_submesh(dim)
+    if m is None:
+        return x
+    n = m.size()
+    assert x.shape[0] == 1, "token shard assumes batch 1"
+    _, L, c = x.shape
+    assert L % n == 0, f"tokens {L} not divisible by {n}"
+    # Rank r sends token block j to rank j and receives block r of every rank i, stacked in i order.
+    y = fc.all_to_all_single(x[0].contiguous(), None, None, m)          # [n * L/n, c]
+    return y.view(n, L // n, c).permute(1, 0, 2).reshape(1, L // n, n * c)
+
+
+def reduce_scatter_tokens(x, dim="tp"):
+    """Traceable reduce-scatter(SUM) [1, n*S, C] -> this rank's token shard [1, S, C]. Same dtype
+    policy as all_reduce_fn: bf16 is promoted to fp32 for the sum unless LINGBOT_AR_BF16=1."""
+    m = mesh_submesh(dim)
+    if m is None:
+        return x
+    assert x.shape[0] == 1, "token reduce-scatter assumes batch 1"
+    x2 = x[0].contiguous()
+    if x2.dtype in (torch.bfloat16, torch.float16) and not _AR_NATIVE_DTYPE:
+        return fc.reduce_scatter_tensor(x2.float(), "sum", 0, m).to(x.dtype).unsqueeze(0)
+    return fc.reduce_scatter_tensor(x2, "sum", 0, m).unsqueeze(0)
 
 
 def init_tp_group(name, tp_degree=None, ranks=None):
