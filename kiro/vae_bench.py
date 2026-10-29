@@ -44,12 +44,17 @@ def main(latents_path):
         vs.shard_vae_decoder_width(vae.model.decoder)
         decode = lambda z: vae.decode([z])[0]
     latent = torch.load(latents_path, map_location="cpu").to(dev)
-    lat_w = latent.shape[-1]
-    pad_w = ((lat_w + world - 1) // world) * world
-    if pad_w != lat_w and world > math.gcd(lat_w, world):
-        latent = torch.cat([latent, latent[..., -1:].expand(*latent.shape[:-1], pad_w - lat_w)],
-                           dim=-1)
-    local_latent = vs.width_shard_latent(latent, world=world)
+    two_d = fused and os.environ.get("LINGBOT_VAE_2D", "0") == "1"
+    if two_d:
+        from wan.modules.vae2_1_fused import shard_latent_2d
+        local_latent = shard_latent_2d(latent)
+    else:
+        lat_w = latent.shape[-1]
+        pad_w = ((lat_w + world - 1) // world) * world
+        if pad_w != lat_w and world > math.gcd(lat_w, world):
+            latent = torch.cat([latent, latent[..., -1:].expand(*latent.shape[:-1], pad_w - lat_w)],
+                               dim=-1)
+        local_latent = vs.width_shard_latent(latent, world=world)
     times = []
     for i in range(1 + int(os.environ.get("REPS", "2"))):
         if i == 1:
@@ -81,6 +86,9 @@ def main(latents_path):
     if save_dir and not diag:
         os.makedirs(save_dir, exist_ok=True)
         torch.save(out.float().cpu(), os.path.join(save_dir, f"{vs._rank():03d}.pt"))
+        if two_d and rank == 0:
+            with open(os.path.join(save_dir, "LAYOUT"), "w") as f:
+                f.write("2d\n")
     if rank == 0:
         print(f"[vae_bench] world={world} fused={int(fused)} diag={sorted(diag) or 'none'} "
               f"latent={tuple(latent.shape)} "

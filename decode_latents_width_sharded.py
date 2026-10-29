@@ -162,7 +162,15 @@ def main():
                 f"{world_size} ranks participate, {_pad_w // world_size} px each")
     else:
         _pad_w = _lat_w
-    latent_local = width_shard_latent(latent, rank=rank, world=world_size)
+    _two_d = _fused and os.environ.get("LINGBOT_VAE_2D", "0") == "1"
+    if _two_d:
+        # LINGBOT_VAE_2D: height x width tiles of the UNPADDED latent (see vae2_1_fused).
+        from wan.modules.vae2_1_fused import shard_latent_2d
+        latent = latent[..., :_lat_w]
+        _pad_w = _lat_w
+        latent_local = shard_latent_2d(latent)
+    else:
+        latent_local = width_shard_latent(latent, rank=rank, world=world_size)
 
     if args.profile:
         def _decode_once():
@@ -202,7 +210,11 @@ def main():
     else:
         video_local = _decode(latent_local)
 
-    video_full = gather_video_width(video_local)
+    if _two_d:
+        from wan.modules.vae2_1_fused import gather_video_2d
+        video_full = gather_video_2d(video_local)
+    else:
+        video_full = gather_video_width(video_local)
 
     if rank == 0 and _pad_w != _lat_w:
 

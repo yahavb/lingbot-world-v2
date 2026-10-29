@@ -65,11 +65,56 @@ def _init_mesh():
     return _MESH
 
 
+def tile_2d(rank=None):
+    """(row block c, column block d, P, D) of a rank under LINGBOT_VAE_2D."""
+    P, D = _PD
+    d, c = divmod(dist.get_rank() if rank is None else rank, P)
+    return c, d, P, D
+
+
+def shard_latent_2d(latent):
+    """[..., H, W] -> this rank's [H / P, W / D] tile (LINGBOT_VAE_2D)."""
+    c, d, P, D = tile_2d()
+    H, W = latent.shape[-2:]
+    assert H % P == 0 and W % D == 0, f"latent {H}x{W} does not tile into {P}x{D}"
+    h, w = H // P, W // D
+    return latent[..., c * h:(c + 1) * h, d * w:(d + 1) * w].contiguous()
+
+
+def gather_video_2d(video_local):
+    """Reassemble [C, T, h, w] tiles into the full video on rank 0, one frame at a time (as
+    gather_video_width does); returns a CPU tensor on rank 0, None elsewhere."""
+    P, D = _PD
+    n = P * D
+    frames = []
+    for i in range(video_local.shape[1]):
+        f = video_local.narrow(1, i, 1).contiguous()
+        out = torch.empty((n,) + tuple(f.shape), dtype=f.dtype, device=f.device)
+        dist.all_gather_into_tensor(out, f)
+        if dist.get_rank() == 0:
+            C, _, h, w = f.shape
+            out = out.view(D, P, C, 1, h, w).permute(2, 3, 1, 4, 0, 5).reshape(C, 1, P * h, D * w)
+            frames.append(out.cpu())
+    return torch.cat(frames, 1) if dist.get_rank() == 0 else None
+
+
 def _selectors(device):
     """Per-rank one-hot weights: (left/right neighbour on this device, what to send in step 2,
-    left/right neighbouring device). Zeros where there is no neighbour = the conv's zero padding."""
+    left/right neighbouring device). Zeros where there is no neighbour = the conv's zero padding.
+    LINGBOT_VAE_2D: (left/right neighbour over D, upper/lower neighbour over P)."""
     P, D = _PD
     d, c = divmod(dist.get_rank(), P)
+    if _TWO_D:
+        wl, wr, hu, hd = torch.zeros(D), torch.zeros(D), torch.zeros(P), torch.zeros(P)
+        if d > 0:
+            wl[d - 1] = 1.0
+        if d < D - 1:
+            wr[d + 1] = 1.0
+        if c > 0:
+            hu[c - 1] = 1.0
+        if c < P - 1:
+            hd[c + 1] = 1.0
+        return tuple(t.to(device) for t in (wl, wr, hu, hd))
     wl1, wr1 = torch.zeros(P), torch.zeros(P)
     if c > 0:
         wl1[c - 1] = 1.0
@@ -92,10 +137,35 @@ _DIAG_NOHALO = os.environ.get("LINGBOT_VAE_DIAG", "") == "nohalo"   # DIAGNOSTIC
 # order, so the result is the same computation in another layout.
 _SWAP = os.environ.get("LINGBOT_VAE_SWAPHW", "0") == "1"
 _WAX = -2 if _SWAP else -1          # the sharded (width) axis
+# LINGBOT_VAE_2D=1: shard height AND width. Rank P*d + c (device d, core c) decodes latent rows
+# block c (of P) and columns block d (of D): at 64 ranks a 15 x 6 tile of the 60 x 96 latent instead
+# of a 60 x 2 column slice (of a width padded to 128, so 16 ranks decoded padding). Halos on both
+# axes, width first so the height exchange carries the corners. Not combinable with SWAPHW.
+_TWO_D = os.environ.get("LINGBOT_VAE_2D", "0") == "1"
+assert not (_TWO_D and _SWAP), "LINGBOT_VAE_2D and LINGBOT_VAE_SWAPHW are exclusive"
+
+
+def _halo_2d(x, sel):
+    """[..., h, w] -> [..., h + 2, w + 2]: the tile with its neighbours' adjoining columns, then
+    rows (of the column-extended tile, so the corners come from the diagonal neighbours)."""
+    P, D = _PD
+    wl, wr, hu, hd = (t.to(x.dtype) for t in sel)
+    e = torch.stack([x[..., :1], x[..., -1:]], 0).contiguous()            # [2, ..., h, 1]
+    g = fc.all_gather_tensor(e, 0, _MESH["dev"]).view((D,) + tuple(e.shape))
+    bd = (D,) + (1,) * (e.dim() - 1)
+    left, right = (g[:, 1] * wl.view(bd)).sum(0), (g[:, 0] * wr.view(bd)).sum(0)
+    x = torch.cat([left, x, right], -1)
+    e = torch.stack([x[..., :1, :], x[..., -1:, :]], 0).contiguous()      # [2, ..., 1, w + 2]
+    g = fc.all_gather_tensor(e, 0, _MESH["core"]).view((P,) + tuple(e.shape))
+    bp = (P,) + (1,) * (e.dim() - 1)
+    up, down = (g[:, 1] * hu.view(bp)).sum(0), (g[:, 0] * hd.view(bp)).sum(0)
+    return torch.cat([up, x, down], -2)
 
 
 def _halo(x, sel):
     """[..., w] -> [..., w + 2]: this rank's slice with its neighbours' adjoining columns."""
+    if _TWO_D:
+        return _halo_2d(x, sel)
     if _DIAG_NOHALO:
         return F.pad(x, (0, 0, 1, 1) if _SWAP else (1, 1))
     P, D = _PD
@@ -118,8 +188,15 @@ def _halo(x, sel):
 
 
 def _gather_w(x):
-    """All-gather the width slices into the full width, in rank (= slice) order."""
+    """All-gather the width slices into the full width, in rank (= slice) order. LINGBOT_VAE_2D:
+    the tiles into the full [H, W] map."""
     P, D = _PD
+    if _TWO_D:
+        g = fc.all_gather_tensor(x.contiguous(), 0, _MESH["core"])         # [P*b, ...]
+        g = fc.all_gather_tensor(g.contiguous(), 0, _MESH["dev"])         # [D*P*b, ...]
+        b, c, t, h, w = x.shape
+        g = g.view((D, P) + tuple(x.shape))
+        return g.permute(2, 3, 4, 1, 5, 0, 6).reshape(b, c, t, P * h, D * w)
     g = fc.all_gather_tensor(x.contiguous(), 0, _MESH["core"])
     if D > 1:
         g = fc.all_gather_tensor(g.contiguous(), 0, _MESH["dev"])
@@ -155,6 +232,8 @@ def _rms(x, gamma, scale):
 def _cconv(xnew_h, cache_h, w, b):
     """Causal 3x3x3 conv of haloed new frames after the haloed 2-frame cache, in w's dtype."""
     xh = torch.cat([cache_h, xnew_h.to(w.dtype)], 2)
+    if _TWO_D:                                   # both spatial halos are in xh already
+        return F.conv3d(xh, w, b), xh[:, :, -2:]
     y = F.conv3d(F.pad(xh, (1, 1, 0, 0, 0, 0) if _SWAP else (0, 0, 1, 1, 0, 0)), w, b)
     return y, xh[:, :, -2:]
 
@@ -201,6 +280,12 @@ def _up_core(x, w2, b2, sel):
     rows; nearest x2 duplicates columns, so the neighbour's last column is the same either way)."""
     b, c, t, h, w = x.shape
     xh = _halo(x.to(w2.dtype), sel)
+    if _TWO_D:                                 # [.., h + 2, w + 2] -> x2 -> crop -> 3x3 valid
+        xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h + 2, w + 2)
+        xf = xf[:, :, :, None, :, None].expand(b * t, c, h + 2, 2, w + 2, 2).reshape(
+            b * t, c, 2 * h + 4, 2 * w + 4)[:, :, 1:-1, 1:-1]
+        y = F.conv2d(xf, w2, b2)
+        return y.reshape(b, t, y.shape[1], 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
     if _SWAP:                                  # [.., W, H]: halo rows on W, pad H
         xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h + 2, w)
         xf = xf[:, :, :, None, :, None].expand(b * t, c, h + 2, 2, w, 2).reshape(
@@ -278,6 +363,8 @@ class FusedWidthDecoder:
         shape = [x.shape[0], c, 2, x.shape[3], x.shape[4]]
         if halo:
             shape[_WAX] += 2
+            if _TWO_D:
+                shape[-2] += 2
         dt = x.dtype if self.dt is None else (torch.float32 if fp32 else self.dt)
         return torch.zeros(shape, dtype=dt, device=x.device)
 

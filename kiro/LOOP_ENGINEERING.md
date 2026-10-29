@@ -14,7 +14,8 @@ seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1`
 | This branch, the job's layout | `loop_engineering`, flags on | TP8 × CP8 | 5.73 | 3.04 | 8.76 | 9.24 |
 | This branch, first push | `loop_engineering`, flags on | TP4 × CP16 | 5.75 | 3.01 | 8.75 | 9.26 |
 | This branch, 4.8 s push (`q6_pair`, below) | `loop_engineering`, flags on | TP4 × CP16 | 4.48 | 0.81 | 5.29 | 15.32 |
-| **This branch, latest** (`q11_host`, below) | `loop_engineering`, flags on | TP4 × CP16 | **4.01** | **0.77** | **4.78** | **16.94** |
+| This branch (`q11_host`, below) | `loop_engineering`, flags on | TP4 × CP16 | 4.01 | 0.77 | 4.78 | 16.94 |
+| **This branch, latest** (`q14_vae2d`, below) | `loop_engineering`, flags on | TP4 × CP16 | **4.04** | **0.33** | **4.37** | **18.55** |
 
 **Measured: 1.36× end to end against `main` as it runs on this host (6.81 → 9.26 fps), 1.56× on
 GEN. Assumed: ~1.1× against `main` with its default `const_max_ag` kernel, which does not run
@@ -41,26 +42,30 @@ in the command below). Every video passes `tests/smoke_test_video.py`.
 | `q8_plk_film` | camera Plücker condition compiled; all 40 blocks' FiLM params in one graph per chunk | 4.29 | 0.81 | 5.09 | 15.91 | 106 of 46.4 M bf16 Plücker values move by one ulp; latents 0.157 vs `q6` |
 | `q10_head` | head + its gathers compiled; cross-attention cache stored in the kernel's layout | 4.25 | 0.81 | 5.05 | 16.03 | latents 0.163 vs `q8` |
 | `q11_host` | noise and timesteps uploaded once per generation; no per-forward `empty_cache`; no head on cache-commit forwards; VAE 3 frames per step | 4.01 | 0.77 | 4.78 | 16.94 | latents bit-identical to `q10`; video PSNR 56.6 dB vs fp32 decode |
+| `q12_vaeo1` | VAE: compiler `-O1`, norm sums as a matmul, [W, H] layout, 4 frames per step | 4.03 | 0.55 | 4.58 | 17.69 | video PSNR 56.58 dB vs fp32 decode |
+| `q14_vae2d` | VAE: 4 × 16 height × width tiles instead of 64 width slices of a padded latent | 4.04 | 0.33 | 4.37 | 18.55 | video PSNR 56.55 dB vs the unpadded fp32 decode (see below) |
+
+**The VAE width padding changed the video.** At 64 ranks the width-sliced decode pads the 96-wide
+latent to 128 by replicating its last column, and the replicated columns reach into the real ones
+through the convolutions: the padded fp32 decode is only 43.55 dB (8-bit max error 156) from an
+unpadded fp32 decode at 32 ranks. The 2-D tiles need no padding, and the 2-D bf16 decode is 56.55 dB
+from the unpadded fp32 decode, the same distance as the 1-D bf16 decodes have from their fp32
+references. The upstream job (`main`) decodes with the same padding.
 
 Latent differences grow with chunk index under any rounding change (`q6` vs `q5`: rel. RMS 0.000
 in chunk 0 to 0.162 in chunk 6), as they do between the TP8 × CP8 and TP4 × CP16 layouts running
 identical code (0.134); see Correctness.
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo q11_host TP=4 CP=16 \
+bash /work/repo/kiro/run_job16.sh /work/repo q14_vae2d TP=4 CP=16 \
   ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1 \
   NEURON_LAUNCH_BLOCKING=0 LINGBOT_LOAD_CONCURRENCY=16 LINGBOT_SKIP_LAST_COMMIT=1 LINGBOT_NO_SYNC=1 \
-  LINGBOT_TOKEN_PAD=32 LINGBOT_VAE_FUSED=1 LINGBOT_VAE_BF16=1 LINGBOT_VAE_T=3 \
-  LINGBOT_ATTN_EARLY=2 LINGBOT_ATTN_PAIR=1 LINGBOT_PLUCKER_COMPILE=1 LINGBOT_FILM_BATCH=1 \
-  LINGBOT_HEAD_COMPILE=1 LINGBOT_CROSS_NMAJOR=1 LINGBOT_PREUPLOAD=1 \
-  LINGBOT_EMPTY_CACHE_SEQ=1000000000 LINGBOT_COMMIT_NOHEAD=1
+  LINGBOT_TOKEN_PAD=32 LINGBOT_ATTN_EARLY=2 LINGBOT_ATTN_PAIR=1 LINGBOT_PLUCKER_COMPILE=1 \
+  LINGBOT_FILM_BATCH=1 LINGBOT_HEAD_COMPILE=1 LINGBOT_CROSS_NMAJOR=1 LINGBOT_PREUPLOAD=1 \
+  LINGBOT_EMPTY_CACHE_SEQ=1000000000 LINGBOT_COMMIT_NOHEAD=1 \
+  LINGBOT_VAE_FUSED=1 LINGBOT_VAE_BF16=1 LINGBOT_VAE_CC_FLAGS=-O1 LINGBOT_VAE_NORM=mm \
+  LINGBOT_VAE_T=4 LINGBOT_VAE_2D=1
 ```
-
-Measured on the VAE bench since `q11` and not yet in an end-to-end run (all at 64 ranks, bf16): the
-decoder graphs at compiler `-O1` decode in 0.62 s at 4 frames per step (0.77 s at the default
-`-O2`), and the RMS norms' channel sums as an fp32 matmul against a ones vector
-(`LINGBOT_VAE_NORM=mm`) take 3 frames per step from 0.65 to 0.59 s; video PSNR vs the fp32 decode
-stays 56.59 dB for both.
 
 Where the time went at `q3`, from synced phase timers (`LINGBOT_FWD_PHASES=1`) and block profiles:
 
@@ -73,6 +78,14 @@ Where the time went at `q3`, from synced phase timers (`LINGBOT_FWD_PHASES=1`) a
 - VAE: 0.81 s of device time (35 ms of host issue).
 
 Measured and not adopted:
+
+- `LINGBOT_FUSE_COMMIT=1` (each chunk's KV commit inside the next chunk's first forward): GEN 4.21
+  vs 4.03 s. The first fused forward's output is 1.1e-2 (rel. RMS) from the unfused one, so it is
+  correct, but a fused forward costs about as much as the two it replaces (blocks 220 ms + 32 ms
+  of embedding and FiLM vs ~255 ms), and the next step recomputes the chunk's FiLM.
+- Compiler `-O1` on the DiT block: 3.23 vs 2.87 ms. Token pad 4 (272 instead of 288 tokens): 2.90
+  ms (the attention runs 3 query tiles of 128 either way). In-graph copies of the cached chunks
+  for the attention kernel: 2.89 ms.
 
 - A compiled head with unpatchify inside the graph: neuronx-cc fails on its CP all-gather
   (`NCC_IBIR158`, access pattern out of bounds). Gathering the 2-D [tokens, 64] rows instead
@@ -242,7 +255,8 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_PREUPLOAD=1` | all per-step noise draws and the timesteps moved to the device once (bit-identical) |
 | `LINGBOT_EMPTY_CACHE_SEQ=N` | per-forward `empty_cache` only for chunks of ≥ N tokens (default 4096 fired at 480p) |
 | `LINGBOT_COMMIT_NOHEAD=1` | skip the head on KV-cache commit forwards (their output is discarded) |
-| `LINGBOT_FUSE_COMMIT=1` | under test: each chunk's KV commit runs inside the next chunk's first forward (`forward_fused`) |
+| `LINGBOT_FUSE_COMMIT=1` | each chunk's KV commit inside the next chunk's first forward (`forward_fused`); measured slower |
+| `LINGBOT_VAE_2D=1` | fused VAE: 4 × 16 height × width tiles of the unpadded latent |
 | `LINGBOT_VAE_CC_FLAGS=…`, `LINGBOT_DIT_CC_FLAGS=…` | extra compiler options for the decode / generate process (`+` for spaces) |
 | `LINGBOT_VAE_NORM=mm`, `LINGBOT_VAE_SWAPHW=1` | fused VAE: norm sums as a matmul; decode on [W, H] tensors |
 | `LINGBOT_DUMP_PRED=dir:tags` | diagnostic: save chosen forwards' outputs (`kiro/cmp_dump.py` compares two runs) |
