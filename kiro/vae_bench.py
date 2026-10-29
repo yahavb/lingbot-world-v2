@@ -36,7 +36,8 @@ def main(latents_path):
     vae = Wan2_1_VAE(vae_pth=os.path.join(CKPT, cfg.vae_checkpoint), device=dev,
                      dtype=torch.bfloat16)
     if fused:
-        from wan.modules.vae2_1_fused import FusedWidthDecoder
+        from wan.modules.vae2_1_fused import FusedWidthDecoder, apply_vae_cc_flags
+        apply_vae_cc_flags()
         fdec = FusedWidthDecoder(vae.model)
         decode = lambda z: fdec.decode(z.unsqueeze(0), vae.scale).float().clamp_(-1, 1).squeeze(0)
     else:

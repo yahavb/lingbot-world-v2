@@ -6,6 +6,7 @@ from einops import rearrange
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as fc
 import torch.nn as nn
 import torch.nn.functional as torch_F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -25,7 +26,10 @@ from wan.modules.attention import attention, flash_attention
 from wan.modules.attention import (
     const_max_ag_attention,
     const_max_ag_available,
+    cte_cross_attention_nmajor,
     cte_merge,
+    cte_merge_rows,
+    cte_rows,
     cte_partial,
     cte_prep_q,
     exact_attention,
@@ -128,9 +132,36 @@ _ATTN_EARLY = int(os.environ.get("LINGBOT_ATTN_EARLY", "0"))
 # attention either way (no approximation), but the kernel rounds the probabilities to bf16 against
 # a different running max: block output rel RMS 1.3e-3 vs the per-chunk path.
 _ATTN_PAIR = os.environ.get("LINGBOT_ATTN_PAIR", "0") == "1"
+# LINGBOT_KV_CLONE=1 (A/B, with LINGBOT_ATTN_EARLY): pass attention_cte in-graph copies of the cached
+# chunks instead of the cache buffers themselves. Profiled, the calls that read cache buffers (graph
+# inputs) spent ~160 us of GpSimd on DMA descriptors, the call on the in-graph new chunk 13 us.
+_KV_CLONE = os.environ.get("LINGBOT_KV_CLONE", "0") == "1"
 # LINGBOT_FILM_BATCH=1 (with LINGBOT_FILM_A2A): all 40 blocks' camera FiLM params in ONE compiled
 # graph per chunk instead of 40 (22 ms per chunk measured, mostly per-graph launch cost).
 _FILM_BATCH = os.environ.get("LINGBOT_FILM_BATCH", "0") == "1"
+# LINGBOT_HEAD_COMPILE=1 (SP + flat CP over a mesh): the head, its TP token gather, the real-token
+# slice and the CP gather as ONE compiled graph that returns the [tokens, 64] patch rows (2-D, rank
+# order = token order, so no permute after the gather); unpatchify stays eager. The eager tail was
+# ~15 small ops per forward (5.5 ms synced). A version that also unpatchified inside the graph failed
+# in neuronx-cc (NCC_IBIR158 on the gather's output access pattern).
+_HEAD_COMPILE = os.environ.get("LINGBOT_HEAD_COMPILE", "0") == "1"
+# LINGBOT_KV_GATHER1=1 (with LINGBOT_ATTN_EARLY): gather the new chunk's K and V over CP in ONE
+# all-gather of the stacked local shards instead of two. Profiled, the two 11 MB Ring all-gathers ran
+# back to back with a ~110 us gap between them. Data movement only.
+_KV_GATHER1 = os.environ.get("LINGBOT_KV_GATHER1", "0") == "1"
+
+
+def _head_fused(head, x, e, P, R):
+    """_head_sp_cp for a fused forward: only group b's real tokens [P, P + R) of each CP rank."""
+    y = tp.all_gather_tokens(head(x, e), "tp")[0][P:P + R]
+    return fc.all_gather_tensor(y.contiguous(), 0, tp.mesh_submesh("cp"))
+
+
+def _head_sp_cp(head, x, e, real):
+    y = tp.all_gather_tokens(head(x, e), "tp")[0]          # [L_pad, 64]
+    if real is not None:
+        y = y[:real]
+    return fc.all_gather_tensor(y.contiguous(), 0, tp.mesh_submesh("cp"))
 
 # LINGBOT_FWD_PHASES=1: DIAGNOSTIC. Sync the device at phase boundaries of WanModelFast.forward and
 # record per-phase wall time in model._fwd_phase_log (image2video logs it). The syncs serialise
@@ -612,6 +643,7 @@ class CausalWanSelfAttention(nn.Module):
         return_cache=False,
         grid_ints=None,
         _sp_scatter=False,
+        fused=None,
     ):
         r"""
         Args:
@@ -716,8 +748,9 @@ class CausalWanSelfAttention(nn.Module):
             # PER-LAYER, not global: a hot layer takes the exact-attention path and so
             # still needs the CP gather done here, even though const_max_ag is loaded and
             # the other 36 layers skip it.
-            _early = (_ATTN_EARLY and kv_chunks is not None and kv_chunks[0][-1].dim() == 3
-                      and _CP_FLAT_SEQ and tp.has_mesh())
+            _early = fused is not None or (
+                _ATTN_EARLY and kv_chunks is not None and kv_chunks[0][-1].dim() == 3
+                and _CP_FLAT_SEQ and tp.has_mesh())
             if not self._const_max_here() and not self._fa2_here() and not _early:
                 roped_key = _gather_w(roped_key, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
                 v = _gather_w(v, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
@@ -736,6 +769,59 @@ class CausalWanSelfAttention(nn.Module):
         # This branch also sidesteps the SP/CP refusal further down, because there is
         # no rolling window left to gather disjointly: eviction IS the round-robin
         # choice of destination chunk, made outside the graph by chunk_routing().
+        if kv_chunks is not None and fused is not None:
+            # LINGBOT_FUSE_COMMIT: this forward is the PREVIOUS chunk's KV-cache commit (group a,
+            # t=0, the first P tokens of this CP rank) and the CURRENT chunk's first denoise step
+            # (group b, the next P), see WanModelFast.forward_fused. kv_chunks is
+            # (common cached chunks..., dest_a, dest_b). Group a attends to the common chunks,
+            # its own fresh chunk and -- if a_reads_b_old -- the chunk that dest_b still holds and
+            # group b now evicts; group b attends to the common chunks, fresh a and fresh b.
+            # Written: fresh a into dest_a before any read of it, fresh b into dest_b after the
+            # last read of its old content.
+            k_chunks, v_chunks = kv_chunks
+            P, R, n_common, a_reads_b_old = fused
+            _cp = cp_w_shard[0]
+            _n, _d = int(roped_key.shape[2]), int(roped_key.shape[3])
+            kd_a, vd_a, kd_b, vd_b = k_chunks[-2], v_chunks[-2], k_chunks[-1], v_chunks[-1]
+            _k_ndl = int(kd_a.shape[1]) == _d
+            ka, kb = roped_key[0, :R], roped_key[0, P:P + R]            # [R, n, d] real tokens
+            va, vb = v[0, :R], v[0, P:P + R]
+            if _k_ndl:
+                kl = torch.stack([ka.permute(1, 2, 0), kb.permute(1, 2, 0)])     # [2, n, d, R]
+            else:
+                kl = torch.stack([ka.permute(1, 0, 2), kb.permute(1, 0, 2)])     # [2, n, R, d]
+            vl = torch.stack([va.permute(1, 0, 2), vb.permute(1, 0, 2)])         # [2, n, R, d]
+            kg = tp.all_gather_fn(kl.contiguous(), 0, "cp").view((_cp, 2) + tuple(kl.shape[1:]))
+            vg = tp.all_gather_fn(vl.contiguous(), 0, "cp").view((_cp, 2) + tuple(vl.shape[1:]))
+            if _k_ndl:
+                kga = kg[:, 0].permute(1, 2, 0, 3).reshape(kd_a.shape)
+                kgb = kg[:, 1].permute(1, 2, 0, 3).reshape(kd_b.shape)
+            else:
+                kga = kg[:, 0].permute(1, 0, 2, 3).reshape(kd_a.shape)
+                kgb = kg[:, 1].permute(1, 0, 2, 3).reshape(kd_b.shape)
+            vga = vg[:, 0].permute(1, 0, 2, 3).reshape(vd_a.shape)
+            vgb = vg[:, 1].permute(1, 0, 2, 3).reshape(vd_b.shape)
+            kd_a.copy_(kga)
+            vd_a.copy_(vga)
+            q_all, _ = cte_prep_q(roped_query)                          # both groups' queries
+            common = list(zip(k_chunks[:n_common], v_chunks[:n_common]))
+            parts_all = []
+            while _ATTN_PAIR and len(common) >= 2:
+                (k0, v0), (k1, v1) = common.pop(0), common.pop(0)
+                parts_all.append(cte_partial(q_all, k1, v1, k0, v0))
+            parts_all += [cte_partial(q_all, kc, vc) for kc, vc in common]
+            parts_all.append(cte_partial(q_all, kd_a, vd_a))
+            parts_a = [cte_rows(p_, 0, P) for p_ in parts_all]
+            parts_b = [cte_rows(p_, P, P) for p_ in parts_all]
+            if a_reads_b_old:
+                q_a, _ = cte_prep_q(roped_query[:, :P])
+                parts_a.append(cte_rows(cte_partial(q_a, kd_b, vd_b), 0, P))
+            kd_b.copy_(kgb)
+            vd_b.copy_(vgb)
+            q_b, _ = cte_prep_q(roped_query[:, P:2 * P])
+            parts_b.append(cte_rows(cte_partial(q_b, kd_b, vd_b), 0, P))
+            x = torch.cat([cte_merge_rows(parts_a), cte_merge_rows(parts_b)], dim=1)
+            return self._out_proj(x, _async_out, scatter=_sp_scatter)
         if kv_chunks is not None:
             k_chunks, v_chunks = kv_chunks
             # FUSED all-gather + const-max attention when that backend is loaded. The
@@ -771,6 +857,17 @@ class CausalWanSelfAttention(nn.Module):
                 _k_ndl = int(kd.shape[1]) == _d                 # K [n, d, L] (else [n, L, d])
 
                 def _gather_new():
+                    if _KV_GATHER1:
+                        kl = (roped_key[0].permute(1, 2, 0) if _k_ndl
+                              else roped_key[0].permute(1, 0, 2))
+                        vl = v[0].permute(1, 0, 2)
+                        g = tp.all_gather_fn(torch.stack([kl.reshape(-1), vl.reshape(-1)]), 0,
+                                             "cp").view(_cp, 2, -1)
+                        if _k_ndl:
+                            kg = g[:, 0].view(_cp, _n, _d, _l).permute(1, 2, 0, 3)
+                        else:
+                            kg = g[:, 0].view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
+                        return kg, g[:, 1].view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
                     if _k_ndl:
                         kg = tp.all_gather_fn(roped_key[0].permute(1, 2, 0).contiguous(), 0, "cp")
                         kg = kg.view(_cp, _n, _d, _l).permute(1, 2, 0, 3)
@@ -782,6 +879,8 @@ class CausalWanSelfAttention(nn.Module):
                 if _ATTN_EARLY == 2:
                     kg, vg = _gather_new()
                 lead = list(zip(k_chunks[:-1], v_chunks[:-1]))
+                if _KV_CLONE:
+                    lead = [(kc_ * 1, vc_ * 1) for kc_, vc_ in lead]
                 last = lead.pop() if (_ATTN_PAIR and lead) else None
                 parts = []
                 while _ATTN_PAIR and len(lead) >= 2:
@@ -1092,6 +1191,7 @@ class WanCrossAttention(WanSelfAttention):
                 is_first = crossattn_cache["is_init"].item() == 0
             else:
                 is_first = cross_attn_first_call
+            _nmaj = crossattn_cache["k"].dim() == 3      # LINGBOT_CROSS_NMAJOR layout
             if is_first:
                 crossattn_cache["is_init"].fill_(1)
                 if use_tp_norm:
@@ -1099,9 +1199,19 @@ class WanCrossAttention(WanSelfAttention):
                 else:
                     k = self.norm_k(self.k(context)).view(b, -1, n, d)
                 v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"].copy_(k)
-                crossattn_cache["v"].copy_(v)
-            else:
+                if _nmaj:
+                    crossattn_cache["k"].copy_(k[0].permute(1, 2, 0))
+                    crossattn_cache["v"].copy_(v[0].permute(1, 0, 2))
+                else:
+                    crossattn_cache["k"].copy_(k)
+                    crossattn_cache["v"].copy_(v)
+            if _nmaj:
+                x = cte_cross_attention_nmajor(q, crossattn_cache["k"], crossattn_cache["v"])
+                x = x.flatten(2)
+                if getattr(self, 'tp_enabled', False):
+                    return _tp_row_parallel(self.o, x, scatter=_sp_scatter)
+                return self.o(x)
+            if not is_first:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]
         else:
@@ -1215,6 +1325,7 @@ class CausalWanAttentionBlock(nn.Module):
         kv_current_end=None,
         kv_chunks=None,
         grid_ints=None,
+        fused=None,
     ):
         r"""
         Args:
@@ -1247,7 +1358,7 @@ class CausalWanAttentionBlock(nn.Module):
                 kv_write_start=kv_write_start, kv_write_end=kv_write_end,
                 kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
                 kv_current_end=kv_current_end, kv_chunks=kv_chunks,
-                grid_ints=grid_ints, _sp_scatter=True)
+                grid_ints=grid_ints, _sp_scatter=True, fused=fused)
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 xs = (xs + y * e[2].squeeze(2)).to(_rdt)
             if dit_cond_dict is not None and "cam_film" in dit_cond_dict:
@@ -1527,6 +1638,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         max_attention_size=1_000_000,
         frame_seqlen=None,
         cross_attn_first_call=None,
+        skip_head=False,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -1913,7 +2025,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # GB despite ~14 GB total free). One empty_cache before the loop is the
         # minimum-risk reclaim (single sync, measurable), gated to large grids
         # so 480p pays nothing. seq_len ~6240 at 960x1664 vs ~1560 at 480p.
-        if seq_len >= 4096:
+        # The threshold meant 960x1664 (the comment's ~6240 tokens), but seq_len is per CHUNK, so at
+        # 480x768 with chunk 3 (4320 tokens) it fired on every forward. LINGBOT_EMPTY_CACHE_SEQ sets it.
+        if seq_len >= int(os.environ.get("LINGBOT_EMPTY_CACHE_SEQ", "4096")):
             torch.neuron.empty_cache()
 
         # (A duplicate of the block loop below used to sit here with no body: it ran
@@ -1979,6 +2093,36 @@ class WanModelFast(ModelMixin, ConfigMixin):
                               crossattn_cache=crossattn_cache[block_index],
                               current_start=0, **_kw)
                 _phase_mark(self, "blocks")
+                if skip_head:
+                    # The caller discards the output (KV-cache commit forward): the blocks have
+                    # already written the cache, so the head, its gathers and unpatchify are skipped.
+                    _REAL_TOKENS[0] = None
+                    if _FWD_PHASES:
+                        _phase_mark(self, "head")
+                        _p = self._ph_cur
+                        if not hasattr(self, "_fwd_phase_log"):
+                            self._fwd_phase_log = []
+                        self._fwd_phase_log.append(
+                            [(n, (t - _p[i][1]) * 1000.0) for i, (n, t) in enumerate(_p[1:])])
+                    return None
+                if (_sp and _HEAD_COMPILE and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+                        and tp.has_mesh()):
+                    hfn = getattr(self, "_head_sp_fn", None)
+                    if hfn is None:
+                        hfn = torch.compile(_head_sp_cp, backend="neuron", fullgraph=True,
+                                            dynamic=False)
+                        self._head_sp_fn = hfn
+                    _real = _REAL_TOKENS[0]
+                    _REAL_TOKENS[0] = None
+                    x = self.unpatchify(hfn(self.head, x, e, _real).unsqueeze(0), grid_sizes)
+                    if _FWD_PHASES:
+                        _phase_mark(self, "head")
+                        _p = self._ph_cur
+                        if not hasattr(self, "_fwd_phase_log"):
+                            self._fwd_phase_log = []
+                        self._fwd_phase_log.append(
+                            [(n, (t - _p[i][1]) * 1000.0) for i, (n, t) in enumerate(_p[1:])])
+                    return [u.float() for u in x]
                 if _sp:
                     # Head on the token shard, then gather the small projected tokens (64 wide).
                     x = tp.all_gather_tokens(self.head(x, e), "tp")
@@ -2034,6 +2178,162 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 [(n, (t - _p[i][1]) * 1000.0) for i, (n, t) in enumerate(_p[1:])])
         return [u.float() for u in x]
 
+
+    # ------------------------------------------------------------------------------------------
+    # LINGBOT_FUSE_COMMIT: one forward = chunk a's KV-cache commit + chunk b's first denoise step.
+    # ------------------------------------------------------------------------------------------
+    def _fused_time_emb(self, t, host_key, device):
+        """(e, e0) for a 1-D timestep: the same ops and the same cache as forward()."""
+        if t.dim() == 1:
+            t = t.expand(t.size(0), 1)
+        e_seq = t.size(1)
+        key = (host_key, tuple(t.shape), str(device))
+        cache = getattr(self, "_t_emb_cache", None)
+        if cache is None:
+            cache = self._t_emb_cache = {}
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        with torch.amp.autocast('neuron', dtype=torch.float32):
+            bt = t.size(0)
+            t = t.flatten()
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, e_seq)).float())
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            e, e0 = e.to(device), e0.to(device)
+        cache[key] = (e, e0)
+        return e, e0
+
+    def _fused_cam_tokens(self, cam_in, g, sp_size):
+        """This CP rank's camera tokens [1, L/cp, C] for one chunk: forward()'s camera branch
+        (flat CP) with its single-entry cache keyed by the condition tuple."""
+        hit = getattr(self, "_cam_emb_cache", None)
+        if hit is not None and hit[0] is cam_in:
+            return hit[1]
+        c = [rearrange(i, '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
+                       c1=self.patch_size[0], c2=self.patch_size[1], c3=self.patch_size[2])
+             for i in cam_in]
+        c = self.patch_embedding_wancamctrl(torch.cat(c, dim=1))
+        c = c + self.c2ws_hidden_states_layer2(torch_F.silu(self.c2ws_hidden_states_layer1(c)))
+        _lc = c.shape[1] // g[0]
+        _sc = 1 if _lc == g[1] * g[2] else 2
+        c = _shard_w(c, g[0], g[1] * _sc, g[2] * _sc, sp_size, _sp_local_r())
+        self._cam_emb_cache = (cam_in, c)
+        return c
+
+    def forward_fused(self, xa, ya, cam_a, ta, ta_key, chunk_a,
+                      xb, yb, cam_b, tb, tb_key, chunk_b,
+                      context, seq_len, kv_cache, crossattn_cache, frame_seqlen,
+                      max_attention_size=1_000_000):
+        """Chunk a's KV-cache commit (its clean latent xa at t = ta = 0) and chunk b's first
+        denoise step (xb at tb) in ONE forward: every block sees both chunks' tokens, so the
+        weights, collectives and per-block fixed costs are paid once for the two.
+
+        Token layout on each CP rank: [a's R real tokens, pad to P, b's R real tokens, pad to P].
+        Each TP shard of that holds tokens of ONE chunk (TP ranks 0..tp/2-1: a, the rest: b), so
+        the timestep modulation is per TP rank. Attention (see the `fused` branch of
+        CausalWanSelfAttention.forward): a attends to its window -- the cached chunks it shares
+        with b, the chunk b evicts, and itself; b to the shared chunks, fresh a and itself -- the
+        same key sets as the separate commit and step-0 forwards. Only b's output is returned.
+
+        Supported configuration only: chunked KV cache, LINGBOT_SP, flat CP over a DeviceMesh,
+        LINGBOT_TOKEN_PAD, hoisted camera FiLM with LINGBOT_FILM_A2A + LINGBOT_FILM_BATCH, and
+        per-block compiled blocks (COMPILE_SCOPE=blocks)."""
+        device = getattr(self, '_onload_device', self.patch_embedding.weight.device)
+        sp_size, tpd = tp.tp_degree(_SP_GROUP), tp.tp_degree(_TP_GROUP)
+        tpr = tp.tp_rank(_TP_GROUP)
+        assert (_SP_ON and tpd > 1 and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+                and tp.has_mesh() and _TOKEN_PAD and _CAM_HOIST and _FILM_A2A and _FILM_BATCH), \
+            "LINGBOT_FUSE_COMMIT needs SP, flat CP on a mesh, TOKEN_PAD, FILM_A2A and FILM_BATCH"
+        assert getattr(self, "_stacks", None) is None, "LINGBOT_FUSE_COMMIT needs COMPILE_SCOPE=blocks"
+        set_bf16_rope_for_forward(seq_len)
+        if _FWD_PHASES:
+            self._ph_cur = []
+            _phase_mark(self, "start")
+
+        def embed(x, y):
+            u = self.patch_embedding(torch.cat([x, y], dim=0).unsqueeze(0).to(
+                self.patch_embedding.weight.dtype))
+            return u.flatten(2).transpose(1, 2), tuple(int(v) for v in u.shape[2:])
+        xa_t, g = embed(xa, ya)
+        xb_t, gb = embed(xb, yb)
+        assert g == gb
+        f, h, w = g
+        L = f * h * w
+        assert L % sp_size == 0
+        R = L // sp_size
+        P = -(-R // _TOKEN_PAD) * _TOKEN_PAD
+        S = (2 * P) // tpd
+        assert (2 * P) % tpd == 0 and P % S == 0, f"TP shards of {2 * P} tokens must not straddle the chunks"
+        r = _sp_local_r()
+        pad = lambda u: torch_F.pad(u, (0, 0, 0, P - R))
+        x = torch.cat([pad(_shard_w(xa_t, f, h, w, sp_size, r)),
+                       pad(_shard_w(xb_t, f, h, w, sp_size, r))], dim=1)
+        x = x.to(torch.bfloat16) if _RESIDUAL_BF16 else x.float()
+
+        ea, e0a = self._fused_time_emb(ta, ta_key, device)
+        eb, e0b = self._fused_time_emb(tb, tb_key, device)
+        grp_b = tpr >= tpd // 2
+        e_r, e0_r = (eb, e0b) if grp_b else (ea, e0a)
+
+        _ckey = (id(context[0]), tuple(context[0].shape))
+        _chit = getattr(self, "_ctx_emb_cache", None)
+        assert _chit is not None and _chit[0] == _ckey and _chit[1] is context[0], \
+            "fused forward expects the context embedded by an earlier forward"
+        ctx = _chit[2]
+
+        ca = self._fused_cam_tokens(cam_a, g, sp_size)
+        cb = self._fused_cam_tokens(cam_b, g, sp_size)
+        films = list(self._cam_film_batch_fn(torch.cat([pad(ca), pad(cb)], dim=1)))
+        _phase_mark(self, "embed")
+
+        grid_sizes = torch.tensor([[f, h, w]], dtype=torch.long)
+        rdt = _rope_dtype(x.unsqueeze(-1))
+        cos_a, sin_a = causal_rope_grids(self.freqs, grid_sizes, x.device, int(chunk_a) * f,
+                                         dtype=rdt, w_shard=(sp_size, r))
+        cos_b, sin_b = causal_rope_grids(self.freqs, grid_sizes, x.device, int(chunk_b) * f,
+                                         dtype=rdt, w_shard=(sp_size, r))
+        cos_a, sin_a, cos_b, sin_b = cos_a[0], sin_a[0], cos_b[0], sin_b[0]
+        one = torch.ones((P - R,) + tuple(cos_a.shape[1:]), dtype=cos_a.dtype, device=x.device)
+        zero = torch.zeros_like(one)
+        rope = ([torch.cat([cos_a, one, cos_b, one], 0)], [torch.cat([sin_a, zero, sin_b, zero], 0)])
+
+        n_chunks = len(kv_cache[0]["k"])
+        dest_a, lead_a = chunk_routing(int(chunk_a), n_chunks)
+        dest_b, lead_b = chunk_routing(int(chunk_b), n_chunks)
+        common = [c_ for c_ in lead_a if c_ in lead_b]
+        a_reads_b_old = dest_b in lead_a
+        assert set(lead_b) == set(common) | {dest_a}, (lead_a, lead_b, dest_a, dest_b)
+        assert set(lead_a) == set(common) | ({dest_b} if a_reads_b_old else set())
+        order = common + [dest_a, dest_b]
+        fz = (P, R, len(common), bool(a_reads_b_old))
+
+        kw = dict(e=e0_r, seq_lens=torch.tensor([L], dtype=torch.long), grid_sizes=grid_sizes,
+                  rope_grids=rope, rope_local_grid=[(1, 1, 2 * P)], grid_ints=[(f, h, w)],
+                  freqs=self.freqs, context=ctx, context_lens=None,
+                  max_attention_size=max_attention_size, frame_seqlen=frame_seqlen,
+                  cross_attn_first_call=False, seq_lens_int=L, sp_start_row=0, sp_rows=h)
+        _REAL_TOKENS[0] = None
+        x = sp_token_shard(x, tpd, tpr)
+        for i, block in enumerate(self.blocks):
+            ks = [kv_cache[i]["k"][j] for j in order]
+            vs = [kv_cache[i]["v"][j] for j in order]
+            x = block(x, kv_cache=None, kv_chunks=(ks, vs), crossattn_cache=crossattn_cache[i],
+                      current_start=0, dit_cond_dict={"cam_film": films[i]}, fused=fz, **kw)
+        _phase_mark(self, "blocks")
+        hfn = getattr(self, "_head_fused_fn", None)
+        if hfn is None:
+            hfn = self._head_fused_fn = torch.compile(_head_fused, backend="neuron",
+                                                      fullgraph=True, dynamic=False)
+        out = self.unpatchify(hfn(self.head, x, e_r, P, R).unsqueeze(0), grid_sizes)
+        if _FWD_PHASES:
+            _phase_mark(self, "head")
+            _p = self._ph_cur
+            if not hasattr(self, "_fwd_phase_log"):
+                self._fwd_phase_log = []
+            self._fwd_phase_log.append(
+                [(n, (t_ - _p[i][1]) * 1000.0) for i, (n, t_) in enumerate(_p[1:])])
+        return [u.float() for u in out]
 
     def _cam_films(self, dit_cond_dict):
         """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).

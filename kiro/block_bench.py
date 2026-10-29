@@ -121,8 +121,15 @@ def main():
         t.copy_(torch.randn(t.shape, generator=gk).to(t.dtype))
     order = list(range(LEAD)) + [n_chunks - 1]
     ks, vs = [kv["k"][i] for i in order], [kv["v"][i] for i in order]
-    cross = {"k": torch.zeros(1, 512, heads, d, dtype=torch.bfloat16, device=dev),
-             "v": torch.zeros(1, 512, heads, d, dtype=torch.bfloat16, device=dev),
+    if os.environ.get("WINDOW_KV", "0") == "1" and LEAD >= 2:
+        # The leading chunks as ONE contiguous buffer (what LINGBOT_KV_WINDOW builds once per
+        # chunk), so LINGBOT_ATTN_PAIR passes it as the kernel's prior: one call per block.
+        ks = [torch.cat(ks[:-1], dim=-1).contiguous(), ks[-1]]
+        vs = [torch.cat(vs[:-1], dim=1).contiguous(), vs[-1]]
+    from wan.modules.attention import cross_cache_shapes
+    _cks, _cvs = cross_cache_shapes(1, 512, heads, d)
+    cross = {"k": torch.zeros(_cks, dtype=torch.bfloat16, device=dev),
+             "v": torch.zeros(_cvs, dtype=torch.bfloat16, device=dev),
              "is_init": torch.tensor(0, dtype=torch.int32, device=dev)}
     for t in (cross["k"], cross["v"]):
         torch._dynamo.mark_static_address(t)

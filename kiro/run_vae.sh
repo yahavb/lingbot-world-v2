@@ -14,6 +14,8 @@ export NEURON_RT_LOG_LEVEL=ERROR NEURON_CC_LOG_LEVEL=ERROR
 export NEURON_COMPILE_CACHE_URL=/tmp/neuron-compile-cache TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
 export TORCH_NEURONX_HLO_CACHE_DIR=/tmp/hlo_cache NKI_ENABLE_TRACE_CACHE=1 HF_HOME=/work/hf
 for kv in "$@"; do export "$kv"; eval "$kv"; done
+# VAE_CC_EXTRA=<flags, '+' for spaces>: appended to NEURON_CC_FLAGS (A/B of compiler options).
+if [ -n "${VAE_CC_EXTRA:-}" ]; then export NEURON_CC_FLAGS="$NEURON_CC_FLAGS ${VAE_CC_EXTRA//+/ }"; fi
 export NEURON_LOGICAL_NC_CONFIG="$LNC"
 cd /work/repo
 L=/work/logs/vae_${NAME}.log

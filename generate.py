@@ -714,6 +714,12 @@ def _init_distributed(args, rank, world_size, local_rank):
 
 
 def generate(args):
+    # LINGBOT_DIT_CC_FLAGS ('+' for spaces): extra compiler options for every graph this process
+    # compiles (the DiT); torch-neuronx reads NEURON_CC_FLAGS at each compile. The decode step is a
+    # separate process with its own LINGBOT_VAE_CC_FLAGS.
+    _dcc = os.environ.get("LINGBOT_DIT_CC_FLAGS", "").replace("+", " ").strip()
+    if _dcc:
+        os.environ["NEURON_CC_FLAGS"] = (os.environ.get("NEURON_CC_FLAGS", "") + " " + _dcc).strip()
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))

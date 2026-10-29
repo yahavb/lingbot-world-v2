@@ -474,6 +474,38 @@ def cte_merge_enabled():
     return os.environ.get("LINGBOT_CTE_MERGE", "0") == "1"
 
 
+# LINGBOT_CROSS_NMAJOR=1: the cross-attention K/V cache is stored in attention_cte's own layout,
+# K [n, d, text_len] and V [n, text_len, d], written once per generation (the first cross-attention
+# call). Otherwise every call permutes the [1, text_len, n, d] cache into that layout: two strided
+# 1.3 MB transposes per block, ~250 us on the critical path of a 3.2 ms block at TP4 x CP16.
+# The same values reach the kernel (data movement only).
+_CROSS_NMAJOR = os.environ.get("LINGBOT_CROSS_NMAJOR", "0") == "1"
+
+
+def cross_nmajor_enabled():
+    return _CROSS_NMAJOR and (_CTE_AVAILABLE or _CTE_FOR_EXACT_AVAILABLE)
+
+
+def cross_cache_shapes(batch, text_len, heads, head_dim):
+    """(K shape, V shape) of one layer's cross-attention cache."""
+    if cross_nmajor_enabled():
+        assert batch == 1, "N-major cross cache assumes batch 1"
+        return (heads, head_dim, text_len), (heads, text_len, head_dim)
+    return (batch, text_len, heads, head_dim), (batch, text_len, heads, head_dim)
+
+
+def cte_cross_attention_nmajor(q, k_ndl, v_nld, dtype=torch.bfloat16):
+    """[1, Lq, n, d] queries against the N-major cross cache -> [1, Lq, n, d]. Same kernel call as
+    _cte_attention (pre-scaled q padded to 128 rows, no bounds), with K already transposed
+    (tp_k=False) instead of permuted from [1, L, n, d] on every call."""
+    q_c, lq = cte_prep_q(q, dtype)
+    out = _attention_cte(q_c, k_ndl.to(dtype), v_nld.to(dtype), scale=1.0, causal_mask=False,
+                         tp_q=True, tp_k=False, tp_out=False)
+    if isinstance(out, tuple):
+        out = out[0]
+    return out[:, :lq].permute(1, 0, 2).unsqueeze(0)
+
+
 def cte_prep_q(q, dtype=torch.bfloat16):
     """[1, Lq, n, d] -> (pre-scaled N-major q padded to 128 rows [n, Lq_p, d], Lq)."""
     b, lq, n, d = q.shape
@@ -501,6 +533,40 @@ def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None):
                                    tp_q=True, tp_k=tp_k, tp_out=False,
                                    cache_softmax=True, skip_output_normalization=True, **kw)
     return o, -neg_max.float(), s.float()
+
+
+def cte_rows(part, start, length):
+    """Rows [start, start + length) of a cte_partial result, with the softmax stats converted from
+    the kernel's [n, 128, Lq_p / 128] layout (query = group * 128 + row) to per-query [n, length]."""
+    o, m, s = part
+    n, g = int(m.shape[0]), int(m.shape[2])
+    m = m.transpose(1, 2).reshape(n, g * 128)[:, start:start + length]
+    s = s.transpose(1, 2).reshape(n, g * 128)[:, start:start + length]
+    return o[:, start:start + length], m, s
+
+
+def cte_merge_rows(parts, dtype=torch.bfloat16):
+    """cte_merge over per-query partials (cte_rows): the same fp32 ops in the same order, so the
+    same values element for element. [n, R, d] parts -> [1, R, n, d]."""
+    outs = [p[0] for p in parts]
+    maxs = [p[1] for p in parts]
+    sums = [p[2] for p in parts]
+    if len(outs) == 1:
+        lam = [1.0 / sums[0]]
+    else:
+        m_all = maxs[0]
+        for m in maxs[1:]:
+            m_all = torch.maximum(m_all, m)
+        w = [torch.exp(m - m_all) for m in maxs]
+        den = w[0] * sums[0]
+        for wc, sc in zip(w[1:], sums[1:]):
+            den = den + wc * sc
+        inv = 1.0 / den
+        lam = [wc * inv for wc in w]
+    out = lam[0].unsqueeze(-1) * outs[0].float()
+    for l_, o in zip(lam[1:], outs[1:]):
+        out = out + l_.unsqueeze(-1) * o.float()
+    return out.permute(1, 0, 2).unsqueeze(0).to(dtype)
 
 
 def cte_merge(parts, lq, dtype=torch.bfloat16):

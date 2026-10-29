@@ -119,7 +119,10 @@ def main():
     # (wan/modules/vae2_1_fused.py) instead of per-conv graphs and eager halo all-gathers.
     _fused = world_size > 1 and os.environ.get("LINGBOT_VAE_FUSED", "0") == "1"
     if _fused:
-        from wan.modules.vae2_1_fused import FusedWidthDecoder
+        from wan.modules.vae2_1_fused import FusedWidthDecoder, apply_vae_cc_flags
+        _ccx = apply_vae_cc_flags()
+        if _ccx:
+            logging.info(f"VAE compiler flags: + {_ccx}")
         _fdec = FusedWidthDecoder(vae.model)
 
         def _decode(z):

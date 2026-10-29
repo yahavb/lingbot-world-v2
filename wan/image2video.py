@@ -1209,6 +1209,34 @@ class WanI2VCausal:
             _sync = ((lambda: None) if os.environ.get("LINGBOT_NO_SYNC", "0") == "1"
                      else torch.neuron.synchronize)
             n_chunks = num_inference_chunk if max_chunks is None else max_chunks
+            # LINGBOT_PREUPLOAD=1: draw every per-step noise tensor up front, in the loop's own order
+            # and shapes (so the seeded CPU stream gives the same values), and move them and the
+            # timesteps to the device once. Each host-to-device copy in the loop waited for the
+            # device queue to drain, so the host could never issue ahead of the running forward.
+            _pre_noise = _pre_t = _pre_commit_t = None
+            if (os.environ.get("LINGBOT_PREUPLOAD", "0") == "1" and chunk_control is None
+                    and max_chunks is None and n_chunks <= num_inference_chunk):
+                _shape = tuple(latents_chunk[0].shape)
+                _draws = [torch.randn(_shape, generator=seed_g, device='cpu', dtype=torch.float32)
+                          for _ in range(n_chunks * (len(timesteps) - 1))]
+                _pre_noise = (torch.stack(_draws).to(self.device) if _draws else None)
+                _pre_t = [torch.stack([timesteps[i]]).to(self.device) for i in range(len(timesteps))]
+                _pre_commit_t = torch.stack([timesteps[-1] * 0.0]).to(self.device)
+            # LINGBOT_FUSE_COMMIT=1: run each chunk's KV-cache commit inside the NEXT chunk's first
+            # denoise forward (WanModelFast.forward_fused) instead of as its own forward.
+            _fuse = (os.environ.get("LINGBOT_FUSE_COMMIT", "0") == "1" and chunk_control is None
+                     and max_chunks is None and hasattr(self.model, "forward_fused"))
+            _pending = None
+            # LINGBOT_DUMP_PRED=<dir>:<tag,tag,...> (diagnostic): rank 0 saves those forwards'
+            # outputs, e.g. c1s0, to compare a fused against an unfused run.
+            _dump = os.environ.get("LINGBOT_DUMP_PRED", "")
+            _dump_dir, _dump_tags = (_dump.split(":", 1) + [""])[:2] if _dump else ("", "")
+            _dump_tags = set(filter(None, _dump_tags.split(",")))
+
+            def _maybe_dump(tag, t_):
+                if _dump_dir and tag in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0):
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    torch.save(t_.detach().float().cpu(), os.path.join(_dump_dir, f"{tag}.pt"))
             for chunk_id in tqdm(range(n_chunks)):
                 if chunk_control is not None:
                     ctl = chunk_control(chunk_id)
@@ -1256,7 +1284,8 @@ class WanI2VCausal:
                     latent_model_input = [current_latent.to(self.device)]
                     current_timestep = [timesteps[timestep_idx]]
 
-                    timestep = torch.stack(current_timestep).to(self.device)
+                    timestep = (_pre_t[timestep_idx] if _pre_t is not None
+                                else torch.stack(current_timestep).to(self.device))
                     _sync()
                     self._gen_phase["prep"] += time.perf_counter() - _p0
 
@@ -1287,13 +1316,31 @@ class WanI2VCausal:
                     _sync()
                     _f0 = time.perf_counter()
                     with _fwd_ctx():
-                        noise_pred = self.model(
-                            x=latent_model_input, t=timestep,
-                            cross_attn_first_call=not self._cross_attn_initialized,
-                            **kwargs)[0]
+                        if _pending is not None and timestep_idx == 0:
+                            _xa, _ya, _cam_a, _ca = _pending
+                            _pending = None
+                            _ta = (_pre_commit_t if _pre_commit_t is not None
+                                   else torch.stack([timesteps[-1] * 0.0]).to(self.device))
+                            noise_pred = self.model.forward_fused(
+                                _xa, _ya, _cam_a, _ta, float(timesteps[-1] * 0.0), _ca,
+                                latent_model_input[0], current_condition,
+                                dit_cond_dict["c2ws_plucker_emb"], timestep,
+                                float(current_timestep[0]), chunk_id,
+                                context=[context[0]], seq_len=max_seq_len,
+                                kv_cache=self_kv_cache, crossattn_cache=cross_kv_cache,
+                                frame_seqlen=frame_seqlen,
+                                max_attention_size=kwargs['max_attention_size'])[0]
+                            _ftag = "f"
+                        else:
+                            noise_pred = self.model(
+                                x=latent_model_input, t=timestep,
+                                cross_attn_first_call=not self._cross_attn_initialized,
+                                **kwargs)[0]
+                            _ftag = ""
                         _sync()
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
-                    self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}")
+                    self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}{_ftag}")
+                    _maybe_dump(f"c{chunk_id}s{timestep_idx}", noise_pred)
                     self._cross_attn_initialized = True
 
                     if offload_model:
@@ -1320,8 +1367,12 @@ class WanI2VCausal:
                         # itself and both suspects are wrong.
                         _sync()
                         _n0 = time.perf_counter()
-                        _noise = torch.randn(x0.shape, generator=seed_g, device='cpu',
-                                             dtype=x0.dtype).to(x0.device)
+                        if _pre_noise is not None:
+                            assert x0.dtype == torch.float32 and tuple(x0.shape) == _shape
+                            _noise = _pre_noise[chunk_id * (len(timesteps) - 1) + timestep_idx]
+                        else:
+                            _noise = torch.randn(x0.shape, generator=seed_g, device='cpu',
+                                                 dtype=x0.dtype).to(x0.device)
                         _sync()
                         self._gen_phase["randn"] += time.perf_counter() - _n0
                         _a0 = time.perf_counter()
@@ -1357,9 +1408,14 @@ class WanI2VCausal:
                 if (chunk_id == n_chunks - 1 and chunk_control is None and max_chunks is None
                         and os.environ.get("LINGBOT_SKIP_LAST_COMMIT", "0") == "1"):
                     continue
+                if _fuse and chunk_id < n_chunks - 1:
+                    # Deferred: the next chunk's first forward commits this chunk's KV.
+                    _pending = (x0, current_condition, dit_cond_dict["c2ws_plucker_emb"], chunk_id)
+                    continue
                 # Update kv cache
                 context_timestep = [timesteps[-1] * 0.0]
-                timestep = torch.stack(context_timestep).to(self.device)
+                timestep = (_pre_commit_t if _pre_commit_t is not None
+                            else torch.stack(context_timestep).to(self.device))
                 # A FIFTH DiT forward per chunk. len(timesteps) is 4
                 # (timesteps_index=[0, 179, 358, 679]), so the denoise loop above is not
                 # the whole cost -- this cache-commit pass runs the full 40 blocks too.
@@ -1367,9 +1423,11 @@ class WanI2VCausal:
                 _sync()
                 _f0 = time.perf_counter()
                 with _fwd_ctx():
+                    # LINGBOT_COMMIT_NOHEAD=1: this forward only writes the KV cache; skip the head.
+                    _nh = os.environ.get("LINGBOT_COMMIT_NOHEAD", "0") == "1"
                     self.model(x=[x0], t=timestep,
                                cross_attn_first_call=False,
-                               **kwargs)
+                               **(dict(kwargs, skip_head=True) if _nh else kwargs))
                     _sync()
                 self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                 self._dit_fwd_tag.append(f"c{chunk_id}commit")
@@ -1840,10 +1898,12 @@ class WanI2VCausal:
         """
         Initialize a per-GPU cross-attention cache.
         """
+        from .modules.attention import cross_cache_shapes
+        k_shape, v_shape = cross_cache_shapes(*shape)
         crossattn_cache = []
         for _ in range(num_layers):
-            k = torch.zeros(shape, dtype=dtype, device=device)
-            v = torch.zeros(shape, dtype=dtype, device=device)
+            k = torch.zeros(k_shape, dtype=dtype, device=device)
+            v = torch.zeros(v_shape, dtype=dtype, device=device)
             for _t in (k, v):   # same pinning as the self-attn cache above
                 try:
                     torch._dynamo.mark_static_address(_t)

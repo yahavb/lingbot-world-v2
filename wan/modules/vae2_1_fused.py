@@ -41,6 +41,18 @@ _MESH = None
 _PD = None  # (P ranks per device, D devices)
 
 
+def apply_vae_cc_flags():
+    """LINGBOT_VAE_CC_FLAGS ('+' for spaces): append compiler options to NEURON_CC_FLAGS for the
+    decoder graphs. torch-neuronx reads NEURON_CC_FLAGS at every compile, so this must run before
+    the first decode, and it applies to every later compile in the process: call it only from a
+    process that compiles nothing else (the decode step). Measured at 64 ranks, bf16, T=3: -O1 decodes
+    in 0.65 s against 0.77 s at the default -O2."""
+    extra = os.environ.get("LINGBOT_VAE_CC_FLAGS", "").replace("+", " ").strip()
+    if extra:
+        os.environ["NEURON_CC_FLAGS"] = (os.environ.get("NEURON_CC_FLAGS", "") + " " + extra).strip()
+    return extra
+
+
 def _init_mesh():
     global _MESH, _PD
     if _MESH is None:
@@ -72,13 +84,26 @@ def _selectors(device):
     return tuple(t.to(device) for t in (wl1, wr1, sv, wl2, wr2))
 
 
+_DIAG_NOHALO = os.environ.get("LINGBOT_VAE_DIAG", "") == "nohalo"   # DIAGNOSTIC ONLY: wrong pixels
+# LINGBOT_VAE_SWAPHW=1: run the decoder on [.., W, H] tensors (H innermost) instead of [.., H, W].
+# Each rank's width slice is 2..18 columns, and as the innermost axis it made the compiler emit 1.35M
+# single-element PE-array transposes per decode (283 ms of matmul-engine time). Every decoder op is
+# symmetric in H and W (3x3 kernels transposed, padding swapped), attention is invariant to the token
+# order, so the result is the same computation in another layout.
+_SWAP = os.environ.get("LINGBOT_VAE_SWAPHW", "0") == "1"
+_WAX = -2 if _SWAP else -1          # the sharded (width) axis
+
+
 def _halo(x, sel):
     """[..., w] -> [..., w + 2]: this rank's slice with its neighbours' adjoining columns."""
+    if _DIAG_NOHALO:
+        return F.pad(x, (0, 0, 1, 1) if _SWAP else (1, 1))
     P, D = _PD
     # One-hot weights in x's dtype: x * 1 + 0 is exact in bf16 too, and the concat below then
     # stays in x's dtype instead of promoting the whole activation to fp32.
     wl1, wr1, sv, wl2, wr2 = (t.to(x.dtype) for t in sel)
-    e = torch.stack([x[..., :1], x[..., -1:]], 0).contiguous()            # [2, *x[:-1], 1]
+    nw = x.shape[_WAX]
+    e = torch.stack([x.narrow(_WAX, 0, 1), x.narrow(_WAX, nw - 1, 1)], 0).contiguous()
     g1 = fc.all_gather_tensor(e, 0, _MESH["core"]).view((P,) + tuple(e.shape))
     bc = (P,) + (1,) * (e.dim() - 1)
     hl = (g1[:, 1] * wl1.view(bc)).sum(0)
@@ -89,7 +114,7 @@ def _halo(x, sel):
         bd = (D,) + (1,) * bnd.dim()
         hl = hl + (g2 * wl2.view(bd)).sum(0)
         hr = hr + (g2 * wr2.view(bd)).sum(0)
-    return torch.cat([hl, x, hr], -1)
+    return torch.cat([hl, x, hr], _WAX)
 
 
 def _gather_w(x):
@@ -101,19 +126,36 @@ def _gather_w(x):
     n = P * D
     b, c, t, h, w = x.shape
     g = g.view((n,) + tuple(x.shape))
+    if _SWAP:                                  # x is [b, c, t, W, H]: rank axis next to W
+        return g.permute(1, 2, 3, 0, 4, 5).reshape(b, c, t, n * h, w)
     return g.permute(1, 2, 3, 4, 0, 5).reshape(b, c, t, h, n * w)
+
+
+_NORM_MODE = os.environ.get("LINGBOT_VAE_NORM", "normalize")
 
 
 def _rms(x, gamma, scale):
     # RMS_norm.forward, same op order (bias is the float 0.), always in fp32 (as CUDA autocast
     # runs the norm). A no-op cast in the fp32 decode.
-    return F.normalize(x.float(), dim=1) * scale * gamma + 0.
+    #
+    # LINGBOT_VAE_NORM=mm: the channel sum of squares as one fp32 matmul against a ones vector
+    # (channels are the contraction axis), then x * rsqrt(max(sumsq, eps^2)), which is
+    # F.normalize's x / max(||x||, eps) up to fp32 rounding. In the default form the profile put
+    # ~174 ms of matmul-engine time and 64 ms of GpSimd cross-lane reduce on these reductions.
+    x = x.float()
+    if _NORM_MODE == "mm":
+        ones = torch.ones(x.shape[1], dtype=torch.float32, device=x.device)
+        ss = torch.einsum("bcthw,c->bthw", x * x, ones) if x.dim() == 5 else \
+            torch.einsum("bchw,c->bhw", x * x, ones)
+        inv = torch.rsqrt(torch.clamp(ss, min=1e-24)).unsqueeze(1)
+        return x * inv * scale * gamma + 0.
+    return F.normalize(x, dim=1) * scale * gamma + 0.
 
 
 def _cconv(xnew_h, cache_h, w, b):
     """Causal 3x3x3 conv of haloed new frames after the haloed 2-frame cache, in w's dtype."""
     xh = torch.cat([cache_h, xnew_h.to(w.dtype)], 2)
-    y = F.conv3d(F.pad(xh, (0, 0, 1, 1, 0, 0)), w, b)
+    y = F.conv3d(F.pad(xh, (1, 1, 0, 0, 0, 0) if _SWAP else (0, 0, 1, 1, 0, 0)), w, b)
     return y, xh[:, :, -2:]
 
 
@@ -136,7 +178,7 @@ def _attn_unit(x, gamma, scale, wqkv, bqkv, wproj, bproj):
     b, c, t, h, w = x.shape
 
     def qkv(z):
-        zf = z.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, z.shape[-1])
+        zf = z.permute(0, 2, 1, 3, 4).reshape(b * t, c, z.shape[-2], z.shape[-1])
         zf = _rms(zf, gamma, scale).to(wqkv.dtype)
         return F.conv2d(zf, wqkv, bqkv).reshape(b * t, 1, c * 3, -1).permute(
             0, 1, 3, 2).contiguous().chunk(3, dim=-1)
@@ -159,6 +201,12 @@ def _up_core(x, w2, b2, sel):
     rows; nearest x2 duplicates columns, so the neighbour's last column is the same either way)."""
     b, c, t, h, w = x.shape
     xh = _halo(x.to(w2.dtype), sel)
+    if _SWAP:                                  # [.., W, H]: halo rows on W, pad H
+        xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h + 2, w)
+        xf = xf[:, :, :, None, :, None].expand(b * t, c, h + 2, 2, w, 2).reshape(
+            b * t, c, 2 * h + 4, 2 * w)[:, :, 1:-1]
+        y = F.conv2d(F.pad(xf, (1, 1, 0, 0)), w2, b2)
+        return y.reshape(b, t, y.shape[1], 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
     xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w + 2)
     xf = xf[:, :, :, None, :, None].expand(b * t, c, h, 2, w + 2, 2).reshape(
         b * t, c, 2 * h, 2 * w + 4)[..., 1:-1]
@@ -213,19 +261,25 @@ class FusedWidthDecoder:
         self.sel = None
 
     def _wb(self, m, keep_fp32=False):
-        """(weight, bias) of a conv module in the compute dtype (cached bf16 copies)."""
-        if self.dt is None or keep_fp32:
+        """(weight, bias) of a conv module in the compute dtype (cached bf16 copies); with
+        LINGBOT_VAE_SWAPHW the spatial kernel axes are transposed to match the [W, H] layout."""
+        if (self.dt is None or keep_fp32) and not _SWAP:
             return m.weight, m.bias
-        k = id(m)
+        k = (id(m), keep_fp32)
         if k not in self._wcache:
-            self._wcache[k] = (m.weight.detach().to(self.dt),
-                               None if m.bias is None else m.bias.detach().to(self.dt))
+            dt = m.weight.dtype if (self.dt is None or keep_fp32) else self.dt
+            w = m.weight.detach().to(dt)
+            if _SWAP:
+                w = w.transpose(-1, -2).contiguous()
+            self._wcache[k] = (w, None if m.bias is None else m.bias.detach().to(dt))
         return self._wcache[k]
 
     def _zeros(self, x, c, halo=True, fp32=False):
-        b, _, _, h, w = x.shape
+        shape = [x.shape[0], c, 2, x.shape[3], x.shape[4]]
+        if halo:
+            shape[_WAX] += 2
         dt = x.dtype if self.dt is None else (torch.float32 if fp32 else self.dt)
-        return torch.zeros((b, c, 2, h, w + (2 if halo else 0)), dtype=dt, device=x.device)
+        return torch.zeros(shape, dtype=dt, device=x.device)
 
     def _step(self, x, caches, first):
         new, i = [], 0
@@ -290,6 +344,8 @@ class FusedWidthDecoder:
         else:
             z = z / scale[1] + scale[0]
         x = self.model.conv2(z)
+        if _SWAP:
+            x = x.transpose(-1, -2).contiguous()
         k = max(1, int(os.environ.get("LINGBOT_VAE_T", "1")))
         out, caches = self._step(x[:, :, :1], None, first=True)
         outs, i, n = [out], 1, x.shape[2]
@@ -298,4 +354,5 @@ class FusedWidthDecoder:
             out, caches = self._step(x[:, :, i:j], caches, first=False)
             outs.append(out)
             i = j
-        return torch.cat(outs, 2)
+        out = torch.cat(outs, 2)
+        return out.transpose(-1, -2).contiguous() if _SWAP else out

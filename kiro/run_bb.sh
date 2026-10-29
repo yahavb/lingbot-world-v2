@@ -17,6 +17,8 @@ export NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE=134217728 NEURON_LOAD_CONCURR
 export NEURON_RT_LOG_LEVEL=ERROR NEURON_CC_LOG_LEVEL=ERROR NEURON_LAUNCH_BLOCKING=1
 export TP="$NPROC" CP=1 MASTER_PORT=29720
 for kv in "$@"; do export "$kv"; done
+# CC_EXTRA=<flags, '+' for spaces>: appended to NEURON_CC_FLAGS (A/B of compiler options).
+if [ -n "${CC_EXTRA:-}" ]; then export NEURON_CC_FLAGS="$NEURON_CC_FLAGS ${CC_EXTRA//+/ }"; fi
 mkdir -p /work/logs /work/out
 LOG=/work/logs/bb_${NAME}.log
 cd /work/repo
