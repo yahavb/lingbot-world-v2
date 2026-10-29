@@ -30,6 +30,7 @@ from wan.modules.attention import (
     cte_merge,
     cte_merge_rows,
     cte_rows,
+    xla_attention_rows,
     cte_partial,
     cte_prep_q,
     exact_attention,
@@ -136,6 +137,11 @@ _ATTN_PAIR = os.environ.get("LINGBOT_ATTN_PAIR", "0") == "1"
 # chunks instead of the cache buffers themselves. Profiled, the calls that read cache buffers (graph
 # inputs) spent ~160 us of GpSimd on DMA descriptors, the call on the in-graph new chunk 13 us.
 _KV_CLONE = os.environ.get("LINGBOT_KV_CLONE", "0") == "1"
+# LINGBOT_ATTN_REM=1 (with LINGBOT_ATTN_EARLY): the attention kernel works in 128-row query tiles and
+# its cost is per tile, so at 270 real (288 padded) tokens per rank the third tile does 14 rows of
+# work at the price of 128. Run the first floor(Lq / 128) * 128 queries through the kernel and the
+# remaining rows as fp32 matmuls + softmax over all KV chunks (xla_attention_rows).
+_ATTN_REM = os.environ.get("LINGBOT_ATTN_REM", "0") == "1"
 # LINGBOT_FILM_BATCH=1 (with LINGBOT_FILM_A2A): all 40 blocks' camera FiLM params in ONE compiled
 # graph per chunk instead of 40 (22 ms per chunk measured, mostly per-graph launch cost).
 _FILM_BATCH = os.environ.get("LINGBOT_FILM_BATCH", "0") == "1"
@@ -149,6 +155,60 @@ _HEAD_COMPILE = os.environ.get("LINGBOT_HEAD_COMPILE", "0") == "1"
 # all-gather of the stacked local shards instead of two. Profiled, the two 11 MB Ring all-gathers ran
 # back to back with a ~110 us gap between them. Data movement only.
 _KV_GATHER1 = os.environ.get("LINGBOT_KV_GATHER1", "0") == "1"
+
+
+def _films_multi(raw_blocks, c_cat, K, P):
+    """Every block's camera FiLM (scale, shift) for K chunks at once. c_cat is [1, K * P, C]: each
+    chunk's P (padded) CP-local camera tokens in a row. One all-to-all per tensor gives every TP rank
+    its token shard of EVERY chunk ([K, P / tp, C]); token shards and column order are those of
+    cols_to_token_shard applied to each chunk alone."""
+    m = tp.mesh_submesh("tp")
+    n = m.size()
+    out = []
+    for b in raw_blocks:
+        pair = []
+        for t in b.cam_film(c_cat):                                # [1, K * P, C / n]
+            c = int(t.shape[-1])
+            x = t[0].view(K, n, P // n, c).permute(1, 0, 2, 3).reshape(n * K * (P // n), c)
+            y = fc.all_to_all_single(x.contiguous(), None, None, m)    # [n * K * P/n, c]
+            y = y.view(n, K, P // n, c).permute(1, 2, 0, 3).reshape(K, P // n, n * c)
+            pair.append(y)
+        out.append(tuple(pair))
+    return out
+
+
+def _film_check_log(used, ref, k):
+    """LINGBOT_FILM_CHECK=1 (diagnostic, first generation only): chunk k's precomputed FiLM params
+    (LINGBOT_FILM_ALL) against the ones the per-chunk path (camera branch + _cam_films) builds,
+    over all 40 blocks and all ranks. Rank 0 prints elements compared / differing, max |diff| and
+    rel. RMS. COLLECTIVE (all_gather_object): every rank reaches it in the same forward."""
+    n_el = n_diff = 0
+    mx = ss_d = ss_r = 0.0
+    shp = None
+    for (su, hu), (sr, hr) in zip(used, ref):
+        for a, b in ((su, sr), (hu, hr)):
+            shp = shp or (tuple(a.shape), tuple(b.shape))
+            a = a.detach().cpu().double().reshape(-1)
+            b = b.detach().cpu().double().reshape(-1)
+            assert a.numel() == b.numel(), (shp, tuple(a.shape), tuple(b.shape))
+            d = a - b
+            n_el += d.numel()
+            n_diff += int((d != 0).sum())
+            mx = max(mx, float(d.abs().max()))
+            ss_d += float(d.pow(2).sum())
+            ss_r += float(b.pow(2).sum())
+    st = [n_el, n_diff, mx, ss_d, ss_r, len(used), len(ref)]
+    allst = [None] * dist.get_world_size()
+    dist.all_gather_object(allst, st)
+    if dist.get_rank() == 0:
+        n_el = sum(s[0] for s in allst)
+        n_diff = sum(s[1] for s in allst)
+        mx = max(s[2] for s in allst)
+        rel = math.sqrt(sum(s[3] for s in allst) / max(sum(s[4] for s in allst), 1e-30))
+        worst = max(range(len(allst)), key=lambda i: allst[i][2])
+        print(f"[film check] chunk {k}: blocks {allst[0][5]}/{allst[0][6]} shapes {shp[0]} vs "
+              f"{shp[1]}, {n_diff}/{n_el} elements differ, max|d| {mx:.3e} (rank {worst}), "
+              f"rel RMS {rel:.3e}", flush=True)
 
 
 def _head_fused(head, x, e, P, R):
@@ -850,7 +910,9 @@ class CausalWanSelfAttention(nn.Module):
                 # LINGBOT_ATTN_EARLY=1: leading chunks first (they need only Q), then the new
                 # chunk: local shard -> cache layout -> all-gather on a new leading axis -> one
                 # contiguous-run permute into the destination buffer.
-                q_c, lq = cte_prep_q(roped_query)
+                _lq_all = int(roped_query.shape[1])
+                _lq_main = (_lq_all // 128) * 128 if (_ATTN_REM and _lq_all % 128) else _lq_all
+                q_c, lq = cte_prep_q(roped_query[:, :_lq_main])
                 kd, vd = k_chunks[-1], v_chunks[-1]
                 _cp = cp_w_shard[0]
                 _l, _n, _d = (int(t) for t in roped_key.shape[1:])
@@ -893,6 +955,10 @@ class CausalWanSelfAttention(nn.Module):
                 vd.copy_(vg.reshape(vd.shape))
                 parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ())))
                 x = cte_merge(parts, lq)
+                if _lq_main < _lq_all:
+                    x_rem = xla_attention_rows(roped_query[:, _lq_main:],
+                                               list(k_chunks[:-1]) + [kd], list(v_chunks[:-1]) + [vd])
+                    x = torch.cat([x, x_rem], dim=1)
                 out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                 if return_cache and not getattr(self, 'tp_enabled', False):
                     return out, kd, vd
@@ -1788,6 +1854,21 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # cam: the condition is per CHUNK (same tuple object for its 5 forwards), so the
         # embedded + sharded result is reused within the chunk.
         _cam_in = None
+        self._films_cur = None
+        _film_chk = None
+        _pre = getattr(self, "_films_pre", None)
+        if (_pre and dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict
+                and id(dit_cond_dict["c2ws_plucker_emb"]) in _pre
+                and _pre[id(dit_cond_dict["c2ws_plucker_emb"])][0] is dit_cond_dict["c2ws_plucker_emb"]):
+            # LINGBOT_FILM_ALL: this chunk's FiLM params were computed before the loop.
+            self._films_cur = _pre[id(dit_cond_dict["c2ws_plucker_emb"])][1]
+            _chk_ids = getattr(self, "_film_check_ids", None)
+            if _chk_ids and id(dit_cond_dict["c2ws_plucker_emb"]) in _chk_ids:
+                # LINGBOT_FILM_CHECK: keep the condition, so this forward also builds the chunk's
+                # FiLM params the per-chunk way (camera branch + _cam_films) to compare.
+                _film_chk = _chk_ids.pop(id(dit_cond_dict["c2ws_plucker_emb"]))
+            else:
+                dit_cond_dict = None
         if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
             _cam_in = dit_cond_dict["c2ws_plucker_emb"]
             _camhit = getattr(self, "_cam_emb_cache", None)
@@ -2076,7 +2157,10 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 x = _stacks[_dest](x, _ks, _vs, tuple(crossattn_cache),
                                    self._stack_tokens[_dest], kwargs)
             else:
-                _films = self._cam_films(kwargs.get("dit_cond_dict"))
+                _films = (self._films_cur if getattr(self, "_films_cur", None) is not None
+                          else self._cam_films(kwargs.get("dit_cond_dict")))
+                if _film_chk is not None:
+                    _film_check_log(_films, self._cam_films(kwargs.get("dit_cond_dict")), _film_chk)
                 _phase_mark(self, "films")
                 _tpd = tp.tp_degree(_TP_GROUP)
                 _sp = _SP_ON and _tpd > 1
@@ -2334,6 +2418,56 @@ class WanModelFast(ModelMixin, ConfigMixin):
             self._fwd_phase_log.append(
                 [(n, (t_ - _p[i][1]) * 1000.0) for i, (n, t_) in enumerate(_p[1:])])
         return [u.float() for u in out]
+
+    def precompute_films(self, cam_tuples, c2ws_all, grid):
+        """LINGBOT_FILM_ALL: camera FiLM params of every chunk in one compiled graph before the
+        chunk loop (each chunk's first forward otherwise spent 19-26 ms on its own). cam_tuples are
+        the per-chunk condition tuples the loop will pass (looked up by identity), c2ws_all the
+        whole [1, C, F, H, W] Plucker condition, grid the per-chunk patch grid (f, h, w). Same ops
+        as forward()'s camera branch and _cam_films, on all chunks' tokens at once."""
+        sp_size, tpd = tp.tp_degree(_SP_GROUP), tp.tp_degree(_TP_GROUP)
+        assert (_SP_ON and tpd > 1 and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+                and tp.has_mesh() and _TOKEN_PAD and _CAM_HOIST and _FILM_A2A), \
+            "LINGBOT_FILM_ALL needs SP, flat CP on a mesh, TOKEN_PAD and FILM_A2A"
+        device = getattr(self, '_onload_device', self.patch_embedding.weight.device)
+        if getattr(self, "_children_on", None) != str(device):
+            for _name, _mod in self.named_children():
+                if _name != 'blocks':
+                    _mod.to(device)
+            self._children_on = str(device)
+        f, h, w = grid
+        c = rearrange(c2ws_all, '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
+                      c1=self.patch_size[0], c2=self.patch_size[1], c3=self.patch_size[2])
+        c = self.patch_embedding_wancamctrl(c)
+        c = c + self.c2ws_hidden_states_layer2(torch_F.silu(self.c2ws_hidden_states_layer1(c)))
+        L = f * h * w
+        K = len(cam_tuples)
+        assert c.shape[1] >= K * L or c.shape[1] % L == 0, (c.shape, L, K)
+        R = L // sp_size
+        P = -(-R // _TOKEN_PAD) * _TOKEN_PAD
+        r = _sp_local_r()
+        n_avail = c.shape[1] // L
+        toks = []
+        for k in range(K):
+            ck = c[:, min(k, n_avail - 1) * L:(min(k, n_avail - 1) + 1) * L]
+            ck = _shard_w(ck, f, h, w, sp_size, r)
+            toks.append(torch_F.pad(ck, (0, 0, 0, P - R)))
+        fn = getattr(self, "_films_multi_fn", None)
+        if fn is None:
+            raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+
+            def _all(c_cat, K_, P_):
+                return _films_multi(raw, c_cat, K_, P_)
+            fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
+                                                      dynamic=False)
+        res = fn(torch.cat(toks, dim=1), K, P)
+        self._films_pre = {}
+        for k, t in enumerate(cam_tuples):
+            self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])
+        if os.environ.get("LINGBOT_FILM_CHECK", "") and not getattr(self, "_film_check_done", False):
+            # First generation only, so a benchmark's timed pass is unaffected.
+            self._film_check_ids = {id(t): k for k, t in enumerate(cam_tuples)}
+            self._film_check_done = True
 
     def _cam_films(self, dit_cond_dict):
         """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).

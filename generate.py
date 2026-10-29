@@ -753,6 +753,10 @@ def generate(args):
     img = None
     if args.image is not None:
         img = Image.open(args.image).convert("RGB")
+        if os.environ.get("LINGBOT_IMG_BLOCK", "0") == "1":
+            # one memory block, so the encode-cache key reads the pixels in place (encode_key)
+            from wan.image2video import single_block_image
+            img = single_block_image(img)
         logging.info(f"Input image: {args.image}")
     if (img is not None and args.infer_mode == "causal_fast" and dist.is_initialized()
             and os.environ.get("LINGBOT_PRE_ENCODE", "1") == "1"):

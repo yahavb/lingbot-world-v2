@@ -535,6 +535,31 @@ def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None):
     return o, -neg_max.float(), s.float()
 
 
+def xla_attention_rows(q, k_chunks, v_chunks, dtype=torch.bfloat16):
+    """Exact attention of a few query rows [1, R, n, d] over N-major KV chunks (K [n, d, L] or
+    [n, L, d], V [n, L, d]), as fp32 matmuls and softmax inside the graph. For the partial last
+    128-row query tile: the kernel's cost is per tile, so a tile holding 14 real rows costs as much
+    as a full one."""
+    d = int(q.shape[-1])
+    qh = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2)                # [n, R, d]
+    scores = []
+    for kc in k_chunks:
+        kk = kc.float() if (int(kc.shape[1]) == d and int(kc.shape[-1]) != d) else kc.float().transpose(1, 2)
+        scores.append(torch.matmul(qh, kk))                                    # [n, R, L]
+    m = scores[0].amax(-1, keepdim=True)
+    for sc in scores[1:]:
+        m = torch.maximum(m, sc.amax(-1, keepdim=True))
+    num = None
+    den = None
+    for sc, vc in zip(scores, v_chunks):
+        e = torch.exp(sc - m)
+        o = torch.matmul(e, vc.float())                                        # [n, R, d]
+        s_ = e.sum(-1, keepdim=True)
+        num = o if num is None else num + o
+        den = s_ if den is None else den + s_
+    return (num / den).permute(1, 0, 2).unsqueeze(0).to(dtype)
+
+
 def cte_rows(part, start, length):
     """Rows [start, start + length) of a cte_partial result, with the softmax stats converted from
     the kernel's [n, 128, Lq_p / 128] layout (query = group * 128 + row) to per-query [n, length]."""

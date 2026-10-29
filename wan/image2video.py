@@ -94,23 +94,92 @@ def condition_geometry(img_hw, action_path, frame_num, chunk_size, max_area, tar
     return F, h, w, lat_f, lat_h, lat_w
 
 
+def single_block_image(img):
+    """`img` copied into ONE memory block. Pillow allocates a large image in 16 MB arena blocks, and
+    only a single-block image exports its pixels in place (Arrow C data interface, Pillow >= 11.2),
+    which lets encode_key skip img.tobytes() (28 ms to repack the 42 MB example). Same pixels;
+    returns `img` itself if this Pillow cannot allocate one block."""
+    try:
+        from PIL import Image
+        out = img._new(Image.core.new_block(img.mode, img.size))
+        out.paste(img)
+        return out
+    except Exception:  # noqa: BLE001
+        return img
+
+
+def _pixel_view(img):
+    """(layout tag, memoryview of a PIL image's pixel bytes, owner to keep alive). In place through
+    the Arrow C data interface when the image is in one block (RGB is stored as RGBX there), else a
+    tobytes() copy."""
+    try:
+        import pyarrow as pa
+        a = pa.array(img)
+        vb = a.buffers()[-1]
+        per = a.type.list_size if hasattr(a.type, "list_size") else 1
+        n = len(a) * per
+        if a.offset == 0 and vb is not None and vb.size >= n:
+            return "arrow%d" % per, memoryview(vb)[:n], a
+    except Exception:  # noqa: BLE001  (multi-block image, no pyarrow, old Pillow)
+        pass
+    b = img.tobytes()
+    return "raw", memoryview(b), b
+
+
+_KEY_POOL = None
+
+
+def _checksums(mv, nthreads, block=1 << 20):
+    """(crc32, adler32) of each of `nthreads` slices of `mv`. Each slice is hashed 1 MB block by
+    block with both checksums, so every byte is read from DRAM once, and zlib releases the GIL on
+    large buffers, so the slices hash in parallel threads."""
+    global _KEY_POOL
+    total = mv.nbytes
+    step = -(-total // max(1, nthreads))
+
+    def one(lo):
+        hi = min(lo + step, total)
+        c, a = 0, 1
+        for s in range(lo, hi, block):
+            part = mv[s:min(s + block, hi)]
+            c = zlib.crc32(part, c)
+            a = zlib.adler32(part, a)
+        return c, a
+    if nthreads <= 1:
+        return (one(0),)
+    if _KEY_POOL is None or _KEY_POOL._max_workers != nthreads:
+        from concurrent.futures import ThreadPoolExecutor
+        _KEY_POOL = ThreadPoolExecutor(nthreads)
+    return tuple(_KEY_POOL.map(one, range(0, total, step)))
+
+
 def encode_key(img, F, h, w):
-    """Cache key of a conditioning encode: (image size, F, h, w, checksums of the image bytes).
+    """Cache key of a conditioning encode: (image size, F, h, w, checksums of all image bytes).
 
     `img` is the PIL image (or an already-normalized [3, H, W] tensor). Hashing the PIL bytes
     (uint8, 42 MB for the 5145 x 2894 example) replaced hash(tensor.tobytes()) of the fp32
-    tensor (178 MB) after a device-to-host copy of it: ~330 ms per generation down to ~40 ms.
+    tensor (178 MB) after a device-to-host copy of it: ~330 ms per generation down to ~40 ms
+    (95 ms with 64 ranks hashing at once). LINGBOT_KEY_THREADS=N > 0: every byte still enters
+    the key, read in place when the image is one block (single_block_image), as per-slice crc32 +
+    adler32 in N threads.
     """
+    nt = int(os.environ.get("LINGBOT_KEY_THREADS", "0"))
+    _owner = None
     if isinstance(img, torch.Tensor):
         a = img.detach()
         a = a.cpu() if a.device.type != "cpu" else a
         buf = memoryview(np.ascontiguousarray(a.numpy())).cast("B")
         size = (int(img.shape[1]), int(img.shape[2]))
-    else:
-        buf = img.tobytes()
+        tag = "tensor"
+    elif nt > 0:
+        tag, buf, _owner = _pixel_view(img)
         size = (int(img.size[1]), int(img.size[0]))
-        buf = memoryview(buf)
-    return size + (int(F), int(h), int(w), zlib.crc32(buf), zlib.adler32(buf), buf.nbytes)
+    else:
+        buf = memoryview(img.tobytes())
+        size = (int(img.size[1]), int(img.size[0]))
+    if nt <= 0:
+        return size + (int(F), int(h), int(w), zlib.crc32(buf), zlib.adler32(buf), buf.nbytes)
+    return size + (int(F), int(h), int(w), tag, _checksums(buf, nt), buf.nbytes)
 
 
 def _plucker_cond_math(c2ws, Ks, h, w, lat_f, lat_h, lat_w, dtype):
@@ -1227,6 +1296,16 @@ class WanI2VCausal:
             _fuse = (os.environ.get("LINGBOT_FUSE_COMMIT", "0") == "1" and chunk_control is None
                      and max_chunks is None and hasattr(self.model, "forward_fused"))
             _pending = None
+            # LINGBOT_FILM_ALL=1: every chunk's camera FiLM params in one graph before the loop;
+            # the loop then passes the same condition tuples, which index them.
+            _cam_tuples = None
+            if (os.environ.get("LINGBOT_FILM_ALL", "0") == "1" and chunk_control is None
+                    and max_chunks is None and hasattr(self.model, "precompute_films")):
+                _cam_tuples = [c2ws_plucker_emb_chunk[min(k_, num_inference_chunk - 1)].chunk(1, dim=0)
+                               for k_ in range(n_chunks)]
+                self.model.precompute_films(_cam_tuples, c2ws_plucker_emb,
+                                            (chunk_size, lat_h // self.patch_size[1],
+                                             lat_w // self.patch_size[2]))
             # LINGBOT_DUMP_PRED=<dir>:<tag,tag,...> (diagnostic): rank 0 saves those forwards'
             # outputs, e.g. c1s0, to compare a fused against an unfused run.
             _dump = os.environ.get("LINGBOT_DUMP_PRED", "")
@@ -1258,7 +1337,8 @@ class WanI2VCausal:
                 current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[k]
 
                 dit_cond_dict = {
-                    "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
+                    "c2ws_plucker_emb": (_cam_tuples[chunk_id] if _cam_tuples is not None
+                                         else current_c2ws_plucker_emb.chunk(1, dim=0)),
                 }
 
                 kwargs = {
