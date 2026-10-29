@@ -115,9 +115,28 @@ def main():
         vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint),
         device=device, dtype=torch.bfloat16)
 
-    if world_size > 1:
-        shard_vae_decoder_width(vae.model.decoder)
-        logging.info(f"Width-sharded decoder across {world_size} ranks.")
+    # LINGBOT_VAE_FUSED=1: whole decoder blocks compiled with the width halos inside the graphs
+    # (wan/modules/vae2_1_fused.py) instead of per-conv graphs and eager halo all-gathers.
+    _fused = world_size > 1 and os.environ.get("LINGBOT_VAE_FUSED", "0") == "1"
+    if _fused:
+        from wan.modules.vae2_1_fused import FusedWidthDecoder
+        _fdec = FusedWidthDecoder(vae.model)
+
+        def _decode(z):
+            return _fdec.decode(z.unsqueeze(0), vae.scale).float().clamp_(-1, 1).squeeze(0)
+        logging.info(f"Width-sharded FUSED decoder across {world_size} ranks.")
+    else:
+        if world_size > 1:
+            shard_vae_decoder_width(vae.model.decoder)
+            logging.info(f"Width-sharded decoder across {world_size} ranks.")
+
+        def _decode(z):
+            return vae.decode([z])[0]
+
+    def _device_sync():
+        # Launches are asynchronous; time the device work, not the host issue.
+        if device.type == "neuron":
+            torch.neuron.synchronize()
 
     latent = torch.load(args.latents_path, map_location="cpu").to(device)
 
@@ -144,7 +163,7 @@ def main():
 
     if args.profile:
         def _decode_once():
-            return vae.decode([latent_local])[0]
+            return _decode(latent_local)
 
         # Every rank runs the same call sequence, so the width-sharded
         # collective ops (halo exchange / all-gather) stay in lockstep.
@@ -160,7 +179,8 @@ def main():
             if dist.is_initialized():
                 dist.barrier()
             t0 = time.perf_counter()
-            vae.decode([latent_local])
+            _decode(latent_local)
+            _device_sync()
             if dist.is_initialized():
                 dist.barrier()
             dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -169,14 +189,15 @@ def main():
         if dist.is_initialized():
             dist.barrier()
         t0 = time.perf_counter()
-        video_local = vae.decode([latent_local])[0]
+        video_local = _decode(latent_local)
+        _device_sync()
         if dist.is_initialized():
             dist.barrier()
         dt_ms = (time.perf_counter() - t0) * 1000.0
         label = "steady-state" if args.warmup else "single-call"
         logging.info(f"[TIMING] vae.decode {label} (width={world_size}): {dt_ms:.0f} ms")
     else:
-        video_local = vae.decode([latent_local])[0]
+        video_local = _decode(latent_local)
 
     video_full = gather_video_width(video_local)
 

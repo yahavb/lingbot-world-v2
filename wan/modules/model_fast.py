@@ -25,6 +25,9 @@ from wan.modules.attention import attention, flash_attention
 from wan.modules.attention import (
     const_max_ag_attention,
     const_max_ag_available,
+    cte_merge,
+    cte_partial,
+    cte_prep_q,
     exact_attention,
     exact_attention_chunks,
     fa2_ag_attention,
@@ -107,6 +110,39 @@ def film_full_width(scale_local, shift_local):
     """Column-parallel FiLM params -> full feature width (rank order = feature order)."""
     return (tp.all_gather_last_dim(scale_local.contiguous(), _TP_GROUP),
             tp.all_gather_last_dim(shift_local.contiguous(), _TP_GROUP))
+# LINGBOT_KV_WRITE_LATE=1 (with LINGBOT_CTE_MERGE): see the chunked-cache branch of
+# CausalWanSelfAttention.forward.
+_KV_WRITE_LATE = os.environ.get("LINGBOT_KV_WRITE_LATE", "0") == "1"
+# LINGBOT_ATTN_EARLY=1 (with LINGBOT_CTE_MERGE, CP over a DeviceMesh): in the chunked-cache branch,
+# run the attention calls on the LEADING (cached) chunks first -- they need only Q -- then build the
+# new chunk's cache entry from the local shard: transpose the 270-token shard into the cache layout
+# and all-gather that, so the gathered chunk needs only large contiguous copies instead of an
+# element-wise L<->d transpose of the whole 4320-token chunk. Data movement only and the same merge
+# order, but the compiled graph fuses differently and the result is NOT bit-exact: block output rel
+# RMS 1.6e-4 vs the default path (kiro/block_bench.py, seeded cache).
+# =2 issues the new chunk's all-gathers BEFORE the leading calls (so the collectives can run under
+# them), =1 after them.
+_ATTN_EARLY = int(os.environ.get("LINGBOT_ATTN_EARLY", "0"))
+# LINGBOT_ATTN_PAIR=1 (with LINGBOT_ATTN_EARLY): two KV chunks per attention_cte call, the first as
+# the kernel's prefix-caching prior -- 2 calls per block at steady state instead of 4. Exact
+# attention either way (no approximation), but the kernel rounds the probabilities to bf16 against
+# a different running max: block output rel RMS 1.3e-3 vs the per-chunk path.
+_ATTN_PAIR = os.environ.get("LINGBOT_ATTN_PAIR", "0") == "1"
+# LINGBOT_FILM_BATCH=1 (with LINGBOT_FILM_A2A): all 40 blocks' camera FiLM params in ONE compiled
+# graph per chunk instead of 40 (22 ms per chunk measured, mostly per-graph launch cost).
+_FILM_BATCH = os.environ.get("LINGBOT_FILM_BATCH", "0") == "1"
+
+# LINGBOT_FWD_PHASES=1: DIAGNOSTIC. Sync the device at phase boundaries of WanModelFast.forward and
+# record per-phase wall time in model._fwd_phase_log (image2video logs it). The syncs serialise
+# host and device, so per-forward totals under this flag are not the production numbers.
+_FWD_PHASES = os.environ.get("LINGBOT_FWD_PHASES", "0") == "1"
+
+
+def _phase_mark(model, name):
+    if _FWD_PHASES:
+        import time as _time
+        torch.neuron.synchronize()
+        model._ph_cur.append((name, _time.perf_counter()))
 # LINGBOT_FILM_A2A=1 (with LINGBOT_SP): build the per-chunk FiLM token shards with an all-to-all
 # inside each block's compiled cam_film graph (cam_film_sp) instead of an eager all-gather + slice.
 _FILM_A2A = os.environ.get("LINGBOT_FILM_A2A", "0") == "1"
@@ -680,7 +716,9 @@ class CausalWanSelfAttention(nn.Module):
             # PER-LAYER, not global: a hot layer takes the exact-attention path and so
             # still needs the CP gather done here, even though const_max_ag is loaded and
             # the other 36 layers skip it.
-            if not self._const_max_here() and not self._fa2_here():
+            _early = (_ATTN_EARLY and kv_chunks is not None and kv_chunks[0][-1].dim() == 3
+                      and _CP_FLAT_SEQ and tp.has_mesh())
+            if not self._const_max_here() and not self._fa2_here() and not _early:
                 roped_key = _gather_w(roped_key, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
                 v = _gather_w(v, _g[0], _g[1], _g[2] // _cp, sp_group, _cp)
 
@@ -721,9 +759,69 @@ class CausalWanSelfAttention(nn.Module):
                 if return_cache and not getattr(self, 'tp_enabled', False):
                     return out, _ka, _va
                 return out
+            if (cp_enabled and k_chunks[-1].dim() == 3 and _ATTN_EARLY and _CP_FLAT_SEQ
+                    and tp.has_mesh()):
+                # LINGBOT_ATTN_EARLY=1: leading chunks first (they need only Q), then the new
+                # chunk: local shard -> cache layout -> all-gather on a new leading axis -> one
+                # contiguous-run permute into the destination buffer.
+                q_c, lq = cte_prep_q(roped_query)
+                kd, vd = k_chunks[-1], v_chunks[-1]
+                _cp = cp_w_shard[0]
+                _l, _n, _d = (int(t) for t in roped_key.shape[1:])
+                _k_ndl = int(kd.shape[1]) == _d                 # K [n, d, L] (else [n, L, d])
+
+                def _gather_new():
+                    if _k_ndl:
+                        kg = tp.all_gather_fn(roped_key[0].permute(1, 2, 0).contiguous(), 0, "cp")
+                        kg = kg.view(_cp, _n, _d, _l).permute(1, 2, 0, 3)
+                    else:
+                        kg = tp.all_gather_fn(roped_key[0].permute(1, 0, 2).contiguous(), 0, "cp")
+                        kg = kg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
+                    vg = tp.all_gather_fn(v[0].permute(1, 0, 2).contiguous(), 0, "cp")
+                    return kg, vg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
+                if _ATTN_EARLY == 2:
+                    kg, vg = _gather_new()
+                lead = list(zip(k_chunks[:-1], v_chunks[:-1]))
+                last = lead.pop() if (_ATTN_PAIR and lead) else None
+                parts = []
+                while _ATTN_PAIR and len(lead) >= 2:
+                    (ka, va), (kb, vb) = lead.pop(0), lead.pop(0)
+                    parts.append(cte_partial(q_c, kb, vb, ka, va))
+                parts += [cte_partial(q_c, kc, vc) for kc, vc in lead]
+                if _ATTN_EARLY != 2:
+                    kg, vg = _gather_new()
+                kd.copy_(kg.reshape(kd.shape))
+                vd.copy_(vg.reshape(vd.shape))
+                parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ())))
+                x = cte_merge(parts, lq)
+                out = self._out_proj(x, _async_out, scatter=_sp_scatter)
+                if return_cache and not getattr(self, 'tp_enabled', False):
+                    return out, kd, vd
+                return out
             # Destination is LAST in the ordering. A whole-tensor copy_ into a base
             # tensor is what "direct must-alias output binding" needs (kv_cache.py:100);
             # writing a slice of a larger parent is the case that comment rules out.
+            if k_chunks[-1].dim() == 3 and _KV_WRITE_LATE:
+                # LINGBOT_KV_WRITE_LATE=1 (merged path): attend the new chunk from this
+                # forward's own K/V ([n, L, d], tp_k=True) and write the cache AFTER the
+                # attention. Before, the K transpose into the cache and the V permute sat on the
+                # critical path in front of the first attention call (0.35-0.63 ms of a 3.15 ms
+                # block at TP4 x CP16), although only the last chunk's call needs them.
+                v_new = v[0].permute(1, 0, 2).contiguous()
+                x = exact_attention_chunks(
+                    roped_query, list(k_chunks[:-1]) + [roped_key[0].permute(1, 0, 2).contiguous()],
+                    list(v_chunks[:-1]) + [v_new])
+                if int(k_chunks[-1].shape[1]) == int(roped_key.shape[-1]):
+                    k_chunks[-1].copy_(roped_key[0].permute(1, 2, 0))
+                else:
+                    k_chunks[-1].copy_(roped_key[0].permute(1, 0, 2))
+                v_chunks[-1].copy_(v_new)
+                if sp_enabled and not cp_enabled:
+                    x = dt_util.all_to_all(x, 1, 2, group=sp_group)
+                out = self._out_proj(x, _async_out, scatter=_sp_scatter)
+                if return_cache and not getattr(self, 'tp_enabled', False):
+                    return out, k_chunks[-1], v_chunks[-1]
+                return out
             if k_chunks[-1].dim() == 3:
                 # N-major chunks (LINGBOT_CTE_MERGE=1, the const-max cache layout: K [n, d, L],
                 # V [n, L, d]). The merged cte path reads them in place, so the layout change
@@ -1471,6 +1569,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         if self.model_type == 'i2v':
             assert y is not None
+        if _FWD_PHASES:
+            self._ph_cur = []
+            _phase_mark(self, "start")
 
         _ROWMAX_ON[0] = getattr(self, "_t_host_key", None) is not None
         # Flag bf16 RoPE temporaries when the chunk is large (960x1664),
@@ -1571,6 +1672,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 self._ctx_emb_cache = (_ckey, _ctx_in, context)
         context_lens = None
 
+        _phase_mark(self, "embed")
         # cam: the condition is per CHUNK (same tuple object for its 5 forwards), so the
         # embedded + sharded result is reused within the chunk.
         _cam_in = None
@@ -1640,6 +1742,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
             dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb
             self._cam_emb_cache = (_cam_in, c2ws_plucker_emb)
 
+        _phase_mark(self, "cam")
         # seq_lens_int for signature parity with the legacy sequence_parallel
         # module; not consumed by the in-model SP path below.
         seq_lens_int = int(seq_lens.max().item())
@@ -1833,6 +1936,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # blocks, and each block's first op is self.norm1(x).float() regardless.
         # LINGBOT_RESIDUAL_BF16=1 keeps the residual stream in bf16 between blocks (norm and
         # modulation math still run in fp32 inside each block). Default fp32.
+        _phase_mark(self, "plan")
         x = x.to(torch.bfloat16) if _RESIDUAL_BF16 else x.float()
         _REAL_TOKENS[0] = None
         _head_done = False
@@ -1859,6 +1963,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                                    self._stack_tokens[_dest], kwargs)
             else:
                 _films = self._cam_films(kwargs.get("dit_cond_dict"))
+                _phase_mark(self, "films")
                 _tpd = tp.tp_degree(_TP_GROUP)
                 _sp = _SP_ON and _tpd > 1
                 if _sp:
@@ -1873,6 +1978,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                               kv_chunks=(list(_ks[block_index]), list(_vs[block_index])),
                               crossattn_cache=crossattn_cache[block_index],
                               current_start=0, **_kw)
+                _phase_mark(self, "blocks")
                 if _sp:
                     # Head on the token shard, then gather the small projected tokens (64 wide).
                     x = tp.all_gather_tokens(self.head(x, e), "tp")
@@ -1919,6 +2025,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
 
+        if _FWD_PHASES:
+            _phase_mark(self, "head")
+            _p = self._ph_cur
+            if not hasattr(self, "_fwd_phase_log"):
+                self._fwd_phase_log = []
+            self._fwd_phase_log.append(
+                [(n, (t - _p[i][1]) * 1000.0) for i, (n, t) in enumerate(_p[1:])])
         return [u.float() for u in x]
 
 
@@ -1941,6 +2054,18 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # SP + LINGBOT_FILM_A2A: each block's FiLM params come out of ONE compiled graph already
         # token-sharded (cam_film_sp), so the eager gather/slice/clone below is skipped.
         _a2a = _SP_ON and _FILM_A2A and _tpd > 1 and tp.has_mesh()
+        if _a2a and _FILM_BATCH and os.environ.get("LINGBOT_COMPILE_DIT", "0") == "1":
+            bfn = getattr(self, "_cam_film_batch_fn", None)
+            if bfn is None:
+                raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+
+                def _all_films(c):
+                    return tuple(b.cam_film_sp(c) for b in raw)
+                bfn = torch.compile(_all_films, backend="neuron", fullgraph=True, dynamic=False)
+                self._cam_film_batch_fn = bfn
+            films = list(bfn(c2ws))
+            self._cam_film_cache = (key, films, src[1] if src is not None else c2ws)
+            return films
         fns = getattr(self, "_cam_film_fns", None)
         if fns is None:
             raw = [getattr(b, "_orig_mod", b) for b in self.blocks]

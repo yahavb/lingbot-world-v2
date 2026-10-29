@@ -1,5 +1,6 @@
 import gc
 import hashlib
+import zlib
 import json
 import logging
 import math
@@ -94,9 +95,62 @@ def condition_geometry(img_hw, action_path, frame_num, chunk_size, max_area, tar
 
 
 def encode_key(img, F, h, w):
-    """Cache key of a conditioning encode; `img` is the normalized [3, H, W] image tensor."""
-    return (int(img.shape[1]), int(img.shape[2]), int(F), int(h), int(w),
-            hash(img.detach().cpu().numpy().tobytes()))
+    """Cache key of a conditioning encode: (image size, F, h, w, checksums of the image bytes).
+
+    `img` is the PIL image (or an already-normalized [3, H, W] tensor). Hashing the PIL bytes
+    (uint8, 42 MB for the 5145 x 2894 example) replaced hash(tensor.tobytes()) of the fp32
+    tensor (178 MB) after a device-to-host copy of it: ~330 ms per generation down to ~40 ms.
+    """
+    if isinstance(img, torch.Tensor):
+        a = img.detach()
+        a = a.cpu() if a.device.type != "cpu" else a
+        buf = memoryview(np.ascontiguousarray(a.numpy())).cast("B")
+        size = (int(img.shape[1]), int(img.shape[2]))
+    else:
+        buf = img.tobytes()
+        size = (int(img.size[1]), int(img.size[0]))
+        buf = memoryview(buf)
+    return size + (int(F), int(h), int(w), zlib.crc32(buf), zlib.adler32(buf), buf.nbytes)
+
+
+def _plucker_cond_math(c2ws, Ks, h, w, lat_f, lat_h, lat_w, dtype):
+    """get_plucker_embeddings + both rearranges of _generate_causal_fast, as one function.
+    'f (h c1) (w c2) c -> (f h w) (c c1 c2)' then 'b (f h w) c -> b c f h w' is the single
+    view/permute below (pure data movement, so it matches the einops form exactly)."""
+    e = get_plucker_embeddings(c2ws, Ks, h, w)                       # [f, h, w, 6]
+    c1, c2 = h // lat_h, w // lat_w
+    e = e.view(lat_f, lat_h, c1, lat_w, c2, 6).permute(5, 2, 4, 0, 1, 3)
+    return e.reshape(1, 6 * c1 * c2, lat_f, lat_h, lat_w).to(dtype)
+
+
+_PLUCKER_FN = None
+
+
+def plucker_cond(c2ws, Ks, h, w, lat_f, lat_h, lat_w, dtype):
+    """The camera condition [1, 6*c1*c2, lat_f, lat_h, lat_w]. LINGBOT_PLUCKER_COMPILE=1 runs it as
+    ONE compiled graph on the device instead of ~25 eager ops (measured 143 ms per generation);
+    LINGBOT_PLUCKER_CHECK=1 also runs the eager form and logs the difference."""
+    global _PLUCKER_FN
+    if c2ws.device.type != "neuron" or os.environ.get("LINGBOT_PLUCKER_COMPILE", "0") != "1":
+        return _plucker_cond_math(c2ws, Ks, h, w, lat_f, lat_h, lat_w, dtype)
+    if _PLUCKER_FN is None:
+        _PLUCKER_FN = torch.compile(_plucker_cond_math, backend="neuron", dynamic=False,
+                                    fullgraph=True)
+    out = _PLUCKER_FN(c2ws, Ks, h, w, lat_f, lat_h, lat_w, dtype)
+    if os.environ.get("LINGBOT_PLUCKER_CHECK", "0") == "1":
+        ref = _plucker_cond_math(c2ws, Ks, h, w, lat_f, lat_h, lat_w, torch.float32)
+        got = _PLUCKER_FN(c2ws, Ks, h, w, lat_f, lat_h, lat_w, torch.float32)
+        refd = ref.to(dtype)
+        logging.info(f"[plucker check] fp32 max|d|={(ref - got).abs().max().item():.3e} "
+                     f"{dtype} differing={(refd != out).sum().item()}/{out.numel()}")
+    return out
+
+
+def image_to_tensor(img):
+    """[3, H, W] in [-1, 1] on the host, from a PIL image (tensors pass through)."""
+    if isinstance(img, torch.Tensor):
+        return img
+    return TF.to_tensor(img).sub_(0.5).div_(0.5)
 
 
 def vae_encode_condition(vae, img, F, h, w, device):
@@ -114,12 +168,13 @@ def pre_encode_condition(vae_pth, device, img_pil, action_path, frame_num, chunk
     """Encode the conditioning image on `device` with a throwaway VAE, before the DiT is loaded, and
     park the latent on the host for _generate_causal_fast. Same ops and inputs as the in-loop
     encode, so the latent is identical."""
-    img = TF.to_tensor(img_pil).sub_(0.5).div_(0.5)
-    F, h, w, _, _, _ = condition_geometry(tuple(img.shape[1:]), action_path, frame_num, chunk_size,
-                                          max_area, target_hw, vae_stride, patch_size)
-    key = encode_key(img, F, h, w)
+    F, h, w, _, _, _ = condition_geometry((img_pil.size[1], img_pil.size[0]), action_path,
+                                          frame_num, chunk_size, max_area, target_hw,
+                                          vae_stride, patch_size)
+    key = encode_key(img_pil, F, h, w)
     if key in _PRE_ENCODED:
         return key
+    img = image_to_tensor(img_pil)
     vae = Wan2_1_VAE(vae_pth=vae_pth, device=device)
     with torch.no_grad():
         _PRE_ENCODED[key] = vae_encode_condition(vae, img, F, h, w, device).cpu()
@@ -869,10 +924,14 @@ class WanI2VCausal:
         c2ws = c2ws[:frame_num]
 
         # preprocess
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-
+        # The image stays a PIL image on the HOST. Nothing on the device reads it: it supplies
+        # the frame size, the encode-cache key, and, on a cache miss, the bicubic resize that
+        # vae_encode_condition does on the CPU anyway. Converting the full-resolution photo to
+        # fp32 (90 ms), moving it to the device (178 MB) and back for the key cost ~0.4 s per
+        # generation; the tensor is now built only on a cache miss.
         F = frame_num
-        h, w = img.shape[1:]
+        h, w = ((int(img.shape[1]), int(img.shape[2])) if isinstance(img, torch.Tensor)
+                else (int(img.size[1]), int(img.size[0])))
         aspect_ratio = h / w
         # An EXACT grid wins over the area fit. max_area cannot express a required
         # latent shape -- sqrt(area * aspect) follows the image -- and const-max AG
@@ -914,6 +973,17 @@ class WanI2VCausal:
                            "addnoise": 0.0, "ctx": 0.0, "encode": 0.0, "cat": 0.0,
                            "kvinit": 0.0}
         _g0 = time.perf_counter()
+        # LINGBOT_FWD_PHASES=1 (diagnostic): synced sub-phase times of the pre-loop setup.
+        _sub_on = os.environ.get("LINGBOT_FWD_PHASES", "0") == "1"
+        self._gen_sub = []
+        _sub_t = [_g0]
+
+        def _sub(name):
+            if _sub_on:
+                torch.neuron.synchronize()
+                _t = time.perf_counter()
+                self._gen_sub.append((name, (_t - _sub_t[0]) * 1000.0))
+                _sub_t[0] = _t
         noise = torch.randn(
             16,
             lat_f,
@@ -923,6 +993,7 @@ class WanI2VCausal:
             generator=seed_g,
             device='cpu').to(self.device)
 
+        _sub("noise")
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
@@ -932,6 +1003,7 @@ class WanI2VCausal:
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
+        _sub("msk")
         # 2. Prepare timesteps
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
         # DENOISE STEPS, the reference implementation's "biggest single lever" (the reference benchmark --steps: "Latency
@@ -987,6 +1059,7 @@ class WanI2VCausal:
                 f"T5 encode (device): {(time.perf_counter() - _t5_t0) * 1000:.0f} ms")
             self._t5_cache[cache_key] = context
 
+        _sub("sched_t5")
         Ks = torch.from_numpy(np.load(os.path.join(action_path, "intrinsics.npy"))).float()
 
         # The provided intrinsics are for original image size (480p). We need to transform them according to the new image size (h, w).
@@ -1011,18 +1084,13 @@ class WanI2VCausal:
         c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
         Ks = Ks.repeat(len(c2ws_infer), 1)
 
+        _sub("poses_host")
         c2ws_infer = c2ws_infer.to(self.device)
         Ks = Ks.to(self.device)
         wasd_action = None
-        c2ws_plucker_emb = get_plucker_embeddings(c2ws_infer, Ks, h, w)
-        c2ws_plucker_emb = rearrange(
-            c2ws_plucker_emb,
-            'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
-            c1=int(h // lat_h),
-            c2=int(w // lat_w),
-        )
-        c2ws_plucker_emb = c2ws_plucker_emb[None, ...] # [b, f*h*w, c]
-        c2ws_plucker_emb = rearrange(c2ws_plucker_emb, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
+        c2ws_plucker_emb = plucker_cond(c2ws_infer, Ks, int(h), int(w), int(lat_f), int(lat_h),
+                                        int(lat_w), self.param_dtype)
+        _sub("plucker")
         if wasd_action is not None:
             wasd_action_tensor = wasd_action[:, None, None, :].repeat(1, h, w, 1) # [f, h, w, 3]
             wasd_action_tensor = rearrange(
@@ -1035,6 +1103,7 @@ class WanI2VCausal:
             wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
             c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
 
+        _sub("plucker_rearrange")
         torch.neuron.synchronize()
         self._gen_phase["ctx"] += time.perf_counter() - _g0
         _e0 = time.perf_counter()
@@ -1058,11 +1127,14 @@ class WanI2VCausal:
             if _pre is not None:
                 y = _pre.to(self.device)
             else:
-                y = vae_encode_condition(self.vae, img, F, h, w, self.device)
+                y = vae_encode_condition(self.vae, image_to_tensor(img), F, h, w,
+                                         self.device)
             y = torch.concat([msk, y])
             self._encode_cache = (_ek, y.clone())
         torch.neuron.synchronize()
         self._gen_phase["encode"] += time.perf_counter() - _e0
+        _sub_t[0] = time.perf_counter() - (time.perf_counter() - _e0)
+        _sub("encode")
 
         @contextmanager
         def noop_no_sync():
@@ -1107,6 +1179,7 @@ class WanI2VCausal:
             # sample videos
             latent = noise
             self._dit_fwd_ms = []
+            self.model._fwd_phase_log = []
             # Optional single-forward profile (set by generate.py LINGBOT_PROFILE_FORWARD).
             _pf = getattr(self, "_profile_forward", None)
             self._profile_forward = None
@@ -1128,6 +1201,13 @@ class WanI2VCausal:
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
+            # LINGBOT_NO_SYNC=1: drop the per-phase timing syncs in the chunk loop. Each one
+            # drains the device queue, so the host issues the scheduler step, the noise copy
+            # and the next forward only after the device idles; without them that work queues
+            # behind the running forward. Per-forward and per-phase timings then measure host
+            # issue time, not device time; GEN (synced at the end) stays exact.
+            _sync = ((lambda: None) if os.environ.get("LINGBOT_NO_SYNC", "0") == "1"
+                     else torch.neuron.synchronize)
             n_chunks = num_inference_chunk if max_chunks is None else max_chunks
             for chunk_id in tqdm(range(n_chunks)):
                 if chunk_control is not None:
@@ -1137,7 +1217,7 @@ class WanI2VCausal:
                     if ctl is not None and ctl.get("context") is not None:
                         context = [t.to(self.device) for t in ctl["context"]]
                         self._cross_attn_initialized = False
-                torch.neuron.synchronize()
+                _sync()
                 _c0 = time.perf_counter()
                 k = min(chunk_id, num_inference_chunk - 1)
                 if chunk_id < num_inference_chunk:
@@ -1168,16 +1248,16 @@ class WanI2VCausal:
                 if offload_model:
                     torch.neuron.empty_cache()
 
-                torch.neuron.synchronize()
+                _sync()
                 self._gen_phase["setup"] += time.perf_counter() - _c0
                 for timestep_idx in range(len(timesteps)):
-                    torch.neuron.synchronize()
+                    _sync()
                     _p0 = time.perf_counter()
                     latent_model_input = [current_latent.to(self.device)]
                     current_timestep = [timesteps[timestep_idx]]
 
                     timestep = torch.stack(current_timestep).to(self.device)
-                    torch.neuron.synchronize()
+                    _sync()
                     self._gen_phase["prep"] += time.perf_counter() - _p0
 
                     # PER-FORWARD DiT TIME, MEASURED IN THE REAL LOOP.
@@ -1204,14 +1284,14 @@ class WanI2VCausal:
                     # the device sync that the next host-side read forces anyway, so it
                     # attributes queueing to the forward rather than hiding it.
                     self.model._t_host_key = float(current_timestep[0])
-                    torch.neuron.synchronize()
+                    _sync()
                     _f0 = time.perf_counter()
                     with _fwd_ctx():
                         noise_pred = self.model(
                             x=latent_model_input, t=timestep,
                             cross_attn_first_call=not self._cross_attn_initialized,
                             **kwargs)[0]
-                        torch.neuron.synchronize()
+                        _sync()
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                     self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}")
                     self._cross_attn_initialized = True
@@ -1219,7 +1299,7 @@ class WanI2VCausal:
                     if offload_model:
                         torch.neuron.empty_cache()
 
-                    torch.neuron.synchronize()
+                    _sync()
                     _s0 = time.perf_counter()
                     x0 = self._convert_flow_pred_to_x0(
                         flow_pred=noise_pred,
@@ -1227,7 +1307,7 @@ class WanI2VCausal:
                         timestep=current_timestep[0],
                         scheduler=self.scheduler,
                     )
-                    torch.neuron.synchronize()
+                    _sync()
                     self._gen_phase["sched"] += time.perf_counter() - _s0
 
                     if timestep_idx < len(timesteps) - 1:
@@ -1238,11 +1318,11 @@ class WanI2VCausal:
                         # cost that. Timing the draw and the scheduler step apart says
                         # which -- or neither, in which case the time is in the loop
                         # itself and both suspects are wrong.
-                        torch.neuron.synchronize()
+                        _sync()
                         _n0 = time.perf_counter()
                         _noise = torch.randn(x0.shape, generator=seed_g, device='cpu',
                                              dtype=x0.dtype).to(x0.device)
-                        torch.neuron.synchronize()
+                        _sync()
                         self._gen_phase["randn"] += time.perf_counter() - _n0
                         _a0 = time.perf_counter()
                         if os.environ.get("LINGBOT_HOST_SCHED", "1") == "1":
@@ -1259,7 +1339,7 @@ class WanI2VCausal:
                         else:
                             current_latent = self.scheduler.add_noise(
                                 x0, _noise, next_timestep)
-                        torch.neuron.synchronize()
+                        _sync()
                         self._gen_phase["addnoise"] += time.perf_counter() - _a0
                     else:
                         # note return x0
@@ -1270,6 +1350,13 @@ class WanI2VCausal:
                 if chunk_callback is not None:
                     chunk_callback(chunk_id, x0)
 
+                # LINGBOT_SKIP_LAST_COMMIT=1: the last chunk's cache commit fills KV that no
+                # later chunk reads (the cache is rebuilt per generate() call), so skip that
+                # forward. Only on the plain path: streaming (chunk_control) and max_chunks
+                # callers may continue from the cache.
+                if (chunk_id == n_chunks - 1 and chunk_control is None and max_chunks is None
+                        and os.environ.get("LINGBOT_SKIP_LAST_COMMIT", "0") == "1"):
+                    continue
                 # Update kv cache
                 context_timestep = [timesteps[-1] * 0.0]
                 timestep = torch.stack(context_timestep).to(self.device)
@@ -1277,13 +1364,13 @@ class WanI2VCausal:
                 # (timesteps_index=[0, 179, 358, 679]), so the denoise loop above is not
                 # the whole cost -- this cache-commit pass runs the full 40 blocks too.
                 self.model._t_host_key = float(context_timestep[0])
-                torch.neuron.synchronize()
+                _sync()
                 _f0 = time.perf_counter()
                 with _fwd_ctx():
                     self.model(x=[x0], t=timestep,
                                cross_attn_first_call=False,
                                **kwargs)
-                    torch.neuron.synchronize()
+                    _sync()
                 self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                 self._dit_fwd_tag.append(f"c{chunk_id}commit")
 
@@ -1303,6 +1390,15 @@ class WanI2VCausal:
                 # Every forward in call order, so window-filling vs full-window cost is visible.
                 logging.info("[BENCH] DiT all: " + " ".join(
                     f"{t}={ms:.0f}" for ms, t in zip(self._dit_fwd_ms, self._dit_fwd_tag)))
+                if getattr(self, "_gen_sub", None):
+                    logging.info("[BENCH] pre-loop sub-phases (ms): " + " ".join(
+                        f"{n}={ms:.1f}" for n, ms in self._gen_sub))
+                _pl = getattr(self.model, "_fwd_phase_log", None)
+                if _pl:
+                    # LINGBOT_FWD_PHASES=1 (diagnostic): synced per-phase ms of each forward.
+                    for _tag, _ph in zip(self._dit_fwd_tag, _pl):
+                        logging.info(f"[BENCH] phases {_tag}: " + " ".join(
+                            f"{n}={ms:.1f}" for n, ms in _ph))
                 _big = [ms for ms in self._dit_fwd_ms if ms > 10 * _m[len(_m) // 2]]
                 logging.info(
                     f"[BENCH] DiT stalls >10x median: {len(_big)} calls, "

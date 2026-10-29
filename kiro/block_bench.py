@@ -113,8 +113,12 @@ def main():
     if const_max_ag_available():
         from wan.modules.attention import init_const_max_ag
         init_const_max_ag(tp.replica_groups("cp"), L)
+    # From a seeded CPU generator, so two runs see the same cache and REF comparisons are valid
+    # (t.normal_() on the device draws from an unseeded device generator). The cache holds the
+    # GATHERED chunk, so every rank of a TP group sees the same values: seed by TP rank only.
+    gk = torch.Generator().manual_seed(4321 + tp_rank)
     for t in kv["k"] + kv["v"]:
-        t.normal_(0, 1.0)
+        t.copy_(torch.randn(t.shape, generator=gk).to(t.dtype))
     order = list(range(LEAD)) + [n_chunks - 1]
     ks, vs = [kv["k"][i] for i in order], [kv["v"][i] for i in order]
     cross = {"k": torch.zeros(1, 512, heads, d, dtype=torch.bfloat16, device=dev),
@@ -195,6 +199,19 @@ def main():
         torch.neuron.synchronize()
         out = run(False)
         torch.neuron.synchronize()
+        if int(os.environ.get("FIRST_REPS", "0")) > 0:
+            # The cross_attn_first_call variant (chunk 0, step 0 of every video).
+            fr = int(os.environ["FIRST_REPS"])
+            for _ in range(2):
+                run(True)
+            torch.neuron.synchronize()
+            dist.barrier()
+            t0 = time.perf_counter()
+            for _ in range(fr):
+                run(True)
+            torch.neuron.synchronize()
+            dist.barrier()
+            log(f"[block_bench] first-call variant: {(time.perf_counter() - t0) / fr * 1e3:.2f} ms/block")
         dist.barrier()
         t0 = time.perf_counter()
         for _ in range(REPS):

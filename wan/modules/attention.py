@@ -451,10 +451,81 @@ def _cte_attention_chunks(q, k_chunks, v_chunks, dtype=torch.bfloat16):
     return out.permute(1, 0, 2).unsqueeze(0)
 
 
+# LINGBOT_CROSS_XLA=1: cross-attention (queries x 512 context tokens) as plain matmul / softmax /
+# matmul in fp32 inside the block graph instead of one attention_cte call. At TP4 x CP16 a rank
+# has 270 queries and the cte call is 0.35 ms of a 3.15 ms block for ~0.5 GFLOP of work: the
+# kernel's fixed cost. Same math, full softmax, no padding; fp32 scores and probabilities.
+_CROSS_XLA = os.environ.get("LINGBOT_CROSS_XLA", "0") == "1"
+
+
+def _xla_cross_attention(q, k, v, dtype=torch.bfloat16):
+    """[1, Lq, n, d] x [1, Lk, n, d] -> [1, Lq, n, d]; heads as batch, fp32 throughout."""
+    d = q.shape[-1]
+    qh = q[0].permute(1, 0, 2).float() * (1.0 / math.sqrt(d))     # [n, Lq, d]
+    kh = k[0].permute(1, 2, 0).float()                             # [n, d, Lk]
+    vh = v[0].permute(1, 0, 2).float()                             # [n, Lk, d]
+    p = torch.softmax(torch.matmul(qh, kh), dim=-1)                # [n, Lq, Lk]
+    return torch.matmul(p, vh).permute(1, 0, 2).unsqueeze(0).to(dtype)
+
+
 def cte_merge_enabled():
     """LINGBOT_CTE_MERGE=1: N-major KV chunks + one attention_cte call per chunk, merged (see
     _cte_attention_chunks_merged). Read by the cache allocators and by the KV write."""
     return os.environ.get("LINGBOT_CTE_MERGE", "0") == "1"
+
+
+def cte_prep_q(q, dtype=torch.bfloat16):
+    """[1, Lq, n, d] -> (pre-scaled N-major q padded to 128 rows [n, Lq_p, d], Lq)."""
+    b, lq, n, d = q.shape
+    assert b == 1, "attention_cte path assumes batch_size=1 (heads occupy batch)"
+    q_c = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2).contiguous().to(dtype)
+    pad_q = (128 - lq % 128) % 128
+    if pad_q:
+        q_c = F.pad(q_c, (0, 0, 0, pad_q))
+    return q_c, lq
+
+
+def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None):
+    """Unnormalized attention (out, row max, row sum) of one KV chunk -- or of two, with the
+    second given as the kernel's prefix-caching prior (k_prior/v_prior, all of it used) -- for
+    cte_merge. Two chunks in one call is the same softmax over their union, computed by the
+    kernel's own online softmax instead of by cte_merge."""
+    d = int(q_c.shape[-1])
+    tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
+    kw = {}
+    if k_prior is not None:
+        lp = int(v_prior.shape[1])
+        kw = dict(k_prior=k_prior, v_prior=v_prior,
+                  prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
+    o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
+                                   tp_q=True, tp_k=tp_k, tp_out=False,
+                                   cache_softmax=True, skip_output_normalization=True, **kw)
+    return o, -neg_max.float(), s.float()
+
+
+def cte_merge(parts, lq, dtype=torch.bfloat16):
+    """Merge cte_partial results exactly as _cte_attention_chunks_merged does."""
+    outs = [p[0] for p in parts]
+    maxs = [p[1] for p in parts]
+    sums = [p[2] for p in parts]
+    n, lq_p = int(outs[0].shape[0]), int(outs[0].shape[1])
+    if len(outs) == 1:
+        lam = [1.0 / sums[0]]
+    else:
+        m_all = maxs[0]
+        for m in maxs[1:]:
+            m_all = torch.maximum(m_all, m)
+        w = [torch.exp(m - m_all) for m in maxs]
+        den = w[0] * sums[0]
+        for wc, sc in zip(w[1:], sums[1:]):
+            den = den + wc * sc
+        inv = 1.0 / den
+        lam = [wc * inv for wc in w]
+    lam = [l_.transpose(1, 2).reshape(n, lq_p, 1) for l_ in lam]
+    out = lam[0] * outs[0].float()
+    for l_, o in zip(lam[1:], outs[1:]):
+        out = out + l_ * o.float()
+    return out[:, :lq].permute(1, 0, 2).unsqueeze(0).to(dtype)
 
 
 def _cte_attention_chunks_merged(q, k_chunks, v_chunks, dtype=torch.bfloat16):
@@ -576,6 +647,8 @@ def attention(
     """
     # Try NKI kernels first (Neuron device)
     if q.device.type == "neuron":
+        if is_cross_attn and _CROSS_XLA:
+            return _xla_cross_attention(q, k, v, dtype=dtype)
         if _CTE_AVAILABLE:
             # One kernel for both self and cross attention. Cross-attention has
             # no cache window, so it passes no bounds.

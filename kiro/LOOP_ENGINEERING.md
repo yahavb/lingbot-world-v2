@@ -12,12 +12,70 @@ seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1`
 | Baseline with `const_max_ag` (estimate, not measured; see below) | upstream `main` | TP8 × CP8 | ~6.7 | 2.95 | ~9.7 | ~8.4 |
 | Layout change only | `loop_engineering`, flags off | TP4 × CP16 | 22.46 | 3.01 | 25.47 | 3.18 |
 | This branch, the job's layout | `loop_engineering`, flags on | TP8 × CP8 | 5.73 | 3.04 | 8.76 | 9.24 |
-| **This branch** | `loop_engineering`, flags on | TP4 × CP16 | **5.75** | 3.01 | **8.75** | **9.26** |
+| This branch, first push | `loop_engineering`, flags on | TP4 × CP16 | 5.75 | 3.01 | 8.75 | 9.26 |
+| **This branch, 4.8 s push** (`q6_pair`, below) | `loop_engineering`, flags on | TP4 × CP16 | **4.48** | **0.81** | **5.29** | **15.32** |
 
 **Measured: 1.36× end to end against `main` as it runs on this host (6.81 → 9.26 fps), 1.56× on
 GEN. Assumed: ~1.1× against `main` with its default `const_max_ag` kernel, which does not run
 here; this is the conservative estimate and the number to quote.** With our flags the two
 layouts give the same result (5.73 vs 5.75 s GEN), so on 16 devices the gain is the code.
+
+**Update, 4.8 s push: 5.29 s per video, 2.25× against `main` as measured (11.90 s) and 1.83×
+against the assumed `const_max_ag` baseline (9.68 s).** The target is 4.8 s (2.0× against the
+assumed baseline). Two of the steps are not bit-exact; see the next section.
+
+## Toward 4.8 s per video, measured step by step (16 devices)
+
+Each row is `kiro/run_job16.sh` on all 16 devices at TP4 × CP16 and adds to the row above (flags
+in the command below). Every video passes `tests/smoke_test_video.py`.
+
+| Run | Change | GEN (s) | VAE (s) | Total (s) | fps | Numerics |
+|---|---|---|---|---|---|---|
+| `ours16` | first push | 5.75 | 3.01 | 8.75 | 9.26 | |
+| `q1_cheap` | skip the last chunk's unused KV-commit forward; no per-phase timing syncs; token pad 32 | 5.68 | 3.02 | 8.70 | 9.31 | the pad changes the compiled shapes: latents rel. RMS 0.139 vs `ours16` |
+| `q2_vaefused` | VAE: whole decoder blocks compiled, width halos inside the graphs | 5.70 | 1.36 | 7.07 | 11.47 | video within 1.8e-5 of the per-conv decode |
+| `q3_vaebf16` | VAE: bf16 convolutions (fp32 norms, softmax, output conv), 4 latent frames per step | 5.68 | 0.80 | 6.48 | 12.51 | video PSNR 56.6 dB vs the fp32 decode (8-bit: 53.9 dB, max 23 levels) |
+| `q5_imgonly` | conditioning image stays on the host; encode-cache key from the image bytes | 4.88 | 0.81 | 5.69 | 14.25 | latents bit-identical to `q3` |
+| `q6_pair` | attention: cached chunks first, two KV chunks per `attention_cte` call | 4.48 | 0.81 | 5.29 | 15.32 | block output rel. RMS 1.3e-3; latents 0.078 vs `q5` |
+
+Latent differences grow with chunk index under any rounding change (`q6` vs `q5`: rel. RMS 0.000
+in chunk 0 to 0.162 in chunk 6), as they do between the TP8 × CP8 and TP4 × CP16 layouts running
+identical code (0.134); see Correctness.
+
+```bash
+bash /work/repo/kiro/run_job16.sh /work/repo q6_pair TP=4 CP=16 \
+  ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1 \
+  NEURON_LAUNCH_BLOCKING=0 LINGBOT_LOAD_CONCURRENCY=16 LINGBOT_SKIP_LAST_COMMIT=1 LINGBOT_NO_SYNC=1 \
+  LINGBOT_TOKEN_PAD=32 LINGBOT_VAE_FUSED=1 LINGBOT_VAE_BF16=1 LINGBOT_VAE_T=4 \
+  LINGBOT_ATTN_EARLY=2 LINGBOT_ATTN_PAIR=1
+```
+
+Where the time went at `q3`, from synced phase timers (`LINGBOT_FWD_PHASES=1`) and block profiles:
+
+- GEN: 34 DiT forwards, 4.18 s in the 40 blocks; the head 5.5 ms per forward (0.19 s); the
+  per-chunk camera FiLM 22 ms (0.15 s); the camera Plücker condition 0.14 s; the encode-cache key
+  0.33 s (a device round trip of the full-resolution photo, fixed in `q5`).
+- One steady-state block (TP4 × CP16, `kiro/block_bench.py` + profile): 3.2 ms, with the Tensor
+  engine busy 0.5 ms. The four attention calls take 1.1–1.4 ms and the cores idle ~0.6 ms waiting
+  for the CP all-gathers of K and V. Pairing the KV chunks takes the block from 3.28 to 2.88 ms.
+- VAE: 0.81 s of device time (35 ms of host issue).
+
+Measured and not adopted:
+
+- `LINGBOT_PLUCKER_COMPILE=1`: −0.14 s GEN (`q4_img`), but 106 of 46.4 M bf16 values move by one
+  ulp, so the latents diverge like any rounding change. Available, not in `q6`.
+- A compiled head (head + gathers + unpatchify in one graph): neuronx-cc fails on its CP
+  all-gather (`NCC_IBIR158`, access pattern out of bounds); removed. `LINGBOT_FILM_BATCH=1` ran in
+  the same failed job and is untested on its own.
+- `LINGBOT_CROSS_XLA=1`, `LINGBOT_KV_WRITE_LATE=1`: block time 3.43–3.45 ms vs 3.43 ms.
+- A 12-device DiT + 4-device VAE split: the runtime builds collectives only for 1, 2, 4, 8, 16 or
+  a multiple of 32 logical cores, so the 48-rank DiT fails at init.
+- `LINGBOT_VAE_HALO=pairs`: 2-rank groups on one device fail collective setup. `hier` is
+  bit-identical and took the per-conv decode from 2.95 to 2.75 s; the fused decoder supersedes it.
+- `LINGBOT_VAE_T`: 1 / 4 / 10 / 20 frames per step = 1.35 / 1.19 / 1.21 / 1.93 s (fp32), so the
+  number of graph launches does not limit the VAE.
+
+Every experiment, including the refuted ones, is in `kiro/perf_ledger.jsonl`.
 
 **The `const_max_ag` estimate.** `main` defaults to `ATTENTION_BACKEND=const_max_ag`, a fused
 CP all-gather + attention kernel that subtracts an assumed row max (15.0) instead of computing
@@ -151,6 +209,18 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_PRE_ENCODE` (default 1) | VAE-encode the conditioning image before the DiT loads |
 | `LINGBOT_LOAD_CONCURRENCY=N` | N ranks load the DiT weights per turn (default 1); needs ~10–13 GB host RAM per loading rank |
 | `LINGBOT_DUMP_LATENTS=<path>`, `LINGBOT_MEMLOG=1` | diagnostics |
+| `LINGBOT_SKIP_LAST_COMMIT=1` | skip the last chunk's KV-commit forward (nothing reads it) |
+| `LINGBOT_NO_SYNC=1` | drop the per-phase timing syncs in the chunk loop (per-forward times become host issue times) |
+| `LINGBOT_TOKEN_PAD=N` | pad each rank's tokens to a multiple of N (32 at CP16: 270 → 288 instead of 384) |
+| `LINGBOT_VAE_FUSED=1` | decode with `wan/modules/vae2_1_fused.py`: compiled decoder blocks, halos in the graphs |
+| `LINGBOT_VAE_BF16=1`, `LINGBOT_VAE_T=k` | fused decoder: bf16 convolutions; k latent frames per step after the first |
+| `LINGBOT_VAE_HALO=hier` | per-conv decoder: hierarchical halo exchange (bit-identical) |
+| `LINGBOT_ATTN_EARLY=1/2` | merged `cte` under CP: cached chunks first; the new chunk gathered in cache layout (2: gathers issued first) |
+| `LINGBOT_ATTN_PAIR=1` | with `LINGBOT_ATTN_EARLY`: two KV chunks per kernel call, the first as the kernel's prefix-cache prior |
+| `LINGBOT_PLUCKER_COMPILE=1` | camera Plücker condition as one compiled graph (`LINGBOT_PLUCKER_CHECK=1` logs the difference) |
+| `LINGBOT_FILM_BATCH=1` | all 40 blocks' FiLM params in one compiled graph per chunk (untested on its own) |
+| `LINGBOT_CROSS_XLA=1`, `LINGBOT_KV_WRITE_LATE=1` | A/B only, no gain |
+| `LINGBOT_FWD_PHASES=1` | diagnostic: synced per-phase timings of every forward and of the pre-loop setup |
 
 ## Scripts (`kiro/`)
 
@@ -167,6 +237,9 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `attn_merge_test.py` | exactness and speed of the attention paths vs fp32 |
 | `prof_block.py` | per-op timeline of one block execution from a neuron-explorer profile |
 | `cmp_latents.py`, `frames_cmp.py` | latent and frame comparisons |
+| `run_vae.sh`, `vae_bench.py`, `vae_cmp.py` | VAE decode bench (any decoder mode, optional profile); slice-by-slice output comparison |
+| `prof_crit.py` | per-core op timeline and idle gaps of one execution from a neuron-explorer profile |
+| `perf_ledger.jsonl` | every experiment of the 4.8 s push, refuted ones included |
 
 Reproduce the 16-device table (`/work/repo_upstream` = upstream `main`, `/work/repo` = this branch):
 

@@ -78,6 +78,48 @@ from .vae2_1 import AttentionBlock, CausalConv3d, ResidualBlock, Resample
 
 _VAE_GROUP = None
 
+# LINGBOT_VAE_HALO=hier: exchange width halos hierarchically instead of all-gathering every
+# rank's edges over the whole VAE group. At 64 ranks the decode issues 693 halo exchanges;
+# as world all-gathers they cost ~1.1 s of a ~2.95 s decode (measured by skipping them,
+# kiro/vae_bench.py VAE_DIAG=halo), while each rank needs only 2 of the 64 edges it gets.
+#   step 1: all-gather the edges over the ranks of one device (a TP4-shaped group), which
+#           gives every rank its neighbours on the same device and the device's two
+#           boundary edges;
+#   step 2: the first and the last rank of each device all-gather their device's boundary
+#           edges over one-rank-per-device groups (CP16-shaped, a ring over all 16 devices),
+#           which gives them the neighbouring devices' boundary edges.
+# Both group shapes are ones the DiT already uses here. 2-rank groups do not work: a group of
+# cores 1 and 2 of one device fails collective setup, as does a pair of unlinked devices.
+# Pure data movement, so the output is bit-identical. Needs the default core order (rank r on
+# device r // ranks_per_device) and the whole-world VAE group on 16 devices; anything else
+# keeps the all-gather.
+_HALO_MODE = os.environ.get("LINGBOT_VAE_HALO", "allgather")
+_HIER = None   # (ranks per device, this device's group, first-rank group, last-rank group)
+
+
+def _hier_active():
+    if _HALO_MODE != "hier" or _VAE_GROUP is not None or not dist.is_initialized():
+        return False
+    w = dist.get_world_size()
+    return w % 16 == 0 and w // 16 >= 2
+
+
+def _hier_groups():
+    """new_group is collective over the world: every rank builds every group, in order."""
+    global _HIER
+    if _HIER is None:
+        w, r = dist.get_world_size(), dist.get_rank()
+        per = w // 16
+        dev = None
+        for d in range(16):
+            g = dist.new_group(ranks=list(range(per * d, per * d + per)))
+            if r // per == d:
+                dev = g
+        first = dist.new_group(ranks=[per * d for d in range(16)])
+        last = dist.new_group(ranks=[per * d + per - 1 for d in range(16)])
+        _HIER = (per, dev, first, last)
+    return _HIER
+
 
 def _world():
     if not dist.is_initialized():
@@ -160,6 +202,31 @@ def _halo_exchange_w(x, radius):
 
     _t0 = time.perf_counter()
     edges_local = _extract_edges(x, radius)
+    if _hier_active():
+        per, dev_g, first_g, last_g = _hier_groups()
+        c, d = rank % per, rank // per          # core within the device, device
+        # Step 1: this device's slices' edges, [per, 2, ...] (index 0 = left, 1 = right edge).
+        dev_edges = torch.empty((per * edges_local.shape[0],) + edges_local.shape[1:],
+                                dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(dev_edges, edges_local, group=dev_g)
+        dev_edges = dev_edges.reshape((per,) + edges_local.shape)
+        halo_left = dev_edges[c - 1, 1] if c > 0 else None
+        halo_right = dev_edges[c + 1, 0] if c < per - 1 else None
+        if c == 0 or c == per - 1:
+            # Step 2: the device's boundary edges -- its first slice's left edge and its last
+            # slice's right edge -- from every device, [16, 2, ...].
+            bnd = torch.stack([dev_edges[0, 0], dev_edges[per - 1, 1]], dim=0).contiguous()
+            all_bnd = torch.empty((16 * bnd.shape[0],) + bnd.shape[1:],
+                                  dtype=x.dtype, device=x.device)
+            dist.all_gather_into_tensor(all_bnd, bnd, group=first_g if c == 0 else last_g)
+            all_bnd = all_bnd.reshape((16,) + bnd.shape)
+            if c == 0 and d > 0:
+                halo_left = all_bnd[d - 1, 1]       # previous device's right boundary
+            if c == per - 1 and d < 15:
+                halo_right = all_bnd[d + 1, 0]      # next device's left boundary
+        _COLL["halo"] += 1
+        _COLL["halo_s"] += time.perf_counter() - _t0
+        return halo_left, halo_right
     edges_all = torch.empty(
         (world * edges_local.shape[0],) + edges_local.shape[1:],
         dtype=x.dtype, device=x.device)
