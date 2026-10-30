@@ -35,6 +35,9 @@ if not os.path.exists(out_path):
     torch.set_num_threads(int(os.environ.get("THREADS", str(os.cpu_count()))))
     torch.set_grad_enabled(False)
     sys.path.insert(0, upstream)
+    # the upstream package is CUDA code: t5.py evaluates torch.cuda.current_device() as a default
+    # argument at import time. Nothing on the DiT path runs on CUDA; stub the query.
+    torch.cuda.current_device = lambda: 0
     import wan.modules.attention as A  # noqa: E402  (the upstream module)
     A.attention, A.flash_attention = f32_attention, f32_attention
     import wan.modules.model_fast as MF  # noqa: E402
@@ -65,7 +68,7 @@ if not os.path.exists(out_path):
                  "global_end_index": torch.tensor([0], dtype=torch.long),
                  "local_end_index": torch.tensor([0], dtype=torch.long)} for _ in model.blocks]
     cross_cache = [{"k": torch.zeros(1, model.text_len, n, d), "v": torch.zeros(1, model.text_len, n, d),
-                    "is_init": False} for _ in model.blocks]
+                    "is_init": torch.tensor([0], dtype=torch.long)} for _ in model.blocks]
     t0 = time.time()
     out = model(x=[x], t=t, context=[ctx], seq_len=seq_len, y=[y],
                 dit_cond_dict={"c2ws_plucker_emb": [c.float() for c in inp["cam"]]},

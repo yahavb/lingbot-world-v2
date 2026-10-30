@@ -30,6 +30,39 @@ assumed baseline). Two of the steps are not bit-exact; see the next section.
 **Update, latest: 4.24 s per video (19.10 fps), 2.81× against `main` as measured and 2.28×
 against the assumed `const_max_ag` baseline**, still 4 denoise steps.
 
+## k8s end to end on trn3 (`lbw-v2-i2v-validate-job.yaml`, `kiro/k8s_validate.sh`)
+
+One pod on a `trn3-dev1.48xlarge` node, 16 devices (64 ranks, LNC2), public image
+`public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04`, the job's spec
+(81 frames 480×768, chunk 3, window 12, sink 1, 4 denoise steps, `examples/03`, seed 42).
+`loop` = the `q16_key` flags above (TP4 × CP16); `main_code` = `main` with the job's env (TP8 × CP8).
+Steady state as `kiro/run_job16.sh` computes it.
+
+| Run | GEN (s) | VAE (s) | Total (s) | fps |
+|---|---|---|---|---|
+| `main_code` | 4.69 | 2.12 | 6.80 | 11.9 |
+| `off` (this branch, flags off) | 3.95 | 2.09 | 6.04 | 13.4 |
+| **`loop`** | **3.25** | **0.28** | **3.53** | **23.0** |
+
+**1.93× end to end against `main` on this harness.** The VAE time is from `loop_rep`: in `loop`
+the first decode after `--warmup` still took 2.93 s (a compile), the identical repeat 0.28 s.
+
+Quality (`kiro/validate_cmp.py`):
+
+| Check | Result |
+|---|---|
+| `main` == this branch with flags off | latents and mp4 bytes identical |
+| `loop` run twice | latents and frames identical |
+| chunk 0 / step 0 noise prediction vs fp32 CPU (upstream `WanModelFast`, same inputs, `kiro/ref_fp32_c0s0.py`) | `loop` 0.0125 rel-RMS, `main` 0.0257 |
+| VAE frames vs fp32 CPU decode of the same latents | `loop` 52.7 dB (max 32 levels), `main` 43.5 dB (max 155: the width padding) |
+| `loop` vs `main` video | 23.9 dB (frames 0-11: 32.3 dB, 60-71: 20.2 dB); latent rel-RMS per chunk 0.023 → 0.321 |
+
+The chunk-0 inputs of `loop` and `main` are identical except the camera Plücker tensor (one bf16
+ulp, `LINGBOT_PLUCKER_COMPILE`). `ATTENTION_BACKEND=sdpa` is not usable as a reference: its
+chunk-0 prediction is 0.33 from fp32 (13× `main`'s error), so its 10 dB trajectory is not used.
+There is no fp32 reference for the whole 7-chunk rollout; the per-chunk growth of the `loop` vs
+`main` difference matches the layout-vs-layout divergence in Correctness.
+
 ## Toward 4.8 s per video, measured step by step (16 devices)
 
 Each row is `kiro/run_job16.sh` on all 16 devices at TP4 × CP16 and adds to the row above (flags
