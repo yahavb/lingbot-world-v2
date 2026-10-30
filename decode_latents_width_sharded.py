@@ -111,9 +111,11 @@ def main():
     device = (torch.device(f"neuron:{local_rank}") if args.device == "neuron"
               else torch.device("cpu"))
 
+    # On CPU the decode is the fp32 reference (the autocast in Wan2_1_VAE is CUDA-only and the
+    # weights are fp32); the latent mean/std are kept in fp32 too.
     vae = Wan2_1_VAE(
         vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint),
-        device=device, dtype=torch.bfloat16)
+        device=device, dtype=torch.float32 if device.type == "cpu" else torch.bfloat16)
 
     # LINGBOT_VAE_FUSED=1: whole decoder blocks compiled with the width halos inside the graphs
     # (wan/modules/vae2_1_fused.py) instead of per-conv graphs and eager halo all-gathers.
@@ -142,6 +144,8 @@ def main():
             torch.neuron.synchronize()
 
     latent = torch.load(args.latents_path, map_location="cpu").to(device)
+    if device.type == "cpu":
+        latent = latent.float()
 
     # SAME width padding as the inline path in generate.py. This script sharded on
     # world_size directly, which asserts the moment lat_w does not divide it: at
@@ -219,6 +223,14 @@ def main():
     if rank == 0 and _pad_w != _lat_w:
 
         video_full = video_full[..., :_lat_w * cfg.vae_stride[2]].contiguous()
+
+    # LINGBOT_SAVE_FRAMES=<file.pt>: rank 0 also saves the raw frames as uint8 [F, H, W, 3]
+    # ((clamp(-1, 1) + 1) * 127.5, rounded) for bit-level and PSNR checks; the mp4 is lossy.
+    _frames_path = os.environ.get("LINGBOT_SAVE_FRAMES", "")
+    if rank == 0 and _frames_path:
+        fr = ((video_full.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+        torch.save(fr.permute(1, 2, 3, 0).contiguous().cpu(), _frames_path)
+        logging.info(f"Saved raw frames {tuple(fr.shape)} to {_frames_path}")
 
     if rank == 0:
         os.makedirs(os.path.dirname(args.save_file) or ".", exist_ok=True)

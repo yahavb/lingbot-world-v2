@@ -1313,9 +1313,27 @@ class WanI2VCausal:
             _dump_tags = set(filter(None, _dump_tags.split(",")))
 
             def _maybe_dump(tag, t_):
-                if _dump_dir and tag in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0):
+                # Written once per process (the first generation): with LINGBOT_BENCH_RUNS > 1
+                # the timed pass does no device-to-host copies.
+                if _dump_dir and tag in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0) \
+                        and not os.path.exists(os.path.join(_dump_dir, f"{tag}.pt")):
                     os.makedirs(_dump_dir, exist_ok=True)
                     torch.save(t_.detach().float().cpu(), os.path.join(_dump_dir, f"{tag}.pt"))
+
+            def _maybe_dump_inputs(x_, t_, kw_):
+                # c0s0 inputs for the fp32 CPU reference (kiro/ref_fp32_c0s0.py): chunk 0, step 0
+                # runs on zeroed KV caches, so these tensors and scalars define it completely.
+                p_ = os.path.join(_dump_dir, "c0s0_inputs.pt")
+                if _dump_dir and "c0s0" in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0) \
+                        and not os.path.exists(p_):
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    torch.save({"x": x_.detach().float().cpu(), "t": t_.detach().float().cpu(),
+                                "context": kw_["context"][0].detach().float().cpu(),
+                                "y": kw_["y"][0].detach().float().cpu(),
+                                "cam": [c.detach().float().cpu() for c in kw_["dit_cond_dict"]["c2ws_plucker_emb"]],
+                                "seq_len": kw_["seq_len"], "frame_seqlen": kw_["frame_seqlen"],
+                                "max_attention_size": kw_["max_attention_size"],
+                                "current_start": kw_["current_start"]}, p_)
             for chunk_id in tqdm(range(n_chunks)):
                 if chunk_control is not None:
                     ctl = chunk_control(chunk_id)
@@ -1421,6 +1439,8 @@ class WanI2VCausal:
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                     self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}{_ftag}")
                     _maybe_dump(f"c{chunk_id}s{timestep_idx}", noise_pred)
+                    if chunk_id == 0 and timestep_idx == 0:
+                        _maybe_dump_inputs(latent_model_input[0], timestep, kwargs)
                     self._cross_attn_initialized = True
 
                     if offload_model:
