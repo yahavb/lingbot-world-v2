@@ -9,7 +9,11 @@
 
 The chunks of one video must arrive in order, with first=1 on the first; the
 causal decode cache carries over between calls. Rank 0 serves HTTP from a
-background thread; every rank decodes its width shard on its main thread.
+background thread; every rank decodes its shard on its main thread.
+
+LINGBOT_VAE_FUSED=1 decodes with wan/modules/vae2_1_fused.py (compiled decoder blocks,
+halos inside the graphs; LINGBOT_VAE_2D=1 for height x width tiles), the decoder
+kiro/LOOP_ENGINEERING.md measured; otherwise the per-conv width-sharded decoder.
 """
 
 import argparse
@@ -84,6 +88,8 @@ def main():
     dev = torch.device(f"neuron:{local_rank}")
     torch.set_grad_enabled(False)
     cfg = WAN_CONFIGS[args.task]
+    if world > 1 and os.environ.get("LINGBOT_VAE_FUSED", "0") == "1":
+        return serve_fused(args, cfg, dev, rank)
     vae, vae_world, pad_w = G._width_sharded_vae(args, cfg, dev, rank, world, args.lat_w)
 
     def decode(z, first):
@@ -102,6 +108,37 @@ def main():
         dist.barrier()
         return frames
 
+    serve_loop(decode, args, rank)
+
+
+def serve_fused(args, cfg, dev, rank):
+    from wan.modules.vae2_1 import Wan2_1_VAE
+    from wan.modules import vae2_1_fused as F
+    extra = F.apply_vae_cc_flags()
+    vae = Wan2_1_VAE(vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=dev,
+                     dtype=torch.bfloat16)
+    fdec = F.FusedWidthDecoder(vae.model)
+    two_d = F._TWO_D
+    if rank == 0:
+        logging.info(f"fused VAE decoder, {'2-D tiles' if two_d else 'width slices'}"
+                     + (f", compiler flags + {extra}" if extra else ""))
+
+    def decode(z, first):
+        """Decode one chunk on every rank; rank 0 returns base64 JPEG frames."""
+        assert z.shape[-1] == args.lat_w, f"latent width {z.shape[-1]}, server built for {args.lat_w}"
+        local = F.shard_latent_2d(z) if two_d else width_shard_latent(z, rank=rank, world=dist.get_world_size())
+        out = fdec.decode_chunk(local.to(dev).unsqueeze(0), vae.scale, first).float().clamp_(-1, 1).squeeze(0)
+        video = F.gather_video_2d(out) if two_d else gather_video_width(out)
+        frames = None
+        if rank == 0:
+            frames = [b64_jpeg(to_pil(video[:, t])) for t in range(video.shape[1])]
+        dist.barrier()
+        return frames
+
+    serve_loop(decode, args, rank)
+
+
+def serve_loop(decode, args, rank):
     z = torch.zeros(16, args.chunk_size, args.lat_h, args.lat_w)
     decode(z, True)
     decode(z, False)

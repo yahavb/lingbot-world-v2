@@ -1,0 +1,62 @@
+# Live, steerable front end (web_app.py + web/index.html) for lbw-v2-dit-t5. ClusterIP only:
+#   kubectl port-forward svc/lbw-v2-web 7860:7860   then open http://localhost:7860
+apiVersion: v1
+kind: Service
+metadata:
+  name: lbw-v2-web
+spec:
+  type: ClusterIP
+  selector:
+    app: lbw-v2-web
+  ports:
+    - port: 7860
+      targetPort: 7860
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lbw-v2-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lbw-v2-web
+  template:
+    metadata:
+      labels:
+        app: lbw-v2-web
+    spec:
+      containers:
+        - name: app
+          image: public.ecr.aws/docker/library/python:3.11-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /app
+              pip install -q --root-user-action=ignore --disable-pip-version-check fastapi uvicorn httpx
+              exec python -u /app/web_app.py
+          env:
+            - name: BRANCH
+              value: "live-controls"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: LBW_URL
+              value: "http://lbw-v2-dit-t5.default.svc.cluster.local:8000"
+          ports:
+            - containerPort: 7860
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7860
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi

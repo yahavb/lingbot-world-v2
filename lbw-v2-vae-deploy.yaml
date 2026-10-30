@@ -1,3 +1,5 @@
+# Streaming VAE decode server (vae_serve.py) for lbw-v2-dit-t5: 4 trn3 devices, 32 ranks, the
+# fused decoder on 4 x 8 height x width tiles (LINGBOT_VAE_FUSED / _2D), 3 latent frames per step.
 apiVersion: v1
 kind: Service
 metadata:
@@ -32,7 +34,7 @@ spec:
           resourceClaimTemplateName: l-lnc1
       containers:
         - name: inference
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
           command:
             - /bin/bash
             - "-c"
@@ -40,12 +42,13 @@ spec:
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
+              echo "commit: $(git log --oneline -1)"
               CKPT=/tmp/ckpt/lingbot-world-v2-14b-causal-fast
               export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               export HF_HOME=/tmp/hf-cache
 
-              pip install -q -r requirements_neuron.txt fastapi uvicorn
+              pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
               python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
               hf download robbyant/lingbot-world-v2-14b-causal-fast Wan2.1_VAE.pth --local-dir "$CKPT"
 
@@ -90,7 +93,7 @@ spec:
               mountPath: /logs
           env:
             - name: BRANCH
-              value: "main"
+              value: "live-controls"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
@@ -103,6 +106,20 @@ spec:
               value: "96"
             - name: CHUNK_SIZE
               value: "3"
+            - name: LINGBOT_VAE_FUSED
+              value: "1"
+            - name: LINGBOT_VAE_2D
+              value: "1"
+            - name: LINGBOT_VAE_BF16
+              value: "1"
+            - name: LINGBOT_VAE_CC_FLAGS
+              value: "-O1"
+            - name: LINGBOT_VAE_NORM
+              value: "mm"
+            - name: LINGBOT_VAE_T
+              value: "3"
+            - name: LINGBOT_VAE_PER_DEVICE
+              value: "4"
             - name: NEURON_CC_FLAGS
               value: "--internal-backend-options=--disable-cb-before-global-cc"
             - name: NKI_COMPILER_FRONTEND

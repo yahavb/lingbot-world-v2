@@ -443,3 +443,31 @@ class FusedWidthDecoder:
             i = j
         out = torch.cat(outs, 2)
         return out.transpose(-1, -2).contiguous() if _SWAP else out
+
+    @torch.no_grad()
+    def decode_chunk(self, z, scale, first):
+        """decode() split over consecutive latent chunks: the causal caches carry over between
+        calls, first=True on the first chunk. The chunks of one video decode to the same frames
+        as one decode() of the whole latent."""
+        if self.sel is None:
+            self.sel = _selectors(z.device)
+        zd = self.model.z_dim
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, zd, 1, 1, 1) + scale[0].view(1, zd, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+        x = self.model.conv2(z)
+        if _SWAP:
+            x = x.transpose(-1, -2).contiguous()
+        k = max(1, int(os.environ.get("LINGBOT_VAE_T", "1")))
+        outs, i, n = [], 0, x.shape[2]
+        if first:
+            out, self._caches = self._step(x[:, :, :1], None, first=True)
+            outs, i = [out], 1
+        while i < n:
+            j = min(n, i + k)
+            out, self._caches = self._step(x[:, :, i:j], self._caches, first=False)
+            outs.append(out)
+            i = j
+        out = torch.cat(outs, 2)
+        return out.transpose(-1, -2).contiguous() if _SWAP else out

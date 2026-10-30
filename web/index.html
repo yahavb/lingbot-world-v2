@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LingBot-World v2 live on AWS Trainium</title>
+<style>
+  :root { --bg: #111; --fg: #f5f5f5; --muted: #bbb; --accent: #ffb000; --btn: #2a2a2a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 18px/1.4 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.5rem; margin: 0 0 12px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  select, button, textarea { font: inherit; color: var(--fg); background: var(--btn);
+    border: 2px solid #555; border-radius: 8px; padding: 10px 16px; }
+  button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 4px solid var(--accent); }
+  button[aria-pressed="true"] { background: var(--accent); color: #000; border-color: var(--accent); }
+  button.primary { background: #0a6; border-color: #0a6; }
+  button.stop { background: #a22; border-color: #a22; }
+  #view { position: relative; width: 100%; aspect-ratio: 768 / 480; background: #000; border-radius: 8px; overflow: hidden; }
+  #frame { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #hud { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.65); padding: 6px 10px;
+    border-radius: 6px; font: 600 16px/1.3 ui-monospace, monospace; white-space: pre; }
+  .pad { display: grid; grid-template-columns: repeat(3, 96px); grid-template-rows: repeat(3, 72px); gap: 8px; }
+  .pad button { font-size: 1.1rem; padding: 4px; }
+  .side { display: grid; gap: 8px; }
+  #status { color: var(--muted); min-height: 1.5em; }
+  textarea { width: 100%; }
+  kbd { background: #333; border-radius: 4px; padding: 0 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>LingBot-World v2 live on AWS Trainium</h1>
+
+  <div class="row">
+    <label for="scene">Scene</label>
+    <select id="scene"></select>
+    <button id="start" class="primary">Start</button>
+    <button id="stopBtn" class="stop" disabled>Stop</button>
+  </div>
+
+  <div id="view" role="img" aria-label="Live generated video">
+    <img id="frame" alt="">
+    <div id="hud" aria-hidden="true"></div>
+  </div>
+
+  <p id="status" role="status" aria-live="polite">Pick a scene and press Start.</p>
+
+  <div class="row" role="group" aria-label="Camera controls">
+    <div class="pad">
+      <span></span><button data-action="forward">Forward</button><span></span>
+      <button data-action="left">Left</button><button data-action="stop">Hold</button><button data-action="right">Right</button>
+      <span></span><button data-action="back">Back</button><span></span>
+    </div>
+    <div class="side">
+      <button data-action="up">Up</button>
+      <button data-action="down">Down</button>
+      <button data-action="auto" aria-pressed="true">Scene path</button>
+    </div>
+  </div>
+  <p>Keys: <kbd>W</kbd>/<kbd>↑</kbd> forward, <kbd>S</kbd>/<kbd>↓</kbd> back, <kbd>A</kbd>/<kbd>←</kbd> left,
+    <kbd>D</kbd>/<kbd>→</kbd> right, <kbd>R</kbd> up, <kbd>F</kbd> down, <kbd>Space</kbd> hold, <kbd>P</kbd> scene path.</p>
+
+  <label for="prompt">Prompt (sent with Start; "Send prompt" switches it live)</label>
+  <textarea id="prompt" rows="4"></textarea>
+  <div class="row"><button id="sendPrompt">Send prompt</button></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), hud = $("hud"), img = $("frame");
+const KEYS = { w: "forward", arrowup: "forward", s: "back", arrowdown: "back", a: "left",
+  arrowleft: "left", d: "right", arrowright: "right", r: "up", f: "down", " ": "stop", p: "auto" };
+let scenes = [], abort = null, buffer = [], arrivals = [], shown = [], lastChunk = -1;
+let playing = false, nextAt = 0, playFps = 16, pressed = null, latencyMs = null, total = 0;
+
+function say(msg) { statusEl.textContent = msg; }
+
+async function loadScenes() {
+  scenes = await (await fetch("api/scenes")).json();
+  for (const s of scenes) $("scene").add(new Option(s.name, s.id));
+  pickScene();
+}
+function pickScene() {
+  const s = scenes.find((x) => x.id === $("scene").value);
+  $("prompt").value = s.prompt;
+  img.src = `api/scenes/${s.id}/image.jpg`;
+}
+
+function setPressed(action) {
+  for (const b of document.querySelectorAll("[data-action]"))
+    b.setAttribute("aria-pressed", String(b.dataset.action === action));
+}
+
+async function control(body) {
+  const r = await fetch("api/control", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body) });
+  return r.ok;
+}
+
+async function act(action) {
+  setPressed(action);
+  pressed = { action, t: performance.now(), after: lastChunk };
+  latencyMs = null;
+  if (abort) await control({ action });
+  say(action === "auto" ? "Following the scene path." : action === "stop" ? "Holding still." : `Moving ${action}.`);
+}
+
+function rate(list, windowMs) {
+  const now = performance.now();
+  while (list.length && now - list[0] > windowMs) list.shift();
+  return list.length > 1 ? (list.length - 1) * 1000 / (list[list.length - 1] - list[0]) : 0;
+}
+
+function tick(now) {
+  if (playing && buffer.length && now >= nextAt) {
+    const f = buffer.shift();
+    img.src = "data:image/jpeg;base64," + f.frame;
+    shown.push(now);
+    if (pressed && latencyMs === null && f.action === pressed.action && f.chunk > pressed.after)
+      latencyMs = now - pressed.t;
+    // Play at the generation rate; drift faster or slower to keep about two chunks buffered.
+    const gen = rate(arrivals, 6000);
+    if (gen > 0) playFps = gen;
+    const adj = buffer.length > 30 ? 1.15 : buffer.length < 8 ? 0.85 : 1;
+    nextAt = Math.max(nextAt + 1000 / (playFps * adj), now - 50);
+  }
+  if (playing && !buffer.length && abort === null) playing = false;
+  hud.textContent =
+    `generated ${rate(arrivals, 6000).toFixed(1)} fps   shown ${rate(shown, 3000).toFixed(1)} fps\n` +
+    `buffer ${buffer.length}   frames ${total}   chunk ${lastChunk}\n` +
+    `control latency ${latencyMs === null ? "-" : (latencyMs / 1000).toFixed(2) + " s"}`;
+  requestAnimationFrame(tick);
+}
+
+async function start() {
+  await stop();
+  const scene = $("scene").value, prompt = $("prompt").value;
+  buffer = []; arrivals = []; shown = []; lastChunk = -1; total = 0; playing = false; latencyMs = null;
+  const ctl = new AbortController();
+  abort = ctl;
+  $("start").disabled = true; $("stopBtn").disabled = false;
+  say("Starting. The first frames take a few seconds.");
+  try {
+    const r = await fetch("api/session", { method: "POST", signal: ctl.signal,
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene, prompt }) });
+    if (!r.ok) { say(`Could not start: ${(await r.json()).detail || r.status}`); return; }
+    const current = document.querySelector('[aria-pressed="true"]');
+    if (current && current.dataset.action !== "auto") control({ action: current.dataset.action });
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let text = "", first = true;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += dec.decode(value, { stream: true });
+      let i;
+      while ((i = text.indexOf("\n\n")) >= 0) {
+        const line = text.slice(0, i); text = text.slice(i + 2);
+        if (!line.startsWith("data: ")) continue;
+        const ev = JSON.parse(line.slice(6));
+        if (ev.frame) {
+          buffer.push(ev); arrivals.push(performance.now()); total++;
+          if (ev.chunk > lastChunk) lastChunk = ev.chunk;
+          if (first) { first = false; say("Streaming. Use the arrows or W A S D to steer."); }
+          if (!playing && buffer.length >= 12) { playing = true; nextAt = performance.now(); }
+        } else if (ev.error) say(`Error: ${ev.error}`);
+        else if (ev.superseded) say(`Stopped: ${ev.superseded}`);
+        else if (ev.done) say(`Session ended: ${ev.frames} frames in ${ev.seconds} s.`);
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") say(`Stream error: ${e.message}`);
+  } finally {
+    if (abort === ctl) { abort = null; playing = buffer.length > 0; }
+    $("start").disabled = false; $("stopBtn").disabled = true;
+  }
+}
+
+async function stop() {
+  if (!abort) return;
+  const a = abort; abort = null;
+  a.abort();
+  await fetch("api/stop", { method: "POST" }).catch(() => {});
+  say("Stopped.");
+}
+
+for (const b of document.querySelectorAll("[data-action]")) b.addEventListener("click", () => act(b.dataset.action));
+$("scene").addEventListener("change", pickScene);
+$("start").addEventListener("click", start);
+$("stopBtn").addEventListener("click", stop);
+$("sendPrompt").addEventListener("click", async () => {
+  if (!abort) { say("Start a session first."); return; }
+  say((await control({ prompt: $("prompt").value })) ? "Prompt sent; it applies from the next chunk." : "Prompt not sent.");
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || e.repeat) return;
+  const a = KEYS[e.key.toLowerCase()];
+  if (a) { e.preventDefault(); act(a); }
+});
+window.addEventListener("pagehide", () => navigator.sendBeacon && navigator.sendBeacon("api/stop"));
+loadScenes();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

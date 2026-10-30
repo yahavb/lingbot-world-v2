@@ -835,6 +835,19 @@ class WanI2VCausal:
         return x0_pred.to(original_dtype)
 
 
+    def _camera_chunk(self, c2ws, Ks, h, w, chunk_size, lat_h, lat_w):
+        """One chunk's camera condition [1, C, chunk_size, lat_h, lat_w] from framewise relative
+        poses c2ws [chunk_size, 4, 4], cached by pose values: interactive control sends the same
+        few motions over and over."""
+        cache = self.__dict__.setdefault("_camera_chunks", {})
+        key = (c2ws.float().numpy().tobytes(), int(h), int(w), int(lat_h), int(lat_w))
+        if key not in cache:
+            if len(cache) >= 64:
+                cache.clear()
+            cache[key] = plucker_cond(c2ws.float().to(self.device), Ks[:chunk_size], int(h), int(w),
+                                      int(chunk_size), int(lat_h), int(lat_w), self.param_dtype)
+        return cache[key]
+
     def generate(self,
                  input_prompt,
                  img,
@@ -885,8 +898,11 @@ class WanI2VCausal:
         chunk_control (*optional*): "causal_fast" only. Called on every rank as
             chunk_control(chunk_id) before each chunk. Return None to carry on,
             {"stop": True} to end, or {"context": prompt_embeds} to switch the
-            text conditioning from this chunk on. With chunk_control set, chunks
-            are not accumulated and generate() returns None.
+            text conditioning from this chunk on, and/or {"camera": c2ws} to
+            drive this chunk's camera with c2ws [chunk_size, 4, 4] -- framewise
+            relative poses, one per latent frame -- instead of the camera path.
+            With chunk_control set, chunks are not accumulated and generate()
+            returns None.
         max_chunks (*optional*): "causal_fast" only. Run this many chunks instead
             of the frame_num worth; chunks past the camera path repeat its last
             chunk's camera motion and image conditioning.
@@ -1335,6 +1351,7 @@ class WanI2VCausal:
                                 "max_attention_size": kw_["max_attention_size"],
                                 "current_start": kw_["current_start"]}, p_)
             for chunk_id in tqdm(range(n_chunks)):
+                cam_override = None
                 if chunk_control is not None:
                     ctl = chunk_control(chunk_id)
                     if ctl is not None and ctl.get("stop"):
@@ -1342,6 +1359,9 @@ class WanI2VCausal:
                     if ctl is not None and ctl.get("context") is not None:
                         context = [t.to(self.device) for t in ctl["context"]]
                         self._cross_attn_initialized = False
+                    if ctl is not None and ctl.get("camera") is not None:
+                        cam_override = self._camera_chunk(ctl["camera"], Ks, h, w, chunk_size,
+                                                          lat_h, lat_w)
                 _sync()
                 _c0 = time.perf_counter()
                 k = min(chunk_id, num_inference_chunk - 1)
@@ -1352,10 +1372,12 @@ class WanI2VCausal:
                         latents_chunk[-1].shape, generator=seed_g, device='cpu',
                         dtype=torch.float32).to(self.device)
                 current_condition = condition_chunk[k]
-                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[k]
+                current_c2ws_plucker_emb = (cam_override if cam_override is not None
+                                            else c2ws_plucker_emb_chunk[k])
 
                 dit_cond_dict = {
-                    "c2ws_plucker_emb": (_cam_tuples[chunk_id] if _cam_tuples is not None
+                    "c2ws_plucker_emb": (_cam_tuples[chunk_id]
+                                         if _cam_tuples is not None and cam_override is None
                                          else current_c2ws_plucker_emb.chunk(1, dim=0)),
                 }
 

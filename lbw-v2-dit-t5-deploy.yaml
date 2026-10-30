@@ -1,3 +1,7 @@
+# DiT + T5 streaming server (serve.py) on a whole trn3 node (16 devices, 64 ranks), with the
+# loop_engineering flags of kiro/LOOP_ENGINEERING.md (TP4 x CP16). Latent chunks go to
+# lbw-v2-vae (VAE_URL). The converted checkpoint and compiled NEFFs live on the node
+# (hostPath /opt/lingbot-world-v2), shared with lbw-v2-i2v-validate-job.yaml.
 apiVersion: v1
 kind: Service
 metadata:
@@ -32,7 +36,7 @@ spec:
           resourceClaimTemplateName: xxl-lnc2
       containers:
         - name: inference
-          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
           command:
             - /bin/bash
             - "-c"
@@ -40,20 +44,26 @@ spec:
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
-              CKPT=/tmp/ckpt/lingbot-world-v2-14b-causal-fast
-              export NEURON_COMPILE_CACHE_URL=/var/tmp/neuron-compile-cache
+              echo "commit: $(git log --oneline -1)"
+              NODE=/node-cache; mkdir -p "$NODE"
+              CKPT=$NODE/lingbot-world-v2-14b-causal-fast
+              export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               export NKI_ENABLE_TRACE_CACHE=1
               export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
               export HF_HOME=/tmp/hf-cache
 
-              pip install -q -r requirements_neuron.txt fastapi uvicorn
+              pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
               python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
 
-              hf download robbyant/lingbot-world-v2-14b-causal-fast --local-dir "$CKPT"
-              [ -f "$CKPT/transformers/config.json" ] || cp "$CKPT/config.json" "$CKPT/transformers/config.json"
-              python3 scripts/inference/convert_dit_to_pth.py --ckpt_dir "$CKPT"
-              rm -f "$CKPT"/transformers/*.safetensors
+              # checkpoint: download + convert once per node (flock; .complete marks a finished entry)
+              flock "$NODE/ckpt.lock" bash -c '
+                [ -f "$1/.complete" ] && { echo "ckpt: on node cache"; exit 0; }
+                hf download robbyant/lingbot-world-v2-14b-causal-fast --local-dir "$1"
+                [ -f "$1/transformers/config.json" ] || cp "$1/config.json" "$1/transformers/config.json"
+                python3 scripts/inference/convert_dit_to_pth.py --ckpt_dir "$1"
+                rm -f "$1"/transformers/*.safetensors
+                touch "$1/.complete"' _ "$CKPT"
 
               python3 scripts/analysis/qk_gamma_temperature.py --ckpt_dir "$CKPT" | tee /tmp/qk.txt
               export FLASH_ATTN_LAYERS=$(grep -oE "CANDIDATE HOT LAYERS \([0-9]+\): [0-9,]+" /tmp/qk.txt | sed -E "s/.*: //" || true)
@@ -97,13 +107,15 @@ spec:
               memory: 1900Gi
               ephemeral-storage: 600Gi
           volumeMounts:
+            - name: node-cache
+              mountPath: /node-cache
             - name: dshm
               mountPath: /dev/shm
             - name: logs
               mountPath: /logs
           env:
             - name: BRANCH
-              value: "main"
+              value: "live-controls"
             - name: SEG_CHUNKS
               value: "14"
             - name: VAE_URL
@@ -115,9 +127,9 @@ spec:
             - name: LNC
               value: "2"
             - name: CP
-              value: "8"
+              value: "16"
             - name: TP
-              value: "8"
+              value: "4"
             - name: SIZE
               value: "480*768"
             - name: FRAME_NUM
@@ -143,7 +155,51 @@ spec:
             - name: LINGBOT_CP_FLAT_SEQ
               value: "1"
             - name: ATTENTION_BACKEND
-              value: "const_max_ag"
+              value: "cte"
+            # loop_engineering (kiro/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
+            # on the non-streaming path
+            - name: LINGBOT_HOT_ATTN
+              value: "cte"
+            - name: LINGBOT_SP
+              value: "1"
+            - name: LINGBOT_CTE_MERGE
+              value: "1"
+            - name: LINGBOT_FILM_A2A
+              value: "1"
+            - name: NEURON_LAUNCH_BLOCKING
+              value: "0"
+            - name: LINGBOT_LOAD_CONCURRENCY
+              value: "16"
+            - name: LINGBOT_SKIP_LAST_COMMIT
+              value: "1"
+            - name: LINGBOT_NO_SYNC
+              value: "1"
+            - name: LINGBOT_TOKEN_PAD
+              value: "32"
+            - name: LINGBOT_ATTN_EARLY
+              value: "2"
+            - name: LINGBOT_ATTN_PAIR
+              value: "1"
+            - name: LINGBOT_PLUCKER_COMPILE
+              value: "1"
+            - name: LINGBOT_FILM_BATCH
+              value: "1"
+            - name: LINGBOT_HEAD_COMPILE
+              value: "1"
+            - name: LINGBOT_CROSS_NMAJOR
+              value: "1"
+            - name: LINGBOT_PREUPLOAD
+              value: "1"
+            - name: LINGBOT_EMPTY_CACHE_SEQ
+              value: "1000000000"
+            - name: LINGBOT_COMMIT_NOHEAD
+              value: "1"
+            - name: LINGBOT_FILM_ALL
+              value: "1"
+            - name: LINGBOT_KEY_THREADS
+              value: "4"
+            - name: LINGBOT_IMG_BLOCK
+              value: "1"
             - name: NEURON_CC_FLAGS
               value: "--internal-backend-options=--disable-cb-before-global-cc"
             - name: NKI_COMPILER_FRONTEND
@@ -171,6 +227,10 @@ spec:
                   key: HF_TOKEN
                   optional: true
       volumes:
+        - name: node-cache
+          hostPath:
+            path: /opt/lingbot-world-v2
+            type: DirectoryOrCreate
         - name: logs
           emptyDir: {}
         - name: dshm

@@ -13,16 +13,23 @@ resumes it, optionally with a new prompt. A /continue sent while a segment is
 still generating is queued and starts the moment that segment's last chunk is
 denoised. Only the newest queued /continue is kept.
 
+A live session ({"live": true}) never pauses: it streams until the client
+disconnects, /stop, a new session, or MAX_CHUNKS. /control steers it: the action
+("auto" = the scene's camera path, or one of ACTIONS) drives the camera of every
+chunk from the next one on, and a prompt switches the text from the next chunk.
+
 Decode runs in one of two places:
   - VAE_URL unset: on the same ranks, between chunks (width-sharded).
   - VAE_URL set:   on a separate vae_serve.py. Rank 0 posts each latent chunk
     from a sender thread, so the DiT moves on to the next chunk while the
     previous one decodes.
 
-    POST /session   {"prompt": str, "scene": "02", "seed": int}  -> first segment
+    POST /session   {"prompt": str, "scene": "02", "seed": int, "live": bool}
     POST /continue  {"prompt": str}                              -> next segment
-        both -> text/event-stream of
-           {"frame_index", "frame"(base64 JPEG)}, ... {"done", "segment", "frames", "seconds"}
+        both -> text/event-stream of {"frame_index", "frame"(base64 JPEG), "chunk",
+           "action"}, ... {"done", "segment", "frames", "seconds"}
+    POST /control   {"action": str, "prompt": str}  (both optional) -> {"action"}
+    POST /stop      ends the running session
     GET  /health
     GET  /readiness
 """
@@ -35,6 +42,8 @@ import os
 import queue
 import threading
 import time
+
+import math
 
 import torch
 import torch.distributed as dist
@@ -54,21 +63,50 @@ SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
 
+# Camera motion per latent frame (4 video frames), OpenCV axes (x right, y down, z forward):
+# (yaw deg, + = right; pitch deg, + = up; translation). Sized like the example paths'
+# framewise relative poses (forward ~0.75 per latent frame, turns of a few degrees).
+ACTIONS = {
+    "forward": (0.0, 0.0, (0.0, 0.0, 0.75)),
+    "back": (0.0, 0.0, (0.0, 0.0, -0.6)),
+    "left": (-5.0, 0.0, (0.0, 0.0, 0.4)),
+    "right": (5.0, 0.0, (0.0, 0.0, 0.4)),
+    "up": (0.0, 4.0, (0.0, 0.0, 0.4)),
+    "down": (0.0, -4.0, (0.0, 0.0, 0.4)),
+    "stop": (0.0, 0.0, (0.0, 0.0, 0.0)),
+}
+
+
+def action_poses(name, n):
+    """[n, 4, 4] framewise relative poses for ACTIONS[name], or None for "auto"."""
+    if name not in ACTIONS:
+        return None
+    yaw, pitch, t = ACTIONS[name]
+    a, b = math.radians(yaw), math.radians(pitch)
+    ry = torch.tensor([[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]])
+    rx = torch.tensor([[1, 0, 0], [0, math.cos(b), -math.sin(b)], [0, math.sin(b), math.cos(b)]])
+    m = torch.eye(4)
+    m[:3, :3] = ry @ rx
+    m[:3, 3] = torch.tensor(t)
+    return m.expand(n, 4, 4).clone()
+
 
 class Job:
     """One segment: its frames go to its own event stream."""
 
-    def __init__(self, prompt, seed=42, scene=None):
+    def __init__(self, prompt, seed=42, scene=None, live=False):
         self.prompt = prompt
         self.seed = seed
         self.scene = scene
+        self.live = live
         self.frames = queue.Queue()
         self.count = 0
         self.t0 = None
 
-    def emit(self, frame):
+    def emit(self, frame, chunk=None, action=None):
         self.count += 1
-        self.frames.put({"frame_index": self.count - 1, "frame": frame})
+        self.frames.put({"frame_index": self.count - 1, "frame": frame,
+                         "chunk": chunk, "action": action})
 
     def close(self, segment, err=None):
         if err:
@@ -89,6 +127,9 @@ class Scheduler:
         self.running = False    # a session is generating or paused
         self.cont = None        # newest queued continue
         self.stop = False       # end the running session
+        self.current = None     # job whose stream is open
+        self.action = "auto"    # live camera control
+        self.prompt = None      # live prompt switch, taken once
 
     def _drop(self, job, why):
         if job is not None:
@@ -101,6 +142,30 @@ class Scheduler:
             self._drop(self.cont, "a newer session started")
             self.pending, self.cont = job, None
             self.stop = self.running
+            self.action, self.prompt = "auto", None
+            self.cv.notify_all()
+
+    def control(self, action=None, prompt=None):
+        with self.cv:
+            if action is not None:
+                self.action = action
+            if prompt:
+                self.prompt = prompt
+            return self.action
+
+    def take_control(self):
+        """(action, prompt or None) for the next chunk."""
+        with self.cv:
+            p, self.prompt = self.prompt, None
+            return self.action, p
+
+    def stop_job(self, job):
+        """End the session if `job` is still the one streaming (its client went away)."""
+        with self.cv:
+            if job is self.pending:
+                self.pending = None
+            elif job is self.current and self.running:
+                self.stop = True
             self.cv.notify_all()
 
     def queue_continue(self, job):
@@ -109,6 +174,7 @@ class Scheduler:
                 return False
             self._drop(self.cont, "a newer continue arrived")
             self.cont = job
+            self.current = job
             self.cv.notify_all()
             return True
 
@@ -119,6 +185,7 @@ class Scheduler:
             job, self.pending = self.pending, None
             if job is not None:
                 self.running, self.stop = True, False
+                self.current = job
             return job
 
     def take_continue(self, timeout):
@@ -132,6 +199,7 @@ class Scheduler:
     def end_session(self):
         with self.cv:
             self.running = False
+            self.current = None
             self._drop(self.cont, "the session ended")
             self.cont = None
 
@@ -188,7 +256,8 @@ def b64_jpeg(img):
 
 
 def run_server(sched):
-    from fastapi import FastAPI, HTTPException
+    import asyncio
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import StreamingResponse
     from pydantic import BaseModel
     import uvicorn
@@ -199,36 +268,70 @@ def run_server(sched):
         prompt: str
         seed: int = 42
         scene: str = ""
+        live: bool = False
 
     class ContinueRequest(BaseModel):
         prompt: str
 
-    def stream(job):
-        def events():
-            while True:
-                item = job.frames.get()
-                if item is None:
-                    return
-                yield f"data: {json.dumps(item)}\n\n"
+    class ControlRequest(BaseModel):
+        action: str | None = None
+        prompt: str | None = None
+
+    def stream(job, request):
+        def get():
+            try:
+                return job.frames.get(timeout=1)
+            except queue.Empty:
+                return "idle"
+
+        async def events():
+            try:
+                while True:
+                    item = await asyncio.to_thread(get)
+                    if item is None:
+                        return
+                    if item == "idle":
+                        if await request.is_disconnected():
+                            return
+                        continue
+                    yield f"data: {json.dumps(item)}\n\n"
+            finally:
+                if job.live:
+                    sched.stop_job(job)
         return StreamingResponse(events(), media_type="text/event-stream")
 
     @app.post("/session")
-    def session(req: SessionRequest):
+    def session(req: SessionRequest, request: Request):
         if not sched.ready:
             raise HTTPException(status_code=503, detail="warming up")
         if req.scene and not (req.scene.isdigit() and os.path.isfile(f"examples/{req.scene}/poses.npy")):
             raise HTTPException(status_code=400, detail=f"unknown scene {req.scene!r}")
-        job = Job(req.prompt, req.seed, req.scene or None)
+        job = Job(req.prompt, req.seed, req.scene or None, req.live)
         sched.start(job)
-        return stream(job)
+        return stream(job, request)
 
     @app.post("/continue")
-    def cont(req: ContinueRequest):
+    def cont(req: ContinueRequest, request: Request):
         job = Job(req.prompt)
         if not sched.queue_continue(job):
             raise HTTPException(status_code=409, detail="no session - start one first")
         logging.info(f"continue queued: {req.prompt[:80]!r}")
-        return stream(job)
+        return stream(job, request)
+
+    @app.post("/control")
+    def control(req: ControlRequest):
+        if req.action is not None and req.action != "auto" and req.action not in ACTIONS:
+            raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
+        action = sched.control(req.action, req.prompt)
+        logging.info(f"control: action={action}" + (f" prompt={req.prompt[:60]!r}" if req.prompt else ""))
+        return {"action": action}
+
+    @app.post("/stop")
+    def stop():
+        with sched.cv:
+            sched.stop = sched.running
+            sched.cv.notify_all()
+        return {"stopped": sched.running}
 
     @app.get("/health")
     def health():
@@ -310,15 +413,19 @@ def main():
     def run_session(prompt, img, seed, action_path, control):
         """One continuous generation on every rank.
 
-        control(chunk_id), rank 0 only, returns ("go", new prompt or None),
-        ("wait", None) or ("stop", None). Its answer is broadcast, so every rank
-        switches, pauses or stops at the same chunk. emit_of(chunk_id) says where
-        that chunk's frames go.
+        control(chunk_id), rank 0 only, returns ("go", new prompt or None, action),
+        ("wait", None, None) or ("stop", None, None). Its answer is broadcast, so every
+        rank switches, steers, pauses or stops at the same chunk. state["emit"] says
+        where that chunk's frames go.
         """
         embeds = [t.cpu() for t in t5([prompt], dev)]
+        actions = {}
 
         def on_chunk(chunk_id, x0):
-            emit = state["emit"]
+            job_emit, action = state["emit"], actions.pop(chunk_id, None)
+
+            def emit(frame):
+                job_emit(frame, chunk_id, action)
             if VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None:
@@ -328,14 +435,16 @@ def main():
             while True:
                 c = [control(chunk_id) if rank == 0 else None]
                 dist.broadcast_object_list(c, src=0)
-                action, new_prompt = c[0]
-                if action == "wait":
+                verb, new_prompt, action = c[0]
+                if verb == "wait":
                     continue
-                if action == "stop":
+                if verb == "stop":
                     return {"stop": True}
+                actions[chunk_id] = action or "auto"
+                out = {"camera": action_poses(action, args.chunk_size)}
                 if new_prompt is not None:
-                    return {"context": [t.cpu() for t in t5([new_prompt], dev)]}
-                return None
+                    out["context"] = [t.cpu() for t in t5([new_prompt], dev)]
+                return out
 
         pipe.generate(
             prompt, img,
@@ -355,14 +464,17 @@ def main():
             chunk_control=chunk_control,
             max_chunks=MAX_CHUNKS)
 
-    state = {"emit": lambda f: None}
+    state = {"emit": lambda f, c=None, a=None: None}
 
-    # Warmup: a 3-segment session, switching prompts at both boundaries, so every
-    # graph a real session uses -- including the prompt-switch ones -- compiles here.
+    # Warmup: a 3-segment session, switching prompts at both boundaries and steering the
+    # camera in between, so every graph a real session uses -- including the prompt-switch
+    # and camera-control ones -- compiles here.
+    warm_actions = ["auto"] + list(ACTIONS)
     t0 = time.perf_counter()
     run_session(args.prompt, first_img, args.base_seed, args.action_path,
-                lambda i: ("stop", None) if i >= 3 * SEG_CHUNKS else
-                ("go", args.prompt if i in (SEG_CHUNKS, 2 * SEG_CHUNKS) else None))
+                lambda i: ("stop", None, None) if i >= 3 * SEG_CHUNKS else
+                ("go", args.prompt if i in (SEG_CHUNKS, 2 * SEG_CHUNKS) else None,
+                 warm_actions[i % len(warm_actions)]))
     if remote is not None:
         err = remote.drain()
         if err:
@@ -391,7 +503,9 @@ def main():
             continue
         img = Image.open(io.BytesIO(m["png"])).convert("RGB")
 
-        seg = {"job": job, "n": 1, "end": SEG_CHUNKS, "open": True, "idle": None}
+        live = rank == 0 and job.live
+        seg = {"job": job, "n": 1, "end": MAX_CHUNKS if live else SEG_CHUNKS,
+               "open": True, "idle": None}
         if rank == 0:
             job.t0 = time.perf_counter()
             state["emit"] = job.emit
@@ -406,20 +520,23 @@ def main():
 
         def control(chunk_id):
             if chunk_id < seg["end"]:
-                return ("stop", None) if sched.stop else ("go", None)
+                if sched.stop:
+                    return ("stop", None, None)
+                action, new_prompt = sched.take_control()
+                return ("go", new_prompt, action)
             if seg["open"]:
                 close_segment()
             nxt, stop = sched.take_continue(IDLE_S)
             if stop:
-                return ("stop", None)
+                return ("stop", None, None)
             if nxt is None:
                 over = time.perf_counter() - seg["idle"] > SESSION_IDLE_S
-                return ("stop", None) if over else ("wait", None)
+                return ("stop", None, None) if over else ("wait", None, None)
             seg.update(job=nxt, n=seg["n"] + 1, end=chunk_id + SEG_CHUNKS, open=True)
             nxt.t0 = time.perf_counter()
             state["emit"] = nxt.emit
             logging.info(f"segment {seg['n']}: {nxt.prompt[:80]!r}")
-            return ("go", nxt.prompt)
+            return ("go", nxt.prompt, sched.take_control()[0])
 
         try:
             run_session(m["prompt"], img, m["seed"], m["action_path"], control)
@@ -432,7 +549,7 @@ def main():
             raise
         finally:
             if rank == 0:
-                state["emit"] = lambda f: None
+                state["emit"] = lambda f, c=None, a=None: None
                 sched.end_session()
                 logging.info("session ended")
 
