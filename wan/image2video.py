@@ -1415,7 +1415,11 @@ class WanI2VCausal:
                             noise_pred = self.model(
                                 x=latent_model_input, t=timestep,
                                 cross_attn_first_call=not self._cross_attn_initialized,
-                                **kwargs)[0]
+                                # LINGBOT_STEP_NOWRITE=1: this step's cache write is dead (the
+                                # next step and the commit forward overwrite it)
+                                **(dict(kwargs, kv_commit=False)
+                                   if os.environ.get("LINGBOT_STEP_NOWRITE", "0") == "1"
+                                   else kwargs))[0]
                             _ftag = ""
                         _sync()
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
@@ -1902,9 +1906,13 @@ class WanI2VCausal:
             # the merged attention_cte path reads the chunks in place (no per-block assembly).
             _n_major = [(const_max_ag_available() and (layer_uses_const_max(i) or fa2_ag_available()))
                         or cte_merge_enabled() for i in range(num_layers)]
+            # LINGBOT_ATTN_SPLIT=1: also each CP rank's own shard of every cached chunk.
+            _own = 0
+            if os.environ.get("LINGBOT_ATTN_SPLIT", "0") == "1" and self.sp_size > 1:
+                _own = (chunk_size * frame_seqlen) // self.sp_size
             cache = allocate_self_kv_chunks(
                 num_layers, batch, chunk_size * frame_seqlen, heads, head_dim,
-                n, dtype, device, n_major=_n_major)
+                n, dtype, device, n_major=_n_major, own_tokens=_own)
             _flash = sorted(flash_attn_layers())
             if _flash:
                 logging.info(

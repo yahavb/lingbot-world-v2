@@ -109,7 +109,9 @@ def main():
     from wan.modules.attention import cte_merge_enabled
     n_major = (const_max_ag_available() and (mf.layer_uses_const_max(K) or fa2_ag_available())) \
         or cte_merge_enabled()
-    kv = allocate_self_kv_chunks(1, 1, L, heads, d, n_chunks, torch.bfloat16, dev, n_major=n_major)[0]
+    split = os.environ.get("LINGBOT_ATTN_SPLIT", "0") == "1" and cp > 1
+    kv = allocate_self_kv_chunks(1, 1, L, heads, d, n_chunks, torch.bfloat16, dev, n_major=n_major,
+                                 own_tokens=L_loc if split else 0)[0]
     if const_max_ag_available():
         from wan.modules.attention import init_const_max_ag
         init_const_max_ag(tp.replica_groups("cp"), L)
@@ -119,8 +121,23 @@ def main():
     gk = torch.Generator().manual_seed(4321 + tp_rank)
     for t in kv["k"] + kv["v"]:
         t.copy_(torch.randn(t.shape, generator=gk).to(t.dtype))
+    if os.environ.get("LINGBOT_K_BLOCKED", "0") == "1" and cp > 1:
+        # the same logical K, stored as CP rank blocks [cp, n, d, l] (what the pipeline caches)
+        for t in kv["k"]:
+            n_, d_, L_ = t.shape
+            t.copy_(t.view(n_, d_, cp, L_ // cp).permute(2, 0, 1, 3).contiguous().view(n_, d_, L_))
+    if split:
+        # each CP rank's own shard of every cached chunk = its token slice of the gathered chunk
+        r_cp, l_ = mf._sp_local_r(), L_loc
+        for kc_, vc_, ko_, vo_ in zip(kv["k"], kv["v"], kv["ko"], kv["vo"]):
+            if int(kc_.shape[1]) == d:            # K [n, d, L]
+                ko_.copy_(kc_[:, :, r_cp * l_:(r_cp + 1) * l_])
+            else:
+                ko_.copy_(kc_[:, r_cp * l_:(r_cp + 1) * l_])
+            vo_.copy_(vc_[:, r_cp * l_:(r_cp + 1) * l_])
     order = list(range(LEAD)) + [n_chunks - 1]
     ks, vs = [kv["k"][i] for i in order], [kv["v"][i] for i in order]
+    own = (([kv["ko"][i] for i in order], [kv["vo"][i] for i in order]),) if split else ()
     if os.environ.get("WINDOW_KV", "0") == "1" and LEAD >= 2:
         # The leading chunks as ONE contiguous buffer (what LINGBOT_KV_WINDOW builds once per
         # chunk), so LINGBOT_ATTN_PAIR passes it as the kernel's prior: one call per block.
@@ -192,10 +209,14 @@ def main():
                 f"{(time.perf_counter() - t0) / int(os.environ['FILM_REPS']) * 1e3:.2f} ms/block")
     x_in = mf.sp_token_shard(x, tpd, tp_rank) if sp else x
 
+    # KV_WRITE=0: the denoise-step variant of LINGBOT_STEP_NOWRITE (no write into the cache slot)
+    kv_extra = {"kv_write": False} if os.environ.get("KV_WRITE", "1") == "0" else {}
+
     def run(first):
         mf._REAL_TOKENS[0] = L_loc if Lp != L_loc else None
-        return cblk(x_in, kv_cache=None, kv_chunks=(list(ks), list(vs)), crossattn_cache=cross,
-                    current_start=0, dit_cond_dict={"cam_film": film}, cross_attn_first_call=first, **kw)
+        return cblk(x_in, kv_cache=None, kv_chunks=(list(ks), list(vs)) + own, crossattn_cache=cross,
+                    current_start=0, dit_cond_dict={"cam_film": film}, cross_attn_first_call=first,
+                    **kw, **kv_extra)
 
     with torch.no_grad(), torch.amp.autocast("neuron", dtype=torch.bfloat16):
         t0 = time.perf_counter()
@@ -230,6 +251,47 @@ def main():
         if sp:  # reassemble the token shards for the output check (outside the timed loop)
             out = tp.all_gather_tokens(out.contiguous(), "tp")
             torch.neuron.synchronize()
+    if os.environ.get("ALT", "0") == "1":
+        # Run once on DIFFERENT data in the same buffers (perturbed cache contents, scaled input),
+        # restore the original contents, then do the compared call. Every timed rep sees identical
+        # inputs, so a read of state left by the previous execution would match there; in the
+        # pipeline each block follows a block with other data.
+        with torch.no_grad(), torch.amp.autocast("neuron", dtype=torch.bfloat16):
+            bufs = list(ks) + list(vs) + ([t for pair in own for lst in pair for t in lst] if own else [])
+            saved = [t.clone() for t in bufs]
+            for t in bufs:
+                t.mul_(-1.0)
+            torch.neuron.synchronize()
+            mf._REAL_TOKENS[0] = L_loc if Lp != L_loc else None
+            cblk(x_in * 1.5, kv_cache=None, kv_chunks=(list(ks), list(vs)) + own, crossattn_cache=cross,
+                 current_start=0, dit_cond_dict={"cam_film": film}, cross_attn_first_call=False, **kw)
+            torch.neuron.synchronize()
+            for t, s_ in zip(bufs, saved):
+                t.copy_(s_)
+            torch.neuron.synchronize()
+    zero_dest = os.environ.get("ZERO_DEST", "0") == "1" or os.environ.get("ALT", "0") == "1"
+    if zero_dest:
+        # Every timed rep writes the same new chunk into the destination buffers, so a read that
+        # raced ahead of that write would still see the right values. Clear what this forward
+        # writes before the compared call, so a premature read shows up as a difference.
+        with torch.no_grad():
+            ks[-1].zero_()
+            vs[-1].zero_()
+            for t in (own[0][0][-1], own[0][1][-1]) if own else ():
+                t.zero_()
+            if os.environ.get("CMP_FIRST", "0") == "1":
+                cross["k"].zero_()
+                cross["v"].zero_()
+        torch.neuron.synchronize()
+    if os.environ.get("CMP_FIRST", "0") == "1" or zero_dest:
+        # compare the cross_attn_first_call=True variant (chunk 0, step 0 of every video) instead:
+        # it recomputes the cross-attention K/V from the context, then runs the block
+        with torch.no_grad(), torch.amp.autocast("neuron", dtype=torch.bfloat16):
+            out = run(os.environ.get("CMP_FIRST", "0") == "1")
+            torch.neuron.synchronize()
+            if sp:
+                out = tp.all_gather_tokens(out.contiguous(), "tp")
+                torch.neuron.synchronize()
     o = out.float().cpu()
     msg = (f"[block_bench] tp={tpd} cp={cp} block={K} lead={LEAD} L_loc={L_loc}->{Lp} heads/rank={heads} "
            f"{ms:.2f} ms/block (host {t_host / REPS * 1e3:.2f} ms, first call {t_first:.1f}s) "
@@ -242,7 +304,40 @@ def main():
     if rank == 0 and ref and os.path.exists(ref):
         r = torch.load(ref)
         rel = ((o - r)[0, :L_loc].pow(2).mean().sqrt() / r[0, :L_loc].pow(2).mean().sqrt()).item()
-        msg += f" rel_rms_vs_ref={rel:.5f}"
+        msg += (f" rel_rms_vs_ref={rel:.5f} ref_equal={torch.equal(o[0, :L_loc], r[0, :L_loc])}"
+                f" ref_max_abs={(o - r)[0, :L_loc].abs().max().item():.3e}")
+        t0_ = (L_loc // 128) * 128
+        if t0_ < L_loc:
+            # the rows past the last full 128-row query tile (what LINGBOT_ATTN_SPLIT/REM change)
+            relr = ((o - r)[0, t0_:L_loc].pow(2).mean().sqrt()
+                    / r[0, t0_:L_loc].pow(2).mean().sqrt()).item()
+            msg += f" rem_rows_rel={relr:.5f}"
+    # SAVE_REFDIR=<dir> / REFDIR=<dir>: every rank saves / compares its OWN output. Rank 0's output
+    # alone cannot show an error on another CP rank: it only reaches rank 0 through the next
+    # block's K/V gather, which this bench does not run.
+    rdir_save, rdir = os.environ.get("SAVE_REFDIR"), os.environ.get("REFDIR")
+    if rdir_save:
+        os.makedirs(rdir_save, exist_ok=True)
+        torch.save(o, os.path.join(rdir_save, f"r{rank:02d}.pt"))
+        msg += f" saved_all {rdir_save}"
+    if rdir and os.path.exists(os.path.join(rdir, f"r{rank:02d}.pt")):
+        r = torch.load(os.path.join(rdir, f"r{rank:02d}.pt"))
+        d_ = (o - r)[0, :L_loc]
+        st = (bool(torch.equal(o[0, :L_loc], r[0, :L_loc])),
+              (d_.pow(2).mean().sqrt() / r[0, :L_loc].pow(2).mean().sqrt()).item(),
+              d_.abs().max().item())
+    else:
+        st = None
+    if rdir:
+        allst = [None] * world
+        dist.all_gather_object(allst, st)
+        if rank == 0:
+            got = [(i, s_) for i, s_ in enumerate(allst) if s_ is not None]
+            bad = [i for i, s_ in got if not s_[0]]
+            worst = max(got, key=lambda t: t[1][1]) if got else None
+            msg += (f" ranks_equal={len(got) - len(bad)}/{len(got)} bad_ranks={bad[:16]}"
+                    + (f" worst_rank={worst[0]} worst_rel={worst[1][1]:.3e} worst_max={worst[1][2]:.3e}"
+                       if worst else ""))
     log(msg)
     dist.barrier()
     dist.destroy_process_group()
