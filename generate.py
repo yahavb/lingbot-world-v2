@@ -625,6 +625,10 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             wan_i2v.model._stack_tokens = None
             wan_i2v.model._stacks_built = None
         wan_i2v.model.cpu()
+        # LINGBOT_KV_REUSE: the KV caches kept for the next generation hold ~3.5 GB of device memory
+        for _attr in ("_self_kv_reuse", "_cross_kv_reuse"):
+            if getattr(wan_i2v, _attr, None) is not None:
+                setattr(wan_i2v, _attr, None)
         try:
             torch._dynamo.reset()
         except Exception as _e:

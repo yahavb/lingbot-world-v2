@@ -288,13 +288,38 @@ def attention_cte(
     bias_layout: str = "dense",
     bias_band_params: Optional[dict] = None,
     k_blocks: int = 1,
+    q_major: bool = False,
+    chain_o: Optional[nl.NkiTensor] = None,
+    chain_neg_max: Optional[nl.NkiTensor] = None,
+    chain_sum: Optional[nl.NkiTensor] = None,
+    v_token_major: bool = False,
+    prior_full: bool = False,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
+    lingbot: prior_full = True (prefix caching): prior_used_len equals the prior's length on every call, so
+    the prior's K tiles need no dynamic mask (range_select, Vector-only); they evict like active tiles.
+    lingbot: v_token_major = True: v and v_prior keep their logical shape (bs_kv, seqlen, d) but their
+    MEMORY is token-major [seqlen, bs_kv, d] (a CP all-gather of [seqlen / B, bs_kv, d] shards, the
+    projection's own layout), so key j of head b is at (j * bs_kv + b) * d. The V tile loads use that
+    row stride; nothing else changes (static load offsets only).
+    lingbot: chain_o / chain_neg_max / chain_sum (all three, one flash section, non-causal, no sink):
+    the (output, out_neg_max, out_sum_recip) of an earlier call over other keys with the same q,
+    cache_softmax=True and skip_output_normalization=True, in this call's output layout (tp_out).
+    This call continues that call's online softmax, as a flash-attention section before its own
+    keys: the running max and sum start from the earlier call's, its output is rescaled into this
+    call's, and the result is the attention over the union of both calls' keys -- normalized, or
+    again unnormalized with statistics (cache_softmax + skip_output_normalization) to chain on.
 
     lingbot: k_blocks = B > 1 (tp_k=False, one flash section): k and k_prior keep the logical shape
     (bs_kv, d, seqlen) but their MEMORY is B rank blocks [B, bs_kv, d, seqlen / B] (a CP
     all-gather of [bs_kv, d, seqlen / B] shards, used without the permute into [bs_kv, d, seqlen]);
     key r * (seqlen / B) + j is block r's key j. V keeps the plain layout in the same key order.
+
+    lingbot: q_major = True (tp_out=False, cache_softmax + skip_output_normalization, one flash
+    section): the output is (seqlen_q, batch_size, d) and the two softmax statistics are
+    (padded_seq_grps * 128, batch_size), query-major, instead of (batch_size, seqlen_q, d) and
+    (batch_size, 128, padded_seq_grps). Same values, other DMA destination patterns: the caller's
+    merge then needs no transposes of the statistics and no permute of the output.
 
     The kernel can be invoked with 1D SPMD grid for LNC2 or without grid.
 
@@ -511,6 +536,12 @@ def attention_cte(
         bias_layout=bias_layout,
         bias_band_params=bias_band_params,
         k_blocks=k_blocks,
+        q_major=q_major,
+        chain_o=chain_o,
+        chain_neg_max=chain_neg_max,
+        chain_sum=chain_sum,
+        v_token_major=v_token_major,
+        prior_full=prior_full,
     )
 
 
@@ -565,6 +596,12 @@ def _attention_cte(
     kvp_cp_offset_int: int = 0,
     kvp_k_threshold_sb=None,
     kvp_seg_block_offset_int: int = 0,
+    q_major: bool = False,
+    chain_o=None,
+    chain_neg_max=None,
+    chain_sum=None,
+    v_token_major: bool = False,
+    prior_full: bool = False,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -713,6 +750,21 @@ def _attention_cte(
         v_prior_sbuf,
         skip_output_normalization=skip_output_normalization,
     )
+    if q_major:  # lingbot: query-major output and statistics, see attention_cte
+        kernel_assert(not tp_out and cache_softmax and skip_output_normalization,
+                      "q_major needs tp_out=False, cache_softmax and skip_output_normalization")
+        kernel_assert(out_o_hbm is None and out_neg_max_hbm is None and out_sum_hbm is None,
+                      "q_major allocates its own outputs")
+        out_shape = (out_shape[1], out_shape[0], out_shape[2])
+        softmax_shape = (softmax_shape[1] * softmax_shape[2], softmax_shape[0])
+    if chain_o is not None:  # lingbot: chained call, see attention_cte
+        kernel_assert(chain_neg_max is not None and chain_sum is not None,
+                      "chain_o needs chain_neg_max and chain_sum")
+        kernel_assert(not causal_mask and sink is None and sliding_window == 0 and not q_major,
+                      "chained calls: non-causal, no sink, no sliding window, no q_major")
+        kernel_assert(tuple(chain_o.shape) == tuple(out_shape),
+                      f"chain_o must have the output's shape {tuple(out_shape)}, got {tuple(chain_o.shape)}")
+        kernel_assert(not is_trn3_b1(), "chained calls: the Vector-engine exp path is not handled")
     if is_sequence_packed:
         batch_size = out_shape[0]
         kernel_assert(
@@ -941,6 +993,10 @@ def _attention_cte(
     # Create AttnConfig with high-level configuration
     ac = AttnConfig(
         k_blocks=k_blocks,
+        q_major_bs=bs if q_major else 0,
+        chained=chain_o is not None,
+        v_token_major=v_token_major,
+        prior_full=prior_full,
         seqlen_q=seqlen_q,
         seqlen_k_active=seqlen_k_active,
         seqlen_k_prior=seqlen_k_prior,
@@ -1043,8 +1099,10 @@ def _attention_cte(
             position_bias=position_bias,
             k_scale_sb=k_scale_sb,
             kv_used_len=kv_used_len,
+            chain_o=chain_o,
+            chain_neg_max=chain_neg_max,
+            chain_sum=chain_sum,
         )
-
     has_remainder = (bs % num_shard) != 0
     last_batch = bs - 1
 
@@ -1096,6 +1154,9 @@ def _attention_cte(
                 v_prior_sbuf=v_prior_sbuf,
                 kv_used_len=kv_used_len,
                 position_bias=position_bias,
+                chain_o=chain_o,
+                chain_neg_max=chain_neg_max,
+                chain_sum=chain_sum,
             )
         else:
             # Have core 0 do all the work
@@ -1121,6 +1182,9 @@ def _attention_cte(
                     v_prior_sbuf=v_prior_sbuf,
                     kv_used_len=kv_used_len,
                     position_bias=position_bias,
+                    chain_o=chain_o,
+                    chain_neg_max=chain_neg_max,
+                    chain_sum=chain_sum,
                 )
 
     if cache_softmax:
@@ -1205,6 +1269,10 @@ class AttnConfig(nl.NKIObject):
     kvp_k_threshold_sb: Any = None  # Pre-generated static k_threshold pattern in SBUF
     kvp_all_tiles_visible: bool = False  # Compile-time: all tiles in this segment are fully visible
     k_blocks: int = 1  # lingbot: rank-blocked K memory layout, see attention_cte
+    q_major_bs: int = 0  # lingbot: > 0 = query-major output / statistics (q_major), = batch size
+    chained: bool = False  # lingbot: continue an earlier call's softmax (chain_o / _neg_max / _sum)
+    v_token_major: bool = False  # lingbot: V memory is [seqlen, bs_kv, d], see attention_cte
+    prior_full: bool = False  # lingbot: the whole prior is used on every call, see attention_cte
 
 
 def _attention_cte_impl(
@@ -1236,6 +1304,9 @@ def _attention_cte_impl(
     bias_band_params: Optional[dict] = None,
     k_scale_sb=None,
     kv_used_len: Optional[nl.NkiTensor] = None,
+    chain_o=None,
+    chain_neg_max=None,
+    chain_sum=None,
 ):
     """
     Internal implementation function for attention computation.
@@ -1299,6 +1370,10 @@ def _attention_cte_impl(
     allocator = ModularAllocator(initial_address=init_sbuf_addr)
     bufs = AttnInternalBuffers()
     bufs.k_scale_sb = k_scale_sb
+    # lingbot: chained call (see attention_cte): the earlier call's output and statistics, per head
+    kernel_assert(not ac.chained or atp.num_sections == 1, "chained calls: one flash section only")
+    bufs.chain_o, bufs.chain_neg_max, bufs.chain_sum = chain_o, chain_neg_max, chain_sum
+    bufs.chain_batch_id = batch_id
 
     # Write softmax intermediates
 
@@ -1489,8 +1564,8 @@ def _attention_cte_impl(
                 load_offset_active=bufs.k_offset_sb_u32,
                 out_big=bufs.v_sb_big,
                 out_off=bufs.v_big_off,
+                token_major=ac.v_token_major,
             )
-
         # Start with Q load and actual compute
         if shard_seqlen_q_length <= 1:
             # no pipelining when there's only 1 group
@@ -1544,6 +1619,10 @@ def _attention_cte_impl(
     # to [batch_id, 0:128, shard_seqlen_q_start:shard_seqlen_q_start+shard_seqlen_q_length]
     dst_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
     dst_offset = batch_id * atp.sb_p * atp.num_grps + shard_seqlen_q_start
+    if ac.q_major_bs > 0:
+        # lingbot: q_major, statistics are (num_grps * 128, bs): query g * 128 + p of head batch_id
+        dst_ap = [[ac.q_major_bs, atp.sb_p], [atp.sb_p * ac.q_major_bs, shard_seqlen_q_length]]
+        dst_offset = shard_seqlen_q_start * atp.sb_p * ac.q_major_bs + batch_id
     src_ap = [[atp.num_grps, atp.sb_p], [1, shard_seqlen_q_length]]
     src_offset = shard_seqlen_q_start
     if out_neg_max is not None:
@@ -1636,6 +1715,10 @@ class AttnInternalBuffers(nl.NKIObject):
     # Position bias
     position_bias_sb = None  # SBUF tile used to stage [sb_p, _K_TILE_SZ] bias slices before PSUM preload
     position_bias_hbm = None  # Reference to the HBM position bias tensor (dense or banded)
+    chain_o = None  # lingbot: chained call, the earlier call's unnormalized output (HBM)
+    chain_neg_max = None  # lingbot: chained call, its negated row max (batch, 128, groups)
+    chain_sum = None  # lingbot: chained call, its row sum (batch, 128, groups)
+    chain_batch_id = 0  # lingbot: the head these buffers serve
 
 
 @dataclass
@@ -1866,6 +1949,8 @@ def _compute_tile_parameters(
 
     kernel_assert(atp.section_len > 0, f"section_len must be positive, got {atp.section_len}")
     atp.num_sections = div_ceil(total_seqlen_k, atp.section_len)
+    # lingbot: the multi-section path reads the output back in the head-major layout
+    kernel_assert(ac.q_major_bs == 0 or atp.num_sections == 1, "q_major: one flash section only")
 
     if not use_flash_attn:
         kernel_assert(
@@ -2207,12 +2292,21 @@ def _allocate_attention_buffers(
     else:
         if ac.tp_out:
             p_v, n_v = atp.sb_p, atp.d_tile_size_par_dim_v  # d_v is free dim for MM2
-            bufs.v_sb = allocator.alloc_sbuf_tensor(
-                shape=(p_v, n_v),
-                dtype=nl.bfloat16,
-                block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
-                num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
-            )
+            if (_kv_grouping_ok(ac, atp, bufs) and _VGROUP > 1 and atp.num_d_tiles_v == 1
+                    and not (_KV_DBUF and bufs.kv_parity is not None)
+                    and _VGROUP_MIN_TILES <= atp.num_v_tiles_per_section <= _VGROUP_MAX_TILES):
+                # lingbot: grouped V loads with tp_out too: the V tiles have the same [128, d] shape
+                w_v = atp.num_v_tiles_per_section * n_v
+                bufs.v_sb_big = allocator.alloc_sbuf_tensor(shape=(p_v, w_v), dtype=nl.bfloat16)
+                bufs.v_big_off = 0
+                bufs.v_sb = [[bufs.v_sb_big[:, nl.ds(i * n_v, n_v)]] for i in range(atp.num_v_tiles_per_section)]
+            else:
+                bufs.v_sb = allocator.alloc_sbuf_tensor(
+                    shape=(p_v, n_v),
+                    dtype=nl.bfloat16,
+                    block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
+                    num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles_v],
+                )
         else:
             p_v, n_v = atp.sb_p, atp.d_tile_size_free_dim  # d is free dim for MM2
             _dbuf = _KV_DBUF and bufs.kv_parity is not None
@@ -3096,8 +3190,10 @@ def _load_v_tile(
     load_offset_active=None,
     out_big=None,
     out_off=0,
+    token_major=False,
 ) -> int:
     """Load V tiles from HBM to SBUF in _V_TILE_SZ (128)-element chunks, handling prefix caching.
+    lingbot: token_major = True: v and v_prior memory is [seqlen, bs_kv, d] (see attention_cte).
 
     - v of shape (bs, seqlen, d).
     - out[i] has shape (_V_TILE_SZ, d) where i = 0..num_v_tiles_per_section
@@ -3122,8 +3218,16 @@ def _load_v_tile(
     # below, so this is numerically identical.
     shared_offset_reg = None
     if load_offset_active is not None:
+        kernel_assert(not token_major, "v_token_major: static load offsets only")
         shared_offset_reg = nisa.register_alloc()
         nisa.register_load(shared_offset_reg, load_offset_active)
+
+    def _row(v_t, seqlen_t, off_t):
+        # lingbot: (elements between consecutive keys of one head, offset of key off_t of head batch_id)
+        if token_major:
+            rs = int(v_t.shape[0]) * actual_d
+            return rs, off_t * rs + batch_id * actual_d
+        return actual_d, batch_id * seqlen_t * actual_d + off_t * actual_d
 
     grouped = set()
     if out_big is not None and num_tiles > 0:
@@ -3154,15 +3258,14 @@ def _load_v_tile(
         for run in runs:
             t0, v_t, off0, seqlen_t, _, np0 = run[0]
             g = len(run)
+            rs, base = _row(v_t, seqlen_t, off0)
             if g == 1:
                 dst = out_big.ap(pattern=[[nv_all, np0], [1, actual_d]], offset=out_off + t0 * d_tile_size)
-                src = v_t.ap(pattern=[[actual_d, np0], [1, actual_d]],
-                             offset=batch_id * seqlen_t * actual_d + off0 * actual_d)
+                src = v_t.ap(pattern=[[rs, np0], [1, actual_d]], offset=base)
             else:
                 dst = out_big.ap(pattern=[[nv_all, p], [d_tile_size, g], [1, actual_d]],
                                  offset=out_off + t0 * d_tile_size)
-                src = v_t.ap(pattern=[[actual_d, p], [p * actual_d, g], [1, actual_d]],
-                             offset=batch_id * seqlen_t * actual_d + off0 * actual_d)
+                src = v_t.ap(pattern=[[rs, p], [p * rs, g], [1, actual_d]], offset=base)
             _kv_dma(dst, src)
             grouped.update(r_[0] for r_ in run)
     for tile in range(num_tiles):
@@ -3191,10 +3294,8 @@ def _load_v_tile(
                         indirect_dim=1,
                     )
                 else:
-                    v_src_pat = v.ap(
-                        pattern=[[actual_d, num_p], [1, d]],
-                        offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
-                    )
+                    rs, base = _row(v, seqlen, seqlen_offset)
+                    v_src_pat = v.ap(pattern=[[rs, num_p], [1, d]], offset=base + d_offset)
                 if load_offset is None:  # lingbot:
                     _kv_dma(out_dst_pat, v_src_pat)
                 else:
@@ -3326,7 +3427,9 @@ def _update_max_impl(
     # straight into the running max and skip a GpSimd copy between this reduce and the exp that
     # consumes the max. Only section_idx > 0 needs the two kept apart, because there the section
     # max is combined with the surviving running max.
-    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
+    # lingbot: a chained call (see attention_cte) treats its section like a later flash section whose
+    # predecessor is the earlier call: the running max starts as that call's.
+    reduce_into_running = (sp.section_idx == 0 or atp.num_sections == 1) and not ac.chained
     nisa.tensor_reduce(
         bufs.mm1_running_max[:, grp_i] if reduce_into_running else bufs.mm1_section_max[grp_i][:, 0],
         nl.maximum,
@@ -3334,12 +3437,19 @@ def _update_max_impl(
         1,
         negate=True,
     )
-
+    if ac.chained:
+        nisa.dma_copy(
+            dst=bufs.mm1_running_max[:, grp_i],
+            src=bufs.chain_neg_max.ap(
+                pattern=[[atp.num_grps, atp.sb_p], [1, 1]],
+                offset=bufs.chain_batch_id * atp.sb_p * atp.num_grps + grp_i,
+            ),
+        )
     # Step 2: compute and store running max, and flash attention correction factor
-    if atp.num_sections != 1:
-        if sp.section_idx == 0:
+    if atp.num_sections != 1 or ac.chained:
+        if sp.section_idx == 0 and not ac.chained:
             nisa.memset(bufs.flash_attn_correction_factor[grp_i][...], value=0.0)
-        if sp.section_idx > 0:
+        if sp.section_idx > 0 or ac.chained:
             nisa.activation(
                 bufs.prev_mm1_running_max[grp_i][...],
                 nl.copy,
@@ -3754,14 +3864,33 @@ def _write_back_impl(
     # exp_running_sum hold the same value, so reduce straight into the running sum and skip the
     # GpSimd copy. Only section_idx > 0 needs them apart, where the section
     # sum is folded into the running sum through the flash correction factor.
-    reduce_into_running = sp.section_idx == 0 or atp.num_sections == 1
+    reduce_into_running = (sp.section_idx == 0 or atp.num_sections == 1) and not ac.chained
     nisa.tensor_reduce(
         bufs.exp_running_sum[:, grp_i] if reduce_into_running else bufs.exp_section_sum[grp_i][...],
         nl.add,
         bufs.exp_partial_sum[grp_i],
         axis=1,
     )
-    if atp.num_sections != 1:
+    if ac.chained:
+        # lingbot: running sum = the earlier call's sum rescaled to the new max + this call's
+        nisa.dma_copy(
+            dst=bufs.prev_exp_running_sum[grp_i][...],
+            src=bufs.chain_sum.ap(
+                pattern=[[atp.num_grps, atp.sb_p], [1, 1]],
+                offset=bufs.chain_batch_id * atp.sb_p * atp.num_grps + grp_i,
+            ),
+        )
+        nisa.tensor_scalar(
+            bufs.exp_running_sum[:, grp_i],
+            bufs.prev_exp_running_sum[grp_i][:, 0],
+            nl.multiply,
+            bufs.flash_attn_correction_factor[grp_i],
+            op1=nl.add,
+            operand1=bufs.exp_section_sum[grp_i],
+        )
+        if not ac.skip_output_normalization:
+            nisa.reciprocal(bufs.exp_sum_reciprocal[:, grp_i], bufs.exp_running_sum[:, grp_i])
+    elif atp.num_sections != 1:
         if sp.section_idx > 0:
             nisa.tensor_copy(
                 bufs.prev_exp_running_sum[grp_i][...],
@@ -3818,54 +3947,7 @@ def _write_back_impl(
 
         if sp.section_idx > 0:
             # Load previous output, scale by flash_attn_correction_factor and accumulate
-            for d_tile in range(num_d_tiles_iter):
-                d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
-                d_offset = d_tile * d_tile_size
-                if ac.tp_out:
-                    prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
-                    o_src_pat = o.ap(
-                        pattern=[[ac.seqlen_q, d], [1, num_f]],
-                        offset=batch_id * ac.d_v * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
-                    )
-                    nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
-
-                    nisa.nc_transpose(
-                        bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile].ap(
-                            pattern=[[atp.sb_p, d], [1, atp.sb_p]], offset=0
-                        ),
-                        bufs.flash_attn_correction_factor[grp_i][0 : atp.sb_p, 0:1].broadcast(dim=1, size=d),
-                    )
-                    nisa.tensor_copy(
-                        bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
-                        bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile][:d, :num_f],
-                    )
-                    nisa.tensor_tensor(
-                        bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
-                        bufs.mm2_prev_output[grp_i][d_tile][:d, :num_f],
-                        bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
-                        nl.multiply,
-                    )
-                    nisa.tensor_tensor(
-                        bufs.mm2_accum_flash_attn[grp_i][d_tile][:d, :num_f],
-                        bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
-                        bufs.mm2_sb[grp_i][d_tile][:d, :num_f],
-                        nl.add,
-                    )
-                else:
-                    prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[d, num_p], [1, d]], offset=0)
-                    o_src_pat = o.ap(
-                        pattern=[[ac.d_v, num_p], [1, d]],
-                        offset=batch_id * ac.seqlen_q * ac.d_v + grp_i * atp.sb_p * ac.d_v + d_offset,
-                    )
-                    nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
-                    nisa.scalar_tensor_tensor(
-                        bufs.mm2_accum_flash_attn[grp_i][d_tile][:num_p, :d],
-                        data=bufs.mm2_prev_output[grp_i][d_tile][:num_p, :d],
-                        op0=nl.multiply,
-                        operand0=bufs.flash_attn_correction_factor[grp_i][:num_p, 0],
-                        op1=nl.add,
-                        operand1=bufs.mm2_sb[grp_i][d_tile][:num_p, :d],
-                    )
+            _accum_prev_output_impl(o, grp_i, ac, atp, bufs, batch_id, num_p, num_f)
             if sp.section_idx == atp.num_sections - 1 or is_last_section_with_compute:
                 if ac.skip_output_normalization:
                     _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -3875,13 +3957,73 @@ def _write_back_impl(
                     )
             else:
                 _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
+    elif ac.chained:
+        # lingbot: the earlier call's output (chain_o), rescaled to the new max, plus this call's
+        _accum_prev_output_impl(bufs.chain_o, grp_i, ac, atp, bufs, batch_id, num_p, num_f)
+        if ac.skip_output_normalization:
+            _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
+        else:
+            _scale_reciprocal_write_back_impl(
+                bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f
+            )
     else:
         if ac.skip_output_normalization:
             _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
         else:
             _scale_reciprocal_write_back_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f)
+def _accum_prev_output_impl(src_o, grp_i, ac: AttnConfig, atp: AttnTileParams, bufs, batch_id, num_p, num_f):
+    """mm2_accum_flash_attn[grp_i] = src_o's tile of Q group grp_i (an earlier section's output, or a
+    chained call's chain_o) x flash_attn_correction_factor + mm2_sb[grp_i] (this section's output)."""
+    num_d_tiles_iter = atp.num_d_tiles_v if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim_v if ac.tp_out else atp.d_tile_size_free_dim
+    for d_tile in range(num_d_tiles_iter):
+        d = min(d_tile_size, ac.d_v - d_tile * d_tile_size)
+        d_offset = d_tile * d_tile_size
+        if ac.tp_out:
+            prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
+            o_src_pat = src_o.ap(
+                pattern=[[ac.seqlen_q, d], [1, num_f]],
+                offset=batch_id * ac.d_v * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
+            )
+            nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
 
-
+            nisa.nc_transpose(
+                bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile].ap(
+                    pattern=[[atp.sb_p, d], [1, atp.sb_p]], offset=0
+                ),
+                bufs.flash_attn_correction_factor[grp_i][0 : atp.sb_p, 0:1].broadcast(dim=1, size=d),
+            )
+            nisa.tensor_copy(
+                bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
+                bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile][:d, :num_f],
+            )
+            nisa.tensor_tensor(
+                bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
+                bufs.mm2_prev_output[grp_i][d_tile][:d, :num_f],
+                bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
+                nl.multiply,
+            )
+            nisa.tensor_tensor(
+                bufs.mm2_accum_flash_attn[grp_i][d_tile][:d, :num_f],
+                bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
+                bufs.mm2_sb[grp_i][d_tile][:d, :num_f],
+                nl.add,
+            )
+        else:
+            prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[d, num_p], [1, d]], offset=0)
+            o_src_pat = src_o.ap(
+                pattern=[[ac.d_v, num_p], [1, d]],
+                offset=batch_id * ac.seqlen_q * ac.d_v + grp_i * atp.sb_p * ac.d_v + d_offset,
+            )
+            nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
+            nisa.scalar_tensor_tensor(
+                bufs.mm2_accum_flash_attn[grp_i][d_tile][:num_p, :d],
+                data=bufs.mm2_prev_output[grp_i][d_tile][:num_p, :d],
+                op0=nl.multiply,
+                operand0=bufs.flash_attn_correction_factor[grp_i][:num_p, 0],
+                op1=nl.add,
+                operand1=bufs.mm2_sb[grp_i][d_tile][:num_p, :d],
+            )
 def _scale_reciprocal_write_back_impl(
     src_bufs,
     grp_i,
@@ -3956,6 +4098,13 @@ def _write_back_o_impl(src_bufs, grp_i, ac: AttnConfig, atp: AttnTileParams, o, 
                 offset=batch_id * ac.d_v * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
             )
             src_pat = src_buf.ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
+        elif ac.q_major_bs > 0:
+            # lingbot: q_major, o is (seqlen_q, bs, d_v): row q of head batch_id at q * bs * d_v
+            o_dst_pat = o.ap(
+                pattern=[[ac.q_major_bs * ac.d_v, num_p], [1, d]],
+                offset=grp_i * atp.sb_p * ac.q_major_bs * ac.d_v + batch_id * ac.d_v + d_offset,
+            )
+            src_pat = src_buf.ap(pattern=[[d, num_p], [1, d]], offset=0)
         else:
             o_dst_pat = o.ap(
                 pattern=[[ac.d_v, num_p], [1, d]],
@@ -4139,7 +4288,12 @@ def _k_tile_mask_branch(qkmax_grp, tile, should_process, ac: AttnConfig, atp: At
     return kvp_tile_fully_visible, diagonal_sel_mask
 
 
-def _row_max_on_scalar(kvp_tile_fully_visible, diagonal_sel_mask, tile, atp: AttnTileParams):
+def _prior_needs_mask(tile, ac: AttnConfig):
+    """lingbot: a prior K tile needs the dynamic prior_used_len mask unless the whole prior is used."""
+    return tile.is_prior and not ac.prior_full
+
+
+def _row_max_on_scalar(kvp_tile_fully_visible, diagonal_sel_mask, tile, atp: AttnTileParams, ac: AttnConfig):
     """Whether this k-tile evicts MM1 with a tensor_scalar-style instruction, which ``activate2`` can run
     on the Scalar Engine. ``range_select`` (the dynamic/prior mask) and the interleaved-KV
     three-instruction path are Vector-only. Branch order mirrors the Step-3 emit loop.
@@ -4147,7 +4301,7 @@ def _row_max_on_scalar(kvp_tile_fully_visible, diagonal_sel_mask, tile, atp: Att
     if diagonal_sel_mask:
         # The range_select form of the diagonal mask is Vector-only, like the dynamic one below.
         return not atp.static_causal_range_sel
-    if (atp.dynamic_sel_mask or tile.is_prior) and not kvp_tile_fully_visible:
+    if (atp.dynamic_sel_mask or _prior_needs_mask(tile, ac)) and not kvp_tile_fully_visible:
         return False
     return True  # no masking
 
@@ -4220,7 +4374,7 @@ def _row_max_chain_endpoints(k_tile_selections, ac: AttnConfig, atp: AttnTilePar
         on_scalar = False
         if split_by_engine:
             kvp_visible, diagonal = _k_tile_mask_branch(qkmax_grp, tile_info, should_process, ac, atp)
-            on_scalar = _row_max_on_scalar(kvp_visible, diagonal, tile_info, atp)
+            on_scalar = _row_max_on_scalar(kvp_visible, diagonal, tile_info, atp, ac)
         first_tile = chains[on_scalar][0] if on_scalar in chains else k_tile_idx
         chains[on_scalar] = (first_tile, k_tile_idx)
     if num_executed < 2:
@@ -4337,7 +4491,7 @@ def _qk_and_max_large_tile_impl(
         # only on the last; when not chaining, every tile resets and reads out (per-tile reduce). The
         # chain is per engine because ACT and DVE hold separate reduce accumulators.
         row_max_on_scalar = use_scalar_row_max and _row_max_on_scalar(
-            kvp_tile_fully_visible, diagonal_sel_mask, tile, atp
+            kvp_tile_fully_visible, diagonal_sel_mask, tile, atp, ac
         )
         row_max_chain = row_max_chains.get(row_max_on_scalar) if row_max_chains is not None else None
         row_max_reduce_cmd = (
@@ -4407,7 +4561,7 @@ def _qk_and_max_large_tile_impl(
             )
 
         elif (
-            atp.dynamic_sel_mask or tile.is_prior
+            atp.dynamic_sel_mask or _prior_needs_mask(tile, ac)
         ) and not kvp_tile_fully_visible:  # dynamic (compile-time unknown) mask
             if ac.kvp_group_size > 0 and not tile.is_prior and bufs.k_threshold_sb is not None:
                 # Static mask path for interleaved KV (3 instructions)

@@ -42,6 +42,52 @@ CASES = [  # (name, lq, prior keys, active keys)
 ]
 
 KB = int(os.environ.get("K_BLOCKS", "1"))
+QM = os.environ.get("Q_MAJOR", "0") == "1"
+QROWS = int(os.environ.get("QROWS", "0"))   # >0: the vendored call gets only the first QROWS rows
+if QM or QROWS:
+    # vendored kernel with q_major outputs (Q_MAJOR=1) and / or fewer (unpadded) query rows (QROWS)
+    # vs nkilib on the 128-padded queries; the outputs are compared on the vendored call's rows.
+    def call_qm(q, k, v, kp=None, vp=None):
+        kw = {}
+        if kp is not None:
+            kw = dict(k_prior=kp, v_prior=vp,
+                      prior_used_len=torch.full((1,), int(vp.shape[1]), dtype=torch.int32, device=q.device))
+        if QM:
+            kw["q_major"] = True
+        return A_LOC(q, k, v, scale=1.0, causal_mask=False, tp_q=True, tp_k=False, tp_out=False,
+                     cache_softmax=True, skip_output_normalization=True, **kw)
+    for name, lq, lp, la in CASES:
+        lq_l = min(QROWS, lq) if QROWS else lq
+        q = (r(n, lq, d) * 0.088).to(torch.bfloat16)
+        q[:, lq_l:] = 0          # the reference sees zero padding rows, as cte_prep_q pads
+        k, v = r(n, d, la), r(n, la, d)
+        kp, vp = (r(n, d, lp), r(n, lp, d)) if lp else (None, None)
+        a_ref = [t.to(dev) if t is not None else None for t in (q, k, v, kp, vp)]
+        a_loc = [t.to(dev) if t is not None else None
+                 for t in (q[:, :lq_l].contiguous(), k, v, kp, vp)]
+        f_ref = torch.compile(lambda *a: call(A_REF, *a), backend="neuron", fullgraph=True, dynamic=False)
+        f_loc = torch.compile(call_qm, backend="neuron", fullgraph=True, dynamic=False)
+        with torch.no_grad():
+            o_ref = [t.float().cpu() for t in f_ref(*a_ref)]
+            o_loc = [t.float().cpu() for t in f_loc(*a_loc)]
+        torch.neuron.synchronize()
+        o_r, m_r, s_r = o_ref
+        o_l, m_l, s_l = o_loc
+        G = int(m_r.shape[2])
+        if QM:
+            o_l = o_l.permute(1, 0, 2)                                   # [n, Lq, d]
+            m_l = m_l.t().reshape(n, -1, 128).transpose(1, 2)            # [n, 128, G_l]
+            s_l = s_l.t().reshape(n, -1, 128).transpose(1, 2)
+        rows = lambda t: t.transpose(1, 2).reshape(n, -1)[:, :lq_l]      # noqa: E731
+        pairs = (("out", o_r[:, :lq_l], o_l[:, :lq_l]), ("max", rows(m_r), rows(m_l)),
+                 ("sum", rows(s_r), rows(s_l)))
+        msg = []
+        for lbl, a, b in pairs:
+            dd = (a - b).abs()
+            msg.append(f"{lbl}: equal={torch.equal(a, b)} ndiff={int((dd > 0).sum())}/{dd.numel()} "
+                       f"max|d|={dd.max().item():.3e}")
+        print(f"[bitcmp] q_major={QM} rows={lq_l}/{lq} G={G} {name:30s} " + " | ".join(msg), flush=True)
+    sys.exit(0)
 if KB > 1:
     # vendored kernel with K in rank-blocked memory (k_blocks) vs nkilib on the plain layout
     def blocked(k):

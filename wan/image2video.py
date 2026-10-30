@@ -153,6 +153,24 @@ def _checksums(mv, nthreads, block=1 << 20):
     return tuple(_KEY_POOL.map(one, range(0, total, step)))
 
 
+# LINGBOT_SCHED_FUSE=1 (LINGBOT_HOST_SCHED): a denoise step's x0 = x_t - sigma * v and the next step's input
+# alpha * x0 + sigma' * noise in ONE compiled graph instead of ~5 eager device ops (q26 device timeline: ~7
+# executions of 17-27 us with ~30 us gaps each per step). The sigmas are host floats, so the graph is specialised per
+# step (3 graphs).
+_SCHED_FUSE = os.environ.get("LINGBOT_SCHED_FUSE", "0") == "1"
+_SCHED_STEP = None
+
+
+def _sched_step_fn():
+    global _SCHED_STEP
+    if _SCHED_STEP is None:
+        def _step(v, xt, sig, noise, a, s):
+            x0 = (xt - sig * v).to(v.dtype)
+            return x0, a * x0 + s * noise
+        _SCHED_STEP = torch.compile(_step, backend="neuron", fullgraph=True, dynamic=False)
+    return _SCHED_STEP
+
+
 def encode_key(img, F, h, w):
     """Cache key of a conditioning encode: (image size, F, h, w, checksums of all image bytes).
 
@@ -634,6 +652,10 @@ class WanI2VCausal:
         max_seq_len = chunk_size * frame_seqlen
         head_dim = cfg.dim // cfg.num_heads
         local_num_heads = cfg.num_heads // self.heads_div
+        if os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1":
+            # Before the first compiled block call, so the graphs take the statistics tensors.
+            from wan.modules.model_fast import rowmax_graph_alloc
+            rowmax_graph_alloc(self.model.blocks, local_num_heads, self.device)
 
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
@@ -902,6 +924,25 @@ class WanI2VCausal:
         gen_fn = (self._generate_causal_fast
                   if self.infer_mode == "causal_fast"
                   else self._generate_causal_pretrain)
+        # LINGBOT_GC_OFF=1: no cyclic garbage collection inside a generation (re-enabled after it). In the q26 device
+        # timeline the device idled 1-9 ms at a time in chunks 0-2, while the host was barely ahead of it; a collector
+        # pause there leaves the device queue empty. Generation allocates few reference cycles.
+        _gc_off = os.environ.get("LINGBOT_GC_OFF", "0") == "1" and gc.isenabled()
+        if _gc_off:
+            gc.disable()
+        try:
+            return self._call_gen(gen_fn, input_prompt, img, action_path, chunk_size, max_area, target_hw,
+                                  denoise_steps, frame_num, timesteps_index, shift, seed, offload_model,
+                                  max_sequence_length, max_attention_size, save_latents_path, prompt_embeds_path,
+                                  prompt_embeds, return_latents, extra)
+        finally:
+            if _gc_off:
+                gc.enable()
+
+    @staticmethod
+    def _call_gen(gen_fn, input_prompt, img, action_path, chunk_size, max_area, target_hw, denoise_steps,
+                  frame_num, timesteps_index, shift, seed, offload_model, max_sequence_length, max_attention_size,
+                  save_latents_path, prompt_embeds_path, prompt_embeds, return_latents, extra):
         return gen_fn(
             input_prompt,
             img,
@@ -1047,20 +1088,41 @@ class WanI2VCausal:
         self._gen_sub = []
         _sub_t = [_g0]
 
+        # LINGBOT_HOST_TRACE=1 (diagnostic, no device sync): host time at each pre-loop marker, logged by rank 0
+        _host_trace = [] if os.environ.get("LINGBOT_HOST_TRACE", "0") == "1" else None
+
         def _sub(name):
+            if _host_trace is not None:
+                _host_trace.append((name, (time.perf_counter() - _g0) * 1000.0))
             if _sub_on:
                 torch.neuron.synchronize()
                 _t = time.perf_counter()
                 self._gen_sub.append((name, (_t - _sub_t[0]) * 1000.0))
                 _sub_t[0] = _t
-        noise = torch.randn(
-            16,
-            lat_f,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device='cpu').to(self.device)
+        # LINGBOT_START_OVERLAP=1: the generation's host-side setup work -- the seeded CPU noise draws (the initial
+        # noise and, with LINGBOT_PREUPLOAD, every per-step draw, in the same order on the same generator) and the
+        # encode cache key's checksums -- runs in background threads while this thread issues the device work; the
+        # camera FiLM precompute (LINGBOT_FILM_ALL) is issued right after the Plucker condition; and the pre-loop
+        # timing syncs are skipped. In the q26 device timeline the first block started 248 ms into GEN, with ~90 ms
+        # of it the device idle waiting for that host work. Same values (same draws, same graphs).
+        _overlap = (os.environ.get("LINGBOT_START_OVERLAP", "0") in ("1", "2") and chunk_control is None
+                    and max_chunks is None)
+        _bg = _draw_fut = _ek_fut = None
+        if _overlap:
+            from concurrent.futures import ThreadPoolExecutor
+            _bg = ThreadPoolExecutor(2)
+            _ek_fut = _bg.submit(encode_key, img, F, h, w)
+            noise = None
+        else:
+            noise = torch.randn(
+                16,
+                lat_f,
+                lat_h,
+                lat_w,
+                dtype=torch.float32,
+                generator=seed_g,
+                device='cpu').to(self.device)
+        _noise_shape = (16, int(lat_f), int(lat_h), int(lat_w))
 
         _sub("noise")
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
@@ -1090,6 +1152,27 @@ class WanI2VCausal:
             logging.info(f"denoise steps: {len(timesteps_index)} "
                          f"(timesteps_index={timesteps_index})")
         timesteps = self.scheduler.timesteps[timesteps_index]
+        if _overlap:
+            # the initial noise, then (LINGBOT_PREUPLOAD) the loop's per-step draws: the generator's order of the
+            # synchronous path (nothing else draws from seed_g before the loop)
+            _n_pre = (-(-int(lat_f) // chunk_size)) * (len(timesteps) - 1)
+            _shape_pre = (16, min(chunk_size, int(lat_f)), int(lat_h), int(lat_w))
+            if os.environ.get("LINGBOT_PREUPLOAD", "0") != "1":
+                _n_pre = 0
+
+            _up_in_thread = os.environ.get("LINGBOT_START_OVERLAP", "0") == "2"
+
+            def _draw_all():
+                n0 = torch.randn(*_noise_shape, dtype=torch.float32, generator=seed_g, device='cpu')
+                d = [torch.randn(_shape_pre, generator=seed_g, device='cpu', dtype=torch.float32)
+                     for _ in range(_n_pre)]
+                st = torch.stack(d) if d else None
+                if _up_in_thread:
+                    # LINGBOT_START_OVERLAP=2: the host-to-device copies too, off the issuing thread
+                    n0 = n0.to(self.device)
+                    st = st.to(self.device) if st is not None else None
+                return n0, st
+            _draw_fut = _bg.submit(_draw_all)
 
         # preprocess
         # T5 cache: skip the encoder entirely if we've seen this exact prompt
@@ -1173,7 +1256,22 @@ class WanI2VCausal:
             c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
 
         _sub("plucker_rearrange")
-        torch.neuron.synchronize()
+        _cam_tuples_early = None
+        if (_overlap and os.environ.get("LINGBOT_FILM_ALL", "0") == "1"
+                and hasattr(self.model, "precompute_films")):
+            # LINGBOT_START_OVERLAP: the FiLM precompute of the loop setup below, issued now (same tuples, same
+            # contexts as the loop: autocast + no_grad)
+            _nic = int(lat_f) // chunk_size
+            _cpe = c2ws_plucker_emb.split(chunk_size, dim=2)
+            assert len(_cpe) == _nic, (len(_cpe), _nic)
+            _cam_tuples_early = [_cpe[min(k_, _nic - 1)].chunk(1, dim=0) for k_ in range(_nic)]
+            with torch.amp.autocast('neuron', dtype=self.param_dtype), torch.no_grad():
+                self.model.precompute_films(_cam_tuples_early, c2ws_plucker_emb,
+                                            (chunk_size, lat_h // self.patch_size[1],
+                                             lat_w // self.patch_size[2]))
+            _sub("film_issued")
+        if not _overlap:
+            torch.neuron.synchronize()
         self._gen_phase["ctx"] += time.perf_counter() - _g0
         _e0 = time.perf_counter()
         # CACHED. Measured at 12.2 s -- 36% of GEN and 2.6x the whole VAE decode -- and
@@ -1187,7 +1285,8 @@ class WanI2VCausal:
         #   2. The ENCODER is not width-sharded. shard_vae_decoder_width is only ever
         #      applied to vae.model.decoder, so this runs at single-core width and
         #      redundantly on all 32 ranks.
-        _ek = encode_key(img, F, h, w)
+        _ek = _ek_fut.result() if _ek_fut is not None else encode_key(img, F, h, w)
+        _sub("encode_key")
         _ec = getattr(self, "_encode_cache", None)
         if _ec is not None and _ec[0] == _ek:
             y = _ec[1].clone()
@@ -1200,7 +1299,8 @@ class WanI2VCausal:
                                          self.device)
             y = torch.concat([msk, y])
             self._encode_cache = (_ek, y.clone())
-        torch.neuron.synchronize()
+        if not _overlap:
+            torch.neuron.synchronize()
         self._gen_phase["encode"] += time.perf_counter() - _e0
         _sub_t[0] = time.perf_counter() - (time.perf_counter() - _e0)
         _sub("encode")
@@ -1216,7 +1316,7 @@ class WanI2VCausal:
         _k0 = time.perf_counter()
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
-        frame_seqlen = int(noise.shape[-2] * noise.shape[-1]// 4)
+        frame_seqlen = int(_noise_shape[-2] * _noise_shape[-1] // 4)
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
         else:
@@ -1237,8 +1337,10 @@ class WanI2VCausal:
                                                           shape=cross_kv_shape,
                                                           dtype=transformer_dtype,
                                                           device=self.device)
-        torch.neuron.synchronize()
+        if not _overlap:
+            torch.neuron.synchronize()
         self._gen_phase["kvinit"] += time.perf_counter() - _k0
+        _sub("kvinit")
         # evaluation mode
         with (
                 torch.amp.autocast('neuron', dtype=self.param_dtype),
@@ -1246,6 +1348,13 @@ class WanI2VCausal:
                 no_sync_model(),
         ):
             # sample videos
+            _pre_draws = None
+            if _draw_fut is not None:
+                _n0, _pre_draws = _draw_fut.result()
+                _sub("draws")
+                noise = _n0 if _n0.device.type != "cpu" else _n0.to(self.device)
+                _bg.shutdown(wait=False)
+                _sub("noise_up")
             latent = noise
             self._dit_fwd_ms = []
             self.model._fwd_phase_log = []
@@ -1286,9 +1395,17 @@ class WanI2VCausal:
             if (os.environ.get("LINGBOT_PREUPLOAD", "0") == "1" and chunk_control is None
                     and max_chunks is None and n_chunks <= num_inference_chunk):
                 _shape = tuple(latents_chunk[0].shape)
-                _draws = [torch.randn(_shape, generator=seed_g, device='cpu', dtype=torch.float32)
-                          for _ in range(n_chunks * (len(timesteps) - 1))]
-                _pre_noise = (torch.stack(_draws).to(self.device) if _draws else None)
+                if _draw_fut is not None:
+                    # LINGBOT_START_OVERLAP: drawn in the background thread, same order and shapes
+                    assert _shape == _shape_pre and _n_pre == n_chunks * (len(timesteps) - 1), \
+                        (_shape, _shape_pre, _n_pre)
+                    _pre_noise = (None if _pre_draws is None else
+                                  _pre_draws if _pre_draws.device.type != "cpu" else _pre_draws.to(self.device))
+                    _sub("prenoise_up")
+                else:
+                    _draws = [torch.randn(_shape, generator=seed_g, device='cpu', dtype=torch.float32)
+                              for _ in range(n_chunks * (len(timesteps) - 1))]
+                    _pre_noise = (torch.stack(_draws).to(self.device) if _draws else None)
                 _pre_t = [torch.stack([timesteps[i]]).to(self.device) for i in range(len(timesteps))]
                 _pre_commit_t = torch.stack([timesteps[-1] * 0.0]).to(self.device)
             # LINGBOT_FUSE_COMMIT=1: run each chunk's KV-cache commit inside the NEXT chunk's first
@@ -1299,7 +1416,9 @@ class WanI2VCausal:
             # LINGBOT_FILM_ALL=1: every chunk's camera FiLM params in one graph before the loop;
             # the loop then passes the same condition tuples, which index them.
             _cam_tuples = None
-            if (os.environ.get("LINGBOT_FILM_ALL", "0") == "1" and chunk_control is None
+            if _cam_tuples_early is not None:
+                _cam_tuples = _cam_tuples_early      # LINGBOT_START_OVERLAP: precomputed after the Plucker condition
+            elif (os.environ.get("LINGBOT_FILM_ALL", "0") == "1" and chunk_control is None
                     and max_chunks is None and hasattr(self.model, "precompute_films")):
                 _cam_tuples = [c2ws_plucker_emb_chunk[min(k_, num_inference_chunk - 1)].chunk(1, dim=0)
                                for k_ in range(n_chunks)]
@@ -1393,6 +1512,8 @@ class WanI2VCausal:
                     # the device sync that the next host-side read forces anyway, so it
                     # attributes queueing to the forward rather than hiding it.
                     self.model._t_host_key = float(current_timestep[0])
+                    if chunk_id == 0 and timestep_idx == 0:
+                        _sub("first_fwd")
                     _sync()
                     _f0 = time.perf_counter()
                     with _fwd_ctx():
@@ -1424,6 +1545,8 @@ class WanI2VCausal:
                         _sync()
                     self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                     self._dit_fwd_tag.append(f"c{chunk_id}s{timestep_idx}{_ftag}")
+                    if chunk_id == 0 and timestep_idx == 0:
+                        _sub("first_fwd_issued")
                     _maybe_dump(f"c{chunk_id}s{timestep_idx}", noise_pred)
                     self._cross_attn_initialized = True
 
@@ -1432,12 +1555,23 @@ class WanI2VCausal:
 
                     _sync()
                     _s0 = time.perf_counter()
-                    x0 = self._convert_flow_pred_to_x0(
-                        flow_pred=noise_pred,
-                        xt=current_latent,
-                        timestep=current_timestep[0],
-                        scheduler=self.scheduler,
-                    )
+                    _x0_args = None
+                    if (_SCHED_FUSE and noise_pred.device.type == "neuron"
+                            and os.environ.get("LINGBOT_HOST_SCHED", "1") == "1"
+                            and timestep_idx < len(timesteps) - 1):
+                        # LINGBOT_SCHED_FUSE: x0 is computed with the re-noising below, in one graph. Same host
+                        # sigma lookup as _convert_flow_pred_to_x0's host path.
+                        _ts_h = self.scheduler.timesteps.cpu().double()
+                        _tid = torch.argmin((_ts_h - current_timestep[0].cpu().double()).abs())
+                        _x0_args = (noise_pred, current_latent, float(self.scheduler.sigmas.cpu().double()[_tid]))
+                        x0 = current_latent      # placeholder for the dtype / shape check below
+                    else:
+                        x0 = self._convert_flow_pred_to_x0(
+                            flow_pred=noise_pred,
+                            xt=current_latent,
+                            timestep=current_timestep[0],
+                            scheduler=self.scheduler,
+                        )
                     _sync()
                     self._gen_phase["sched"] += time.perf_counter() - _s0
 
@@ -1470,7 +1604,11 @@ class WanI2VCausal:
                                 next_timestep.cpu() if torch.is_tensor(next_timestep) else next_timestep,
                                 _sch.timesteps.cpu())
                             _a, _s = _sch._sigma_to_alpha_sigma_t(_sig[_idx])
-                            current_latent = float(_a) * x0 + float(_s) * _noise
+                            if _x0_args is not None:
+                                # LINGBOT_SCHED_FUSE: x0 and the re-noised latent in one compiled graph
+                                x0, current_latent = _sched_step_fn()(*_x0_args, _noise, float(_a), float(_s))
+                            else:
+                                current_latent = float(_a) * x0 + float(_s) * _noise
                         else:
                             current_latent = self.scheduler.add_noise(
                                 x0, _noise, next_timestep)
@@ -1516,6 +1654,12 @@ class WanI2VCausal:
                 self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                 self._dit_fwd_tag.append(f"c{chunk_id}commit")
 
+            if os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1":
+                # LINGBOT_ROWMAX_GRAPH (diagnostic): this generation's per-layer, per-head row-max range.
+                from wan.modules.model_fast import rowmax_graph_report, rowmax_graph_reset
+                rowmax_graph_report(self.model.blocks, dist.get_rank() if dist.is_initialized() else 0)
+                rowmax_graph_reset(self.model.blocks)
+
             if self._dit_fwd_ms and (not dist.is_initialized() or dist.get_rank() == 0):
                 _m = sorted(self._dit_fwd_ms)
                 _tot = sum(_m) / 1000.0
@@ -1535,6 +1679,9 @@ class WanI2VCausal:
                 if getattr(self, "_gen_sub", None):
                     logging.info("[BENCH] pre-loop sub-phases (ms): " + " ".join(
                         f"{n}={ms:.1f}" for n, ms in self._gen_sub))
+                if _host_trace:
+                    logging.info("[BENCH] host trace (ms from GEN start): " + " ".join(
+                        f"{n}={ms:.1f}" for n, ms in _host_trace))
                 _pl = getattr(self.model, "_fwd_phase_log", None)
                 if _pl:
                     # LINGBOT_FWD_PHASES=1 (diagnostic): synced per-phase ms of each forward.
@@ -1893,6 +2040,15 @@ class WanI2VCausal:
         """
         n = (num_chunks(self.local_attn_size, chunk_size)
              if os.environ.get("LINGBOT_CHUNKED_KV", "0") == "1" else 0)
+        # LINGBOT_KV_REUSE=1 (chunked cache): keep the cache of the previous generate() call and hand it out again,
+        # instead of allocating and zero-filling 2 x layers x chunks buffers (3.5 GB, 320 executions, ~35 ms of the
+        # q26 device timeline) per generation. Every chunk slot is written by a commit forward before any later
+        # chunk reads it (the first chunk reads none), so their initial contents are never read.
+        _reuse_key = (num_layers, batch, kv_size, heads, head_dim, chunk_size, frame_seqlen, str(dtype),
+                      str(device), n)
+        _reuse = n and os.environ.get("LINGBOT_KV_REUSE", "0") == "1"
+        if _reuse and getattr(self, "_self_kv_reuse", None) is not None and self._self_kv_reuse[0] == _reuse_key:
+            return self._self_kv_reuse[1]
         if n:
             # PER-LAYER layout, because a hot layer takes the exact-attention path and
             # reads [B, S, N, D] while its cold neighbours feed the const-max kernel and
@@ -1941,6 +2097,8 @@ class WanI2VCausal:
             logging.info(
                 f"self KV: chunked, {n} x {chunk_size * frame_seqlen} tokens, "
                 f"heads/rank={heads}, {chunk_bytes(cache) / 1e9:.2f} GB")
+            if _reuse:
+                self._self_kv_reuse = (_reuse_key, cache)
             return cache
         return self._initialize_self_kv_cache(
             num_layers=num_layers, shape=[batch, kv_size, heads, head_dim],
@@ -1988,6 +2146,13 @@ class WanI2VCausal:
         """
         from .modules.attention import cross_cache_shapes
         k_shape, v_shape = cross_cache_shapes(*shape)
+        # LINGBOT_KV_REUSE=1: the previous generation's buffers. The first forward of every generation
+        # (cross_attn_first_call=True) recomputes and writes all of them; is_init is not read when the caller
+        # passes cross_attn_first_call, which the chunk loop always does.
+        _key = (num_layers, tuple(k_shape), tuple(v_shape), str(dtype), str(device))
+        _reuse = os.environ.get("LINGBOT_KV_REUSE", "0") == "1"
+        if _reuse and getattr(self, "_cross_kv_reuse", None) is not None and self._cross_kv_reuse[0] == _key:
+            return self._cross_kv_reuse[1]
         crossattn_cache = []
         for _ in range(num_layers):
             k = torch.zeros(k_shape, dtype=dtype, device=device)
@@ -2002,7 +2167,8 @@ class WanI2VCausal:
                 'v': v,
                 'is_init': torch.tensor(0, dtype=torch.int32, device=device),
             })
-
+        if _reuse:
+            self._cross_kv_reuse = (_key, crossattn_cache)
         return crossattn_cache
 
     def _initialize_crossattn_cache_pretrain(self, num_layers, shape, dtype, device):

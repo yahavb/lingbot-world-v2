@@ -499,11 +499,35 @@ def cross_cache_shapes(batch, text_len, heads, head_dim):
     return (batch, text_len, heads, head_dim), (batch, text_len, heads, head_dim)
 
 
+# LINGBOT_CROSS_TPOUT=1 (vendored kernel, LINGBOT_CTE_LOCAL=1): the cross-attention call writes its
+# output as [n, d, Lq] (tp_out), the layout the output projection contracts over, instead of
+# [n, Lq, d] permuted to [Lq, n, d] in the graph. Same values (the output layout only).
+_CROSS_TPOUT = os.environ.get("LINGBOT_CROSS_TPOUT", "0") == "1"
+
+
+# LINGBOT_CROSS_QPAD=32: pad the cross-attention queries to a multiple of 32 rows instead of 128 (288 instead of 384
+# rows at 270 tokens per rank), as LINGBOT_CTE_QPAD does for the self-attention: the last query group holds 32 rows.
+_CROSS_QPAD = int(os.environ.get("LINGBOT_CROSS_QPAD", "128"))
+
+
 def cte_cross_attention_nmajor(q, k_ndl, v_nld, dtype=torch.bfloat16):
     """[1, Lq, n, d] queries against the N-major cross cache -> [1, Lq, n, d]. Same kernel call as
     _cte_attention (pre-scaled q padded to 128 rows, no bounds), with K already transposed
     (tp_k=False) instead of permuted from [1, L, n, d] on every call."""
-    q_c, lq = cte_prep_q(q, dtype)
+    if _CROSS_XLA:
+        # LINGBOT_CROSS_XLA=1 with the N-major cache: fp32 matmuls and softmax in the block graph
+        d = int(q.shape[-1])
+        qh = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2)              # [n, Lq, d]
+        p_ = torch.softmax(torch.matmul(qh, k_ndl.float()), dim=-1)               # [n, Lq, Lk]
+        return torch.matmul(p_, v_nld.float()).permute(1, 0, 2).unsqueeze(0).to(dtype)
+    q_c, lq = cte_prep_q(q, dtype, pad_to=_CROSS_QPAD)
+    if _CROSS_TPOUT:
+        assert os.environ.get("LINGBOT_CTE_LOCAL", "0") == "1", "LINGBOT_CROSS_TPOUT needs LINGBOT_CTE_LOCAL=1"
+        out = _attention_cte(q_c, k_ndl.to(dtype), v_nld.to(dtype), scale=1.0, causal_mask=False,
+                             tp_q=True, tp_k=False, tp_out=True)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out[:, :, :lq].permute(2, 0, 1).unsqueeze(0)
     out = _attention_cte(q_c, k_ndl.to(dtype), v_nld.to(dtype), scale=1.0, causal_mask=False,
                          tp_q=True, tp_k=False, tp_out=False)
     if isinstance(out, tuple):
@@ -511,23 +535,77 @@ def cte_cross_attention_nmajor(q, k_ndl, v_nld, dtype=torch.bfloat16):
     return out[:, :lq].permute(1, 0, 2).unsqueeze(0)
 
 
-def cte_prep_q(q, dtype=torch.bfloat16):
-    """[1, Lq, n, d] -> (pre-scaled N-major q padded to 128 rows [n, Lq_p, d], Lq)."""
+# LINGBOT_CTE_QMAJOR=1 (vendored kernel, LINGBOT_CTE_LOCAL=1): the self-attention calls return
+# query-major results (out [Lq, n, d], row max and sum [Lq_p, n]) and cte_merge merges them in that
+# layout. Profiled, the head-major merge spent ~200 us of Vector/Scalar time per block (768
+# 32-element stream transposes, ~280 one-partition copies) laying the [n, 128, groups] statistics
+# out against the output and permuting the result to [1, Lq, n, d]. Same fp32 merge, same order.
+_CTE_QMAJOR = os.environ.get("LINGBOT_CTE_QMAJOR", "0") == "1"
+# LINGBOT_CTE_QPAD=32: pad the self-attention queries to a multiple of 32 rows instead of 128 (288
+# instead of 384 rows at 270 tokens per rank). The kernel's last query group then holds 32 rows,
+# so its exp transposes and PV weight loads shrink 4x; the unnormalized kernel path takes any
+# seqlen_q (the padding rows of the statistics are dropped by the merge).
+_CTE_QPAD = int(os.environ.get("LINGBOT_CTE_QPAD", "128"))
+
+
+def cte_self_layout():
+    """(q_major, query padding) for the self-attention cte_partial / cte_merge calls. q_major
+    needs the vendored kernel (LINGBOT_CTE_LOCAL=1)."""
+    assert not _CTE_QMAJOR or os.environ.get("LINGBOT_CTE_LOCAL", "0") == "1", \
+        "LINGBOT_CTE_QMAJOR needs LINGBOT_CTE_LOCAL=1 (the vendored kernel)"
+    return _CTE_QMAJOR, _CTE_QPAD
+
+
+def cte_prep_q(q, dtype=torch.bfloat16, pad_to=128):
+    """[1, Lq, n, d] -> (pre-scaled N-major q padded to pad_to rows [n, Lq_p, d], Lq)."""
     b, lq, n, d = q.shape
     assert b == 1, "attention_cte path assumes batch_size=1 (heads occupy batch)"
     q_c = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2).contiguous().to(dtype)
-    pad_q = (128 - lq % 128) % 128
+    pad_q = (pad_to - lq % pad_to) % pad_to
     if pad_q:
         q_c = F.pad(q_c, (0, 0, 0, pad_q))
     return q_c, lq
 
 
-def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1):
+def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, q_major=False):
     """Unnormalized attention (out, row max, row sum) of one KV chunk -- or of two, with the
     second given as the kernel's prefix-caching prior (k_prior/v_prior, all of it used) -- for
     cte_merge. Two chunks in one call is the same softmax over their union, computed by the
     kernel's own online softmax instead of by cte_merge. k_blocks > 1 (vendored kernel only,
-    LINGBOT_K_BLOCKED): K and the K prior are in rank-blocked memory, see kernels/attention_cte_lb."""
+    LINGBOT_K_BLOCKED): K and the K prior are in rank-blocked memory, see kernels/attention_cte_lb.
+    q_major (vendored kernel only, LINGBOT_CTE_QMAJOR): out [Lq, n, d], max and sum [Lq_p, n]."""
+    d = int(q_c.shape[-1])
+    tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
+    kw = {}
+    if k_blocks > 1:
+        kw["k_blocks"] = int(k_blocks)
+    if q_major:
+        kw["q_major"] = True
+    if k_prior is not None:
+        lp = int(v_prior.shape[1])
+        kw.update(k_prior=k_prior, v_prior=v_prior,
+                  prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
+    o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
+                                   tp_q=True, tp_k=tp_k, tp_out=False,
+                                   cache_softmax=True, skip_output_normalization=True, **kw)
+    return o, -neg_max.float(), s.float()
+
+
+# LINGBOT_CTE_PRIOR_FULL=1 (vendored kernel): the self-attention calls always use their whole prior (the
+# cached chunk), so the kernel's prior K tiles skip the dynamic prior_used_len mask (range_select, Vector
+# only) and evict like the active tiles, on the Scalar or the Vector engine. Same values.
+_CTE_PRIOR_FULL = os.environ.get("LINGBOT_CTE_PRIOR_FULL", "0") == "1"
+
+
+def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, normalize=False,
+             v_token_major=False):
+    """One self-attention attention_cte call of the vendored kernel (LINGBOT_CTE_CHAIN), output in the
+    tp_out layout [n, d, Lq_p]. normalize=False: (out, neg_max, sum) -- unnormalized output and the
+    kernel's own [n, 128, groups] statistics -- for the next call's chain=. chain=(out, neg_max, sum)
+    of an earlier call over other keys with the same q_c: this call continues that call's online
+    softmax, so the last call of a chain returns the attention over the union of all the calls' keys.
+    normalize=True: the normalized output only. k_prior / v_prior and k_blocks as in cte_partial.
+    v_token_major (LINGBOT_V_TOKEN_MAJOR): V and the V prior hold [L, n, d] memory under the [n, L, d] shape."""
     d = int(q_c.shape[-1])
     tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
     kw = {}
@@ -537,10 +615,94 @@ def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1):
         lp = int(v_prior.shape[1])
         kw.update(k_prior=k_prior, v_prior=v_prior,
                   prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
-    o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
-                                   tp_q=True, tp_k=tp_k, tp_out=False,
-                                   cache_softmax=True, skip_output_normalization=True, **kw)
-    return o, -neg_max.float(), s.float()
+        if _CTE_PRIOR_FULL:
+            kw["prior_full"] = True
+    if chain is not None:
+        kw.update(chain_o=chain[0], chain_neg_max=chain[1], chain_sum=chain[2])
+    if v_token_major:
+        kw["v_token_major"] = True
+    if normalize:
+        out = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+                             tp_out=True, **kw)
+        return out[0] if isinstance(out, tuple) else out
+    return tuple(_attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+                                tp_out=True, cache_softmax=True, skip_output_normalization=True, **kw))
+
+
+# LINGBOT_CMAX=1 (see model_fast): constant-offset self-attention (kernels/attention_cmax_lb.py) in the layers whose
+# measured row-max range fits one offset: no row-max reduction and no transpose of the probabilities.
+_CMAX_KERNELS = None
+
+
+# LINGBOT_CMAX=1: kernels/attention_cmax_lb.py (the upstream per-block streams, plain K / V layouts only);
+# LINGBOT_CMAX=2: kernels/attention_cmax2_lb.py (whole-chunk loads, any K / V memory layout).
+_CMAX_MODE = int(os.environ.get("LINGBOT_CMAX", "0") or 0)
+
+
+def _cmax_kernels():
+    global _CMAX_KERNELS
+    if _CMAX_KERNELS is None:
+        from torch_neuronx.nki_hop import wrap_nki
+        if _CMAX_MODE == 2:
+            from kernels import attention_cmax2_lb as cm
+            _CMAX_KERNELS = {
+                "full1": wrap_nki(cm.cmax2_full_1),
+                "part1": wrap_nki(cm.cmax2_part_1),
+                "part2": wrap_nki(cm.cmax2_part_2),
+                "part3": wrap_nki(cm.cmax2_part_3),
+                "final1": wrap_nki(cm.cmax2_final_1),
+            }
+        else:
+            from kernels import attention_cmax_lb as cm
+            _CMAX_KERNELS = {
+                "full1": wrap_nki(cm.attention_cmax_1),
+                "part1": wrap_nki(cm.attention_cmax_part_1),
+                "part2": wrap_nki(cm.attention_cmax_part_2),
+                "part3": wrap_nki(cm.attention_cmax_part_3),
+                "final1": wrap_nki(cm.attention_cmax_final_1),
+            }
+    return _CMAX_KERNELS
+
+
+def _cmax_layout(k_blocks, v_token_major):
+    """The extra compile-time arguments of the LINGBOT_CMAX=2 kernels (the =1 kernels take plain layouts only)."""
+    if _CMAX_MODE == 2:
+        return (int(k_blocks), bool(v_token_major))
+    assert k_blocks == 1 and not v_token_major, "LINGBOT_CMAX=1 reads plain K / V layouts; use LINGBOT_CMAX=2"
+    return ()
+
+
+def cmax_prep_q(q, pad_to=128, dtype=torch.bfloat16):
+    """[1, Lq, n, d] -> (pre-scaled [n, d, Lq_p], queries zero-padded to a multiple of pad_to; Lq)."""
+    b, lq, n, d = q.shape
+    assert b == 1, "constant-offset path assumes batch_size=1 (heads occupy batch)"
+    q_t = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 2, 0).contiguous().to(dtype)
+    pad_q = (pad_to - lq % pad_to) % pad_to
+    if pad_q:
+        q_t = F.pad(q_t, (0, pad_q))
+    return q_t, lq
+
+
+def _cmax_arg(offset):
+    """The kernel's offset argument: a Python number (a compile-time constant) or a [128, 1] fp32 tensor (an input,
+    so one compiled graph serves every layer)."""
+    return offset if torch.is_tensor(offset) else float(offset)
+
+
+def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False):
+    """fp32 accumulator [n, Lq_p, d + 1] (unnormalized output and row sums) over up to 3 chunks (K [n, d, L],
+    V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say)."""
+    return _cmax_kernels()[f"part{len(k_chunks)}"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
+                                                   *_cmax_layout(k_blocks, v_token_major))
+
+
+def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False):
+    """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only)."""
+    k = _cmax_kernels()
+    lay = _cmax_layout(k_blocks, v_token_major)
+    if acc is None:
+        return k["full1"](q_t, kc, vc, _cmax_arg(offset), *lay)
+    return k["final1"](q_t, kc, vc, acc, _cmax_arg(offset), *lay)
 
 
 def xla_attention_rows(q, k_chunks, v_chunks, dtype=torch.bfloat16):
@@ -602,8 +764,34 @@ def cte_merge_rows(parts, dtype=torch.bfloat16):
     return out.permute(1, 0, 2).unsqueeze(0).to(dtype)
 
 
-def cte_merge(parts, lq, dtype=torch.bfloat16):
+def cte_merge_qmajor(parts, lq, dtype=torch.bfloat16):
+    """cte_merge over q_major cte_partial results (out [Lq_c, n, d], max / sum [Lq_p, n]): the
+    same fp32 ops in the same order on the first lq rows, returned as [1, lq, n, d]."""
+    outs = [p[0][:lq] for p in parts]
+    maxs = [p[1][:lq] for p in parts]
+    sums = [p[2][:lq] for p in parts]
+    if len(outs) == 1:
+        lam = [1.0 / sums[0]]
+    else:
+        m_all = maxs[0]
+        for m in maxs[1:]:
+            m_all = torch.maximum(m_all, m)
+        w = [torch.exp(m - m_all) for m in maxs]
+        den = w[0] * sums[0]
+        for wc, sc in zip(w[1:], sums[1:]):
+            den = den + wc * sc
+        inv = 1.0 / den
+        lam = [wc * inv for wc in w]
+    out = lam[0].unsqueeze(-1) * outs[0].float()
+    for l_, o in zip(lam[1:], outs[1:]):
+        out = out + l_.unsqueeze(-1) * o.float()
+    return out.unsqueeze(0).to(dtype)
+
+
+def cte_merge(parts, lq, dtype=torch.bfloat16, q_major=False):
     """Merge cte_partial results exactly as _cte_attention_chunks_merged does."""
+    if q_major:
+        return cte_merge_qmajor(parts, lq, dtype)
     outs = [p[0] for p in parts]
     maxs = [p[1] for p in parts]
     sums = [p[2] for p in parts]
@@ -620,7 +808,10 @@ def cte_merge(parts, lq, dtype=torch.bfloat16):
             den = den + wc * sc
         inv = 1.0 / den
         lam = [wc * inv for wc in w]
-    lam = [l_.transpose(1, 2).reshape(n, lq_p, 1) for l_ in lam]
+    if int(lam[0].shape[1]) * int(lam[0].shape[2]) == lq_p:
+        lam = [l_.transpose(1, 2).reshape(n, lq_p, 1) for l_ in lam]
+    else:   # LINGBOT_CTE_QPAD: queries not padded to whole 128-row groups
+        lam = [l_.transpose(1, 2).reshape(n, -1)[:, :lq_p].unsqueeze(-1) for l_ in lam]
     out = lam[0] * outs[0].float()
     for l_, o in zip(lam[1:], outs[1:]):
         out = out + l_ * o.float()

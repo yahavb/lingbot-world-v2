@@ -17,7 +17,8 @@ seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1`
 | This branch (`q11_host`, below) | `loop_engineering`, flags on | TP4 × CP16 | 4.01 | 0.77 | 4.78 | 16.94 |
 | This branch (`q14_vae2d`, below) | `loop_engineering`, flags on | TP4 × CP16 | 4.04 | 0.33 | 4.37 | 18.55 |
 | This branch (`q16_key`, below) | `loop_engineering`, flags on | TP4 × CP16 | 3.94 | 0.31 | 4.24 | 19.10 |
-| **This branch, latest** (`q20_kbnw`, below) | `loop_engineering`, flags on | TP4 × CP16 | **3.66** | **0.31** | **3.97** | **20.43** |
+| This branch (`q20_kbnw`, below) | `loop_engineering`, flags on | TP4 × CP16 | 3.66 | 0.31 | 3.97 | 20.43 |
+| **This branch, latest** (`q33_a`, below) | `loop_engineering`, flags on | TP4 × CP16 | **2.93** | **0.31** | **3.24** | **25.02** |
 
 **Measured: 1.36× end to end against `main` as it runs on this host (6.81 → 9.26 fps), 1.56× on
 GEN. Assumed: ~1.1× against `main` with its default `const_max_ag` kernel, which does not run
@@ -31,10 +32,16 @@ assumed baseline). Two of the steps are not bit-exact; see the next section.
 **Update: 4.24 s per video (19.10 fps), 2.81× against `main` as measured and 2.28× against the
 assumed `const_max_ag` baseline**, still 4 denoise steps.
 
-**Update, latest: 3.97 s per video (20.43 fps), 3.00× against `main` as measured and 2.44×
+**Update: 3.97 s per video (20.43 fps), 3.00× against `main` as measured and 2.44×
 against the assumed `const_max_ag` baseline**, still 4 denoise steps. The steps since `q16` change
 the attention kernel's data movement only, but not bit-exactly; see the numerics column and the
 note below the table.
+
+**Update, latest: 3.24 s per video (25.02 fps), 3.68× against `main` as measured and 2.99×
+against the assumed `const_max_ag` baseline**, still 4 denoise steps. Four runs of the final flag set
+gave 24.99–25.04 fps, so 25 fps is reached with no margin. The two large steps are the constant-offset
+attention in 34 of the 40 layers (`q25`) and the work before the first block (`q30`–`q33`). Since
+`q25`, repeat runs of one config are no longer bit-identical (rounding level; see Correctness).
 
 ## Toward 4.8 s per video, measured step by step (16 devices)
 
@@ -58,6 +65,14 @@ in the command below). Every video passes `tests/smoke_test_video.py`.
 | `q16_key` | encode-cache key: the image held in one memory block and hashed in place, checksums in 4 threads | 3.94 | 0.31 | 4.24 | 19.10 | latents bit-identical to `q15`; a repeat run gave 3.92 + 0.31 s (19.15 fps) |
 | `q18_vgroup` | attention: `attention_cte` vendored as `kernels/attention_cte_lb.py`; V tiles loaded 8 per DMA instead of one each | 3.74 | 0.30 | 4.04 | 20.07 | kernel output bitwise equal to nkilib's on random inputs at every DiT call shape (`kiro/attn_bitcmp.py`); block output (RMS 0.515) on all 64 ranks at lead 0: 44 bitwise equal, the rest max \|d\| 5.2e-3, rel. RMS ≤ 9.9e-5; latents 0.146 vs `q16`; a repeat run is bit-identical |
 | `q20_kbnw` | attention: K read in the CP all-gather's rank-block layout (no K permute); denoise steps attend the gathered K/V without writing the cache slot, which the commit forward writes | 3.66 | 0.31 | 3.97 | 20.43 | block output vs nkilib on all 64 ranks: lead 1 bitwise equal, leads 0 and 3 max \|d\| ≤ 5.2e-3 (rel. RMS ≤ 1.4e-4), lead 3 with the skipped write ≤ 6.2e-3 (7.9e-5); latents 0.139 vs `q16` (chunk 0: 0.013, chunk 6: 0.271), 0.131 vs `q18` |
+| `q21_chq` | attention: the self-attention calls chained in the kernel (each continues the previous call's online softmax, the last normalizes) instead of merged in the graph; cross-attention output in the projection's layout; queries padded to 32 rows instead of 128 | 3.47 | 0.31 | 3.78 | 21.45 | latents 0.138 vs `q20` (first frame 0.005, last 0.271) |
+| `q22_vtm` | V gathered and cached token-major, as the projection leaves it (no V permute after the CP gather) | 3.35 | 0.30 | 3.65 | 22.19 | latents 0.158 vs `q21_chq` (last frame 0.27–0.32) |
+| `q23_pf` | the kernel's prefix-cache prior always whole (no dynamic length mask on its K tiles) | 3.34 | 0.30 | 3.64 | 22.23 | block output bitwise equal |
+| `q24_ior256` | runtime I/O descriptor cache of 256 entries (`NEURON_RT_IO_RING_CACHE_SIZE=256`) | 3.30 | 0.30 | 3.60 | 22.49 | latents bitwise equal to `q23_pf` |
+| `q25_cmax_ior` | constant-offset self-attention in the 34 layers whose softmax row maxes stay within [−8.3, 71.5] (`LINGBOT_CMAX=2`, offset 30; see below) | 3.06 | 0.30 | 3.36 | 24.12 | block output vs the exact chained calls: rel. RMS ≤ 1.4e-3 on all 64 ranks; latents 0.151 vs `q23_pf` (last frame 0.26) |
+| `q26_ior1024` | descriptor cache of 1024 entries | 3.04 | 0.31 | 3.35 | 24.21 | runtime only |
+| `q30_start` | KV caches kept across generations instead of new zero-filled ones; host setup (seeded noise draws, encode-cache key) in background threads; the camera FiLM precompute issued right after the Plücker condition; no syncs before the chunk loop | 2.99 | 0.30 | 3.29 | 24.62 | same draws and graphs; latents 0.083 vs `q26`, the size of the run-to-run spread (0.058 between `q33_a` and `q33_b`) |
+| `q33_a` | camera embedding MLP on each CP rank's own tokens only; a denoise step's x0 and re-noised input in one compiled graph; no garbage collection inside a generation | 2.93 | 0.31 | 3.24 | 25.02 | latents of `q33_b` 0.150 vs `q23_pf` (last frame 0.27); repeats `q33_b` 2.93 + 0.30 s (25.03 fps), `q34_up` 2.94 + 0.30 s (24.99), `q34_upemb` 2.93 + 0.30 s (25.04) |
 
 **The VAE width padding changed the video.** At 64 ranks the width-sliced decode pads the 96-wide
 latent to 128 by replicating its last column, and the replicated columns reach into the real ones
@@ -84,8 +99,33 @@ row max bitwise equal. End to end, `q20` drifts from `q16` by 0.139 (rel. RMS of
 inside the range of the accepted rounding changes above (`q6` 0.078, `q8` 0.157, `q10` 0.163,
 `q15` 0.125) and of the layout control (0.134), and its video passes the smoke test.
 
+**The constant-offset attention (`q25`).** The online softmax spends part of every kernel call on the
+running row max, the rescaling of the accumulator and a transpose of the probabilities. A diagnostic
+run (`LINGBOT_ROWMAX_GRAPH=1`) recorded each layer's per-head softmax row maxes over a whole
+generation on all 64 ranks: 34 layers stay within [−8.3, 71.5], while layers 2, 13, 33, 34, 38 and
+39 reach 126–864 in one or two heads. The 34 layers compute softmax(QKᵀ − 30)·V with an fp32
+[V | 1] accumulator (`kernels/attention_cmax2_lb.py`, one call over the cached chunks and one over
+the new chunk). That is the exact softmax up to rounding while every row max m satisfies
+−85 < m − 30 < 78 (no underflow of a whole row, no overflow of exp or of its fp32 sums over the
+17280-key window), a margin of at least 36 on both sides of the measured range. The other six layers
+keep the exact chained `attention_cte` calls. One core, four chunks: 0.35–0.37 ms instead of
+0.70 ms; the block at lead 3: 1.97 instead of 2.31 ms. A version with one offset per layer, passed to
+the block as a tensor, tracked the exact path through chunk 3 and then diverged (latents 0.461 vs
+`q23_pf`, last frame 0.95); the cause was not found and it was dropped.
+
+**The start of a generation (`q30`–`q33`).** In a rank-0 runtime system profile of `q26`
+(`SYSPROF_DIR`, `kiro/sysprof_gaps.py`) the first block ran 248 ms into GEN: 320 KV-cache zero
+fills (~35 ms), the cross-attention cache fills (~11 ms), ~90 ms of gaps while the device waited for
+host work (the seeded CPU noise draws and their upload; other ranks at the first block's barrier) and
+the 66 ms FiLM graph issued after them. With the `q33` flags the first block starts ~150 ms in. The
+steady host trace of `q34_up` (`LINGBOT_HOST_TRACE=1`) shows the Plücker graph issued by 31 ms, the
+FiLM graph by 59 ms and the first forward at 140 ms, after the background thread's 7.7 M normal
+samples. One run with the `q33` flags (`q30_startfs`) took 6.30 s of GEN with 0.7 s of host time;
+the same flags gave 2.90 s under the system profile and 2.93–2.94 s in four more runs. The cause of
+that run was not found.
+
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo q20_kbnw TP=4 CP=16 \
+bash /work/repo/kiro/run_job16.sh /work/repo q33_a TP=4 CP=16 \
   ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte LINGBOT_SP=1 LINGBOT_CTE_MERGE=1 LINGBOT_FILM_A2A=1 \
   NEURON_LAUNCH_BLOCKING=0 LINGBOT_LOAD_CONCURRENCY=16 LINGBOT_SKIP_LAST_COMMIT=1 LINGBOT_NO_SYNC=1 \
   LINGBOT_TOKEN_PAD=32 LINGBOT_ATTN_EARLY=2 LINGBOT_ATTN_PAIR=1 LINGBOT_PLUCKER_COMPILE=1 \
@@ -94,9 +134,25 @@ bash /work/repo/kiro/run_job16.sh /work/repo q20_kbnw TP=4 CP=16 \
   LINGBOT_VAE_FUSED=1 LINGBOT_VAE_BF16=1 LINGBOT_VAE_CC_FLAGS=-O1 LINGBOT_VAE_NORM=mm \
   LINGBOT_VAE_T=6 LINGBOT_VAE_2D=1 LINGBOT_FILM_ALL=1 LINGBOT_KEY_THREADS=4 LINGBOT_IMG_BLOCK=1 \
   LINGBOT_CTE_LOCAL=1 LINGBOT_CTE_VGROUP=8 NKI_ENABLE_TRACE_CACHE=0 LINGBOT_K_BLOCKED=1 \
-  LINGBOT_STEP_NOWRITE=1
+  LINGBOT_STEP_NOWRITE=1 \
+  LINGBOT_CTE_CHAIN=1 LINGBOT_CROSS_TPOUT=1 LINGBOT_CTE_QPAD=32 LINGBOT_V_TOKEN_MAJOR=1 \
+  LINGBOT_CTE_PRIOR_FULL=1 LINGBOT_CMAX=2 NEURON_RT_IO_RING_CACHE_SIZE=1024 \
+  LINGBOT_KV_REUSE=1 LINGBOT_START_OVERLAP=1 LINGBOT_FILM_SHARD=1 LINGBOT_SCHED_FUSE=1 LINGBOT_GC_OFF=1
 ```
-Where the time goes in one steady-state block at `q20` (2.53–2.60 ms, TP4 × CP16, profiled):
+`q20_kbnw` ran the first ten lines of these flags; each later row adds its own.
+
+Where the time goes at `q33`:
+- GEN on the device (rank-0 system profile of the `q33` flags): 2.73 s busy and 0.17 s idle of
+  2.90 s. The 1360 block executions take ~2.61 s (1.92 ms each on average).
+- One steady block at lead 3 (1.90 ms, device profile): Tensor engine busy 1.12 ms, Scalar 0.75,
+  Vector 0.65, GpSimd 0.56. The new chunk's K all-gather runs 364–576 µs and its V all-gather
+  717–893 µs, with every engine idle from ~720 µs until V lands. The compiler issues the V gather's
+  trigger on GpSimd 140–200 µs after the K gather ends, whatever the program order (`LINGBOT_KV_REAL=2`)
+  or the engine of the kernel's copies (`LINGBOT_CMAX_DGE`); one coalesced K + V gather
+  (`LINGBOT_KV_COALESCE`) only starts at ~650 µs, after the V projection, so the wait moves instead of
+  shrinking. The SP collectives cost ~220 µs on the critical path.
+
+Where the time went in one steady-state block at `q20` (2.53–2.60 ms, TP4 × CP16, profiled):
 - The K and V all-gathers over CP16 take ~170 and ~150 µs and run one after the other; for about
   350 µs before the first attention call every engine of the core is idle.
 - Each of the two attention calls spends its first ~100 µs loading K and V (the GpSimd engine
@@ -131,7 +187,8 @@ Measured and not adopted:
 - `LINGBOT_ATTN_REM=1` (the 14 query rows past the last full 128-row tile as fp32 matmuls and
   softmax instead of a third kernel tile): 2.93 vs 2.87 ms per block, output rel. RMS 8.0e-4.
 - VAE frames per step on the 2-D tiles: T = 6 / 8 / 10 gave 308 / 299 / 313 ms, but at T = 8 and
-  10 the first decode after warmup took 2.6–2.7 s. T = 6 is kept until T = 8 passes the e2e gate.
+  10 the first decode after warmup took 2.6–2.7 s. End to end (`q28`) T = 8 gave 0.301 s, inside
+  T = 6's spread (0.300–0.307 s), so T = 6 is kept.
 
 - A compiled head with unpatchify inside the graph: neuronx-cc fails on its CP all-gather
   (`NCC_IBIR158`, access pattern out of bounds). Gathering the 2-D [tokens, 64] rows instead
@@ -167,6 +224,22 @@ Measured and not adopted:
 - V tiles double-buffered across heads (`LINGBOT_CTE_KV_DBUF=v`, `q19`): 20.05 vs 20.07 fps; K and
   V double-buffered do not fit in SBUF (`NCC_INLA001`). One kernel call over all four KV chunks as
   one 17280-key window: 0.72 vs 0.68 ms for the two calls.
+- `LINGBOT_CMAX=1` (the constant-offset kernel on plain K/V layouts, loaded per tile): 2.18 ms per
+  block at lead 3, against 1.97 ms for `LINGBOT_CMAX=2` in the production layouts.
+- `NEURON_RT_IO_RING_CACHE_SIZE=64` (inside noise) and `=4096` (GEN +20 ms against 1024);
+  `NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=4` (+9 ms).
+- `LINGBOT_EMBED_LOCAL=1` (each CP rank embeds only its own tokens): GEN −5 ms, inside the spread.
+  `LINGBOT_START_OVERLAP=2` (the noise uploads in the draw thread too): no gain.
+  `LINGBOT_CROSS_QPAD=32` (cross-attention queries padded to 32 rows): +0.06 ms per block.
+- `LINGBOT_KV_REAL=1…4` (K/V of the real token rows only; 2–4 also put the V gather first in
+  program order), `LINGBOT_CMAX_DGE=hwdge_sync` (the constant-offset kernel's copies on the Sync
+  engine) and `LINGBOT_KV_COALESCE=1`: the block within ±0.05 ms of the base, inside its spread (see
+  the `q33` profile note). `LINGBOT_KV_COALESCE` needs the coalesced all-gather in torch-neuronx's
+  CollectiveLegalization table (added at import); without it its group falls back to the whole
+  world and neuronx-cc rejects it (`NCC_IVRF100`).
+- The block executed on other buffers every call (`NBLK=4` or `8` copies with their own weights, KV
+  and caches, as the pipeline's 40 blocks do): 1.93–1.96 ms against 2.01–2.07 ms for one copy, so
+  rebinding buffers costs nothing.
 
 Every experiment, including the refuted ones, is in `kiro/perf_ledger.jsonl`.
 
@@ -283,7 +356,13 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
   denominator. Against an fp32 reference (`kiro/attn_merge_test.py`) this scales flat heads' output
   by 0.993 with a full window and 0.939 in the first chunk. The merged path's gain is 1.0000 on
   every head, with lower error on flat heads (rel. RMS 0.0028 vs 0.0078).
-- **Run-to-run.** Rerunning the same layout gave bit-identical latents (2-device TP8).
+- **Run-to-run.** Rerunning the same layout gave bit-identical latents (2-device TP8), and on 16
+  devices up to `q24`. Since the constant-offset attention (`q25`), two runs of one config agree
+  bitwise through chunk 1 and then drift at rounding level (rel. RMS 0.058–0.079 overall, last frame
+  0.14–0.18). The constant-offset kernels (20 calls on one core, `kiro/cmax_det.py`) and the compiled
+  block (64 ranks, separate processes, leads 2 and 3) are bitwise repeatable on equal inputs, so the
+  source is not found yet; those tests repeat identical inputs and would miss a read that races a
+  buffer's previous contents.
 - **Across layouts.** Latents from different layouts diverge with chunk index (rel. RMS ~0.004 in
   the first frame, 0.25–0.36 by the last). SP vs no-SP at the same layout, which differ only in
   reduction order, diverge just as much, so this is the autoregressive rollout amplifying
@@ -336,6 +415,20 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_CTE_KV_DGE=…`, `LINGBOT_CTE_KV_DBUF=1\|v`, `LINGBOT_CTE_VGROUP_MIN_TILES` / `_MAX_TILES` | A/B only: vendored kernel DMA descriptor mode, K/V double buffering, which calls group their V loads |
 | `LINGBOT_Q_FIRST=1`, `LINGBOT_LEAD_AFTER_KV=1`, `LINGBOT_ATTN_SPLIT=1` | A/B only: issue-order tricks around the CP gathers, remainder query rows split over CP (no gain) |
 | `LINGBOT_DUMP_BLOCKS=<dir>` | diagnostic: rank 0 saves every block's output of the first forward (`kiro/cmp_blocks.py` compares two runs) |
+| `LINGBOT_CTE_CHAIN=1` | vendored kernel: the self-attention calls chain (each continues the previous call's online softmax, the last normalizes into the output projection's layout) instead of being merged in the graph |
+| `LINGBOT_CROSS_TPOUT=1`, `LINGBOT_CTE_QPAD=32` | cross-attention output in the projection's layout; self-attention queries padded to 32 rows (288 instead of 384) |
+| `LINGBOT_V_TOKEN_MAJOR=1` | V gathered and cached token-major ([L, n, d] memory under the [n, L, d] shape), read so by the kernel (no V permute) |
+| `LINGBOT_CTE_PRIOR_FULL=1` | the kernel's prefix-cache prior always whole: no dynamic length mask on its K tiles (bitwise equal) |
+| `LINGBOT_CMAX=1\|2`, `LINGBOT_CMAX_OFFSET=c` | constant-offset self-attention softmax(QKᵀ − c)·V in the 34 layers of `_CMAX_LAYERS` (c = 30 by default); 2 = `kernels/attention_cmax2_lb.py`, whole-chunk loads in the production K/V layouts (adopted) |
+| `LINGBOT_ROWMAX_GRAPH=1` | diagnostic: every layer's per-head softmax row-max range over each generation, printed per rank (`[ROWMAX]`, `[ROWMAX_X]` for cross-attention) |
+| `LINGBOT_KV_REUSE=1` | keep the self- and cross-attention KV caches for the next generation instead of allocating and zero-filling new ones (every slot is written before it is read) |
+| `LINGBOT_START_OVERLAP=1\|2` | seeded noise draws and the encode-cache key in background threads, the FiLM precompute right after the Plücker condition, no syncs before the chunk loop (2: the noise uploads in the thread too); same draws, same order |
+| `LINGBOT_FILM_SHARD=1` | with `LINGBOT_FILM_ALL`: the camera embedding MLP on each CP rank's own tokens only |
+| `LINGBOT_SCHED_FUSE=1` | a denoise step's x0 and the re-noised next input in one compiled graph |
+| `LINGBOT_GC_OFF=1` | no cyclic garbage collection inside a generation (re-enabled after it) |
+| `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop, no syncs |
+| `LINGBOT_EMBED_LOCAL=1`, `LINGBOT_CROSS_QPAD=32`, `LINGBOT_KV_REAL=1…4`, `LINGBOT_CMAX_DGE=hwdge_sync\|hwdge_act`, `LINGBOT_KV_COALESCE=1` | A/B only, no gain (see "Measured and not adopted") |
+| `NEURON_RT_IO_RING_CACHE_SIZE=1024` | runtime setting, not a code flag: I/O descriptor cache entries (GEN −42 ms at 256 against the default, a further −19 ms at 1024) |
 
 ## Scripts (`kiro/`)
 
@@ -362,6 +455,11 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `attn_bitcmp.py` | vendored vs nkilib `attention_cte`, bitwise, at the DiT call shapes (`K_BLOCKS=16` for the rank-blocked K) |
 | `cmp_blocks.py` | per-block output comparison of two `LINGBOT_DUMP_BLOCKS` runs |
 | `prof_nodes.py`, `prof_op.py`, `prof_kernel.py`, `prof_cc.py`, `prof_dma.py` | neuron-explorer profile views: framework-node timeline, one op's instructions per engine, a kernel's engine busy in bins, collectives against compute, HBM traffic per op |
+| `prof_rings.py` | collective spans per CC core and all-engine idle intervals of one block execution |
+| `run_job16.sh … SYSPROF_DIR=<dir>`, `sysprof_rank0.sh`, `sysprof_gaps.py` | runtime system profile of `generate.py` on rank 0; per-NEFF device time and the idle gaps of the steady generation |
+| `attn_chain_test.py` | `LINGBOT_CTE_CHAIN` on one core: chained calls vs the merged path and fp32, and their time |
+| `cmax_test.py`, `cmax_det.py` | the constant-offset kernels vs the chained `attention_cte` calls and fp32, one core; their run-to-run determinism |
+| `nkl_cte_cmp.py` | an nki-library `attention_cte` branch against `main` on one core: time per call and bitwise comparison of every output (`CASES=table` for the full table) |
 
 Reproduce the 16-device table (`/work/repo_upstream` = upstream `main`, `/work/repo` = this branch):
 

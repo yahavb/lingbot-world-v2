@@ -48,8 +48,16 @@ cp "$SL" "$GL"
 # PROMPT_EMBEDS=<file from kiro/encode_prompt.py>: skip generate.py's inline T5 (it does not
 # enter GEN; needed when the core order breaks world-wide collectives, see encode_prompt.py).
 if [ -n "${PROMPT_EMBEDS:-}" ]; then ARGS+=(--prompt_embeds_path "$PROMPT_EMBEDS"); fi
-torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" generate.py \
-  "${ARGS[@]}" --save_file "$SAVE" --save_latents_path "$LATENTS" >> "$GL" 2>&1
+# SYSPROF_DIR=<dir>: Neuron runtime system profile of generate.py on rank 0 (kiro/sysprof_rank0.sh)
+if [ -n "${SYSPROF_DIR:-}" ]; then
+  rm -rf "$SYSPROF_DIR"; mkdir -p "$SYSPROF_DIR"
+  torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" --no-python \
+    bash kiro/sysprof_rank0.sh python3 generate.py \
+    "${ARGS[@]}" --save_file "$SAVE" --save_latents_path "$LATENTS" >> "$GL" 2>&1
+else
+  torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" generate.py \
+    "${ARGS[@]}" --save_file "$SAVE" --save_latents_path "$LATENTS" >> "$GL" 2>&1
+fi
 echo "### gen exit=$? end $(date -Is)" | tee -a "$GL" >> "$SL"
 # DEC_DEFAULT_CORES=1: decode with the default core order even when generate ran with a custom
 # NEURON_RT_VISIBLE_CORES order (the VAE step is the same code in every run we compare).

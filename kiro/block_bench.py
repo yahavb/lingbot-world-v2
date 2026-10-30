@@ -77,6 +77,7 @@ def main():
     blk = blk.to(torch.bfloat16).to(dev).eval().requires_grad_(False)
     blk.self_attn.layer_index = K
     blk.self_attn.use_const_max = mf.layer_uses_const_max(K)
+    blk.self_attn.use_cmax = mf.layer_uses_cmax(K)
     d = config["dim"] // config["num_heads"]
     freqs = torch.cat([rope_params(mf.MAX_LATENT_FRAMES, d - 4 * (d // 6)),
                        rope_params(mf.MAX_LATENT_FRAMES, 2 * (d // 6)),
@@ -126,6 +127,10 @@ def main():
         for t in kv["k"]:
             n_, d_, L_ = t.shape
             t.copy_(t.view(n_, d_, cp, L_ // cp).permute(2, 0, 1, 3).contiguous().view(n_, d_, L_))
+    if os.environ.get("LINGBOT_V_TOKEN_MAJOR", "0") == "1":
+        # the same logical V, stored token-major: [L, n, d] memory under the [n, L, d] shape
+        for t in kv["v"]:
+            t.copy_(t.permute(1, 0, 2).contiguous().view(t.shape))
     if split:
         # each CP rank's own shard of every cached chunk = its token slice of the gathered chunk
         r_cp, l_ = mf._sp_local_r(), L_loc
@@ -251,6 +256,40 @@ def main():
         if sp:  # reassemble the token shards for the output check (outside the timed loop)
             out = tp.all_gather_tokens(out.contiguous(), "tp")
             torch.neuron.synchronize()
+    nblk = int(os.environ.get("NBLK", "1"))
+    if nblk > 1:
+        # NBLK=N: N copies of the block (cloned weights, own KV and cross-attention caches), called in turn, as the
+        # pipeline's 40 blocks are: the same compiled graph executed on other buffers every call.
+        import copy
+        assert not own, "NBLK: no LINGBOT_ATTN_SPLIT"
+        cops = [(cblk, ks, vs, cross)]
+        for _ in range(nblk - 1):
+            b2 = copy.deepcopy(blk)
+            ks2, vs2 = [t.clone() for t in ks], [t.clone() for t in vs]
+            cr2 = {k_: t.clone() for k_, t in cross.items()}
+            for t in ks2 + vs2 + [cr2["k"], cr2["v"]]:
+                torch._dynamo.mark_static_address(t)
+            cops.append((torch.compile(b2, backend="neuron", fullgraph=True, dynamic=False), ks2, vs2, cr2))
+
+        def run_copy(c_):
+            mf._REAL_TOKENS[0] = L_loc if Lp != L_loc else None
+            cb_, ks_, vs_, cr_ = c_
+            return cb_(x_in, kv_cache=None, kv_chunks=(list(ks_), list(vs_)), crossattn_cache=cr_, current_start=0,
+                       dit_cond_dict={"cam_film": film}, cross_attn_first_call=False, **kw, **kv_extra)
+        with torch.no_grad(), torch.amp.autocast("neuron", dtype=torch.bfloat16):
+            for c_ in cops[1:]:
+                run_copy(c_)  # cross-attention cache: copied from the initialized one
+                run_copy(c_)
+            torch.neuron.synchronize()
+            dist.barrier()
+            t0 = time.perf_counter()
+            for _ in range(REPS):
+                for c_ in cops:
+                    run_copy(c_)
+            torch.neuron.synchronize()
+            dist.barrier()
+            ms_n = (time.perf_counter() - t0) / (REPS * nblk) * 1e3
+        log(f"[block_bench] NBLK={nblk}: {ms_n:.2f} ms/block cycling {nblk} copies (one copy: {ms:.2f} ms/block)")
     if os.environ.get("ALT", "0") == "1":
         # Run once on DIFFERENT data in the same buffers (perturbed cache contents, scaled input),
         # restore the original contents, then do the compared call. Every timed rep sees identical
