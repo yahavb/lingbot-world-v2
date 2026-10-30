@@ -62,6 +62,7 @@ SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
+BACKLOG = int(os.environ.get("LIVE_BACKLOG_FRAMES", "480"))  # unread frames that end a live session
 
 # Camera motion per latent frame (4 video frames), OpenCV axes (x right, y down, z forward):
 # (yaw deg, + = right; pitch deg, + = up; translation). Sized like the example paths'
@@ -99,6 +100,7 @@ class Job:
         self.seed = seed
         self.scene = scene
         self.live = live
+        self.on_backlog = None  # called once when a live client stops reading
         self.frames = queue.Queue()
         self.count = 0
         self.t0 = None
@@ -107,6 +109,12 @@ class Job:
         self.count += 1
         self.frames.put({"frame_index": self.count - 1, "frame": frame,
                          "chunk": chunk, "action": action})
+        # A dead connection behind a proxy (kubectl port-forward) may never look
+        # disconnected; a live client that stops reading ends the session instead.
+        if self.live and self.on_backlog is not None and self.frames.qsize() > BACKLOG:
+            logging.info(f"live client not reading ({self.frames.qsize()} frames queued): stopping")
+            self.on_backlog(self)
+            self.on_backlog = None
 
     def close(self, segment, err=None):
         if err:
@@ -307,6 +315,7 @@ def run_server(sched):
         if req.scene and not (req.scene.isdigit() and os.path.isfile(f"examples/{req.scene}/poses.npy")):
             raise HTTPException(status_code=400, detail=f"unknown scene {req.scene!r}")
         job = Job(req.prompt, req.seed, req.scene or None, req.live)
+        job.on_backlog = sched.stop_job
         sched.start(job)
         return stream(job, request)
 
