@@ -76,7 +76,7 @@ spec:
               mountPath: /dev/shm
           env:
             - name: BRANCH
-              value: "loop_engineering_k8s"
+              value: "main"
             - name: RUNS
               value: "loop loop_rep off main_code exact"
             - name: PYTHONUNBUFFERED
