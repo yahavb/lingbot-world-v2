@@ -436,15 +436,18 @@ def main():
 
     first_img = load_image(args.image)
 
-    # T5 embeddings by prompt: a new prompt costs ~3.5 s of the first chunk. Every rank runs the
-    # same prompts in the same order, so every rank's cache holds the same keys.
+    # T5 embeddings by prompt. Every rank runs the same prompts in the same order, so every
+    # rank's cache holds the same keys.
     t5_cache = {}
 
     def encode_prompt(p):
         if p not in t5_cache:
             if len(t5_cache) >= 64:
                 t5_cache.pop(next(iter(t5_cache)))
-            t5_cache[p] = [t.cpu() for t in t5([p], dev)]
+            # Zero-padded to text_len here, as the model pads it: on the device that pad is an
+            # eager op shaped by the prompt's token count, a new graph (~3.7 s) per new length.
+            t5_cache[p] = [torch.cat([u, u.new_zeros(cfg.text_len - u.size(0), u.size(1))])
+                           for u in (t.cpu() for t in t5([p], dev))]
         return t5_cache[p]
 
     t0 = time.perf_counter()
