@@ -535,6 +535,18 @@ def main():
             logging.info(f"warmup: remote decode failed: {err}")
     if rank == 0:
         logging.info(f"warmup session: {time.perf_counter() - t0:.1f} s")
+    # The first session after the warmup ran ~4 s per chunk for its first ~6 chunks (then 0.42 s),
+    # on any scene; a second short one, steered, on another scene's pre-encoded image takes that.
+    t0 = time.perf_counter()
+    sid = next((k for k in sorted(scene_imgs) if f"examples/{k}" != os.path.normpath(args.action_path)), None)
+    if sid is not None:
+        run_session(args.prompt, scene_imgs[sid], args.base_seed, f"examples/{sid}",
+                    lambda i: ("stop", None, None) if i >= 12 else
+                    ("go", None, warm_actions[i % len(warm_actions)]))
+        if remote is not None:
+            remote.drain()
+        if rank == 0:
+            logging.info(f"second warmup session (scene {sid}): {time.perf_counter() - t0:.1f} s")
 
     sched = Scheduler()
     if rank == 0:
