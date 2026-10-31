@@ -264,6 +264,16 @@ class RemoteDecoder:
                 self.q.task_done()
 
 
+def load_image(path):
+    """A start image as every encode sees it: one memory block under LINGBOT_IMG_BLOCK=1, so its
+    encode-cache key (which records the pixel layout) is the same wherever it was loaded."""
+    img = Image.open(path).convert("RGB")
+    if os.environ.get("LINGBOT_IMG_BLOCK", "0") == "1":
+        from wan.image2video import single_block_image
+        img = single_block_image(img)
+    return img
+
+
 def to_pil(frame):
     """[C, H, W] in [-1, 1] -> PIL."""
     x = ((frame.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
@@ -381,6 +391,23 @@ def main():
     dev = torch.device(f"neuron:{local_rank}")
     torch.set_grad_enabled(False)
 
+    # Every scene's start image, VAE-encoded once now, before T5 and the DiT take the device
+    # memory: a session's first chunk then needs no encode (11-15 s per new image).
+    from wan.image2video import pre_encode_condition
+    scene_imgs = {}
+    t0 = time.perf_counter()
+    for sid in sorted(os.listdir("examples")):
+        d = f"examples/{sid}"
+        if not (sid.isdigit() and os.path.isfile(f"{d}/image.jpg") and os.path.isfile(f"{d}/poses.npy")):
+            continue
+        scene_imgs[sid] = load_image(f"{d}/image.jpg")
+        pre_encode_condition(os.path.join(args.ckpt_dir, cfg.vae_checkpoint), dev, scene_imgs[sid], d,
+                             args.frame_num, args.chunk_size, MAX_AREA_CONFIGS[args.size],
+                             EXACT_GRID_SIZES.get(args.size), cfg.vae_stride, cfg.patch_size)
+    dist.barrier()
+    if rank == 0:
+        logging.info(f"pre-encoded scenes {sorted(scene_imgs)} in {time.perf_counter() - t0:.1f} s")
+
     init_t5_parallel_group(world)
     t5 = T5EncoderModel(
         text_len=cfg.text_len,
@@ -407,7 +434,7 @@ def main():
         sp_size=args.sp_size,
         seq_mode=args.seq_mode)
 
-    first_img = Image.open(args.image).convert("RGB")
+    first_img = load_image(args.image)
     max_area = MAX_AREA_CONFIGS[args.size]
     target_hw = EXACT_GRID_SIZES.get(args.size)
     pipe.prewarm(first_img, max_area=max_area, target_hw=target_hw,
@@ -519,16 +546,14 @@ def main():
         msg = [None]
         if job is not None:
             scene = job.scene or None
-            img = Image.open(f"examples/{scene}/image.jpg").convert("RGB") if scene else first_img
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            msg = [{"prompt": job.prompt, "seed": job.seed, "png": buf.getvalue(),
-                    "action_path": f"examples/{scene}" if scene else args.action_path}]
+            msg = [{"prompt": job.prompt, "seed": job.seed, "scene": scene}]
         dist.broadcast_object_list(msg, src=0)
         m = msg[0]
         if m is None:
             continue
-        img = Image.open(io.BytesIO(m["png"])).convert("RGB")
+        # Every rank has the repo's scenes loaded; only the scene id is broadcast.
+        img = scene_imgs.get(m["scene"], first_img)
+        m["action_path"] = f"examples/{m['scene']}" if m["scene"] else args.action_path
 
         live = rank == 0 and job.live
         seg = {"job": job, "n": 1, "end": MAX_CHUNKS if live else SEG_CHUNKS,

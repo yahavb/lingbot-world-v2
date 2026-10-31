@@ -1208,7 +1208,8 @@ class WanI2VCausal:
         if _ec is not None and _ec[0] == _ek:
             y = _ec[1].clone()
         else:
-            _pre = _PRE_ENCODED.pop(_ek, None)
+            # get, not pop: a server keeps every pre-encoded scene for later sessions
+            _pre = _PRE_ENCODED.get(_ek)
             if _pre is not None:
                 y = _pre.to(self.device)
             else:
