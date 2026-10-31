@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LingBot-World v2 — live streaming: components and one session</title>
+<style>
+  :root{
+    --surface-1:#141416;      /* slide surface (validated against) */
+    --plane:#0a0a0b;          /* page plane */
+    --ink:#ffffff;
+    --ink-2:#c3c2b7;
+    --ink-3:#898781;
+    --grid:#2c2c2a;
+    --axis:#383835;
+    --hair:rgba(255,255,255,.12);
+    --box:rgba(255,255,255,.035);
+    --box-line:rgba(255,255,255,.18);
+    /* categorical (dark steps, validated) */
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+    /* status (fixed) */
+    --good:#0ca30c; --warn:#fab219; --crit:#d03b3b;
+    /* sequential blue, ordinal-safe range for dark (250 -> 600) */
+    --q1:#86b6ef; --q2:#5598e7; --q3:#3987e5; --q4:#2a78d6; --q5:#256abf; --q6:#184f95;
+    --font:system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--plane);font-family:var(--font);color:var(--ink);overflow:hidden}
+  body.ov{overflow:auto}
+
+  /* ---------- stage / slide geometry ---------- */
+  #stage{position:fixed;left:50%;top:50%;width:1280px;height:720px;transform-origin:center center}
+  .cell{position:absolute;inset:0}
+  .cell[hidden]{display:none}
+  .slide{width:1280px;height:720px;background:var(--surface-1);position:relative;
+         padding:44px 64px 56px;display:flex;flex-direction:column;overflow:hidden}
+  .slide::after{content:"";position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+
+  .eyebrow{display:flex;align-items:baseline;gap:14px;font-size:13px;letter-spacing:.09em;
+           text-transform:uppercase;color:var(--ink-3)}
+  .eyebrow b{color:var(--s1);font-weight:700;letter-spacing:.06em}
+  h1{font-size:40px;line-height:1.14;margin:10px 0 0;font-weight:650;letter-spacing:-.015em;max-width:26ch}
+  h2{font-size:33px;line-height:1.16;margin:8px 0 0;font-weight:650;letter-spacing:-.012em}
+  .dek{margin:9px 0 0;font-size:16px;line-height:1.45;color:var(--ink-2);max-width:92ch}
+  .body{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;margin-top:14px}
+  .kicker{position:absolute;left:64px;right:64px;bottom:22px;font-size:15px;color:var(--ink-2);
+          border-top:1px solid var(--hair);padding-top:12px;display:flex;gap:12px;align-items:baseline}
+  .kicker strong{color:var(--ink);font-weight:600}
+  .tag{font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);
+       border:1px solid var(--hair);border-radius:999px;padding:3px 9px;white-space:nowrap}
+  .pill{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)}
+  svg{display:block;overflow:visible}
+
+  /* ---------- shared svg vocabulary ---------- */
+  .bx{fill:var(--box);stroke:var(--box-line);stroke-width:1}
+  .bx-a{fill:rgba(57,135,229,.10);stroke:var(--s1);stroke-width:1.5}
+  .bx-g{fill:rgba(12,163,12,.08);stroke:var(--good);stroke-width:1.5;stroke-dasharray:5 4}
+  .bx-x{fill:rgba(208,59,59,.08);stroke:var(--crit);stroke-width:1.5}
+  .bx-h{fill:rgba(25,158,112,.10);stroke:var(--s3);stroke-width:1.5}
+  .bx-ok{fill:rgba(12,163,12,.14);stroke:var(--good);stroke-width:1.5}
+  .ar-a{stroke:var(--s3);stroke-width:2;fill:none;marker-end:url(#mA)}
+  .t{fill:var(--ink);font-size:15px;font-weight:600}
+  .t-s{fill:var(--ink-2);font-size:13px}
+  .t-m{fill:var(--ink-3);font-size:12px}
+  .t-b{fill:var(--ink);font-size:21px;font-weight:650}
+  .t-n{fill:var(--ink);font-size:34px;font-weight:650;letter-spacing:-.02em}
+  .ar{stroke:var(--ink-3);stroke-width:1.4;fill:none;marker-end:url(#mM)}
+  .ar-d{stroke:var(--ink-3);stroke-width:1.3;fill:none;stroke-dasharray:4 4;marker-end:url(#mM)}
+  .ar-b{stroke:var(--s1);stroke-width:2;fill:none;marker-end:url(#mB)}
+  .ar-x{stroke:var(--crit);stroke-width:2;fill:none;marker-end:url(#mX)}
+  .ar-g{stroke:var(--good);stroke-width:2;fill:none;marker-end:url(#mG)}
+  .gl{stroke:var(--grid);stroke-width:1;fill:none}
+  .ax{stroke:var(--axis);stroke-width:1;fill:none}
+  tspan.hl{fill:var(--s1);font-weight:650}
+
+  /* ---------- chrome ---------- */
+  #hud{position:fixed;right:14px;bottom:12px;font-size:12px;color:var(--ink-3);
+       font-variant-numeric:tabular-nums;z-index:40;letter-spacing:.04em}
+  #hud kbd{border:1px solid var(--hair);border-radius:4px;padding:1px 5px;font:inherit;color:var(--ink-2)}
+  #notes{position:fixed;left:0;right:0;bottom:0;max-height:38vh;overflow:auto;z-index:50;
+         background:#000;border-top:1px solid var(--hair);padding:16px 22px;display:none}
+  body.notes #notes{display:block}
+  #notes h4{margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
+  #notes p{margin:0;font-size:15px;line-height:1.55;color:var(--ink-2);max-width:120ch}
+  #jump{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:60;display:none;
+        font-size:80px;font-weight:650;color:var(--ink);background:rgba(0,0,0,.82);
+        border:1px solid var(--hair);border-radius:16px;padding:18px 40px}
+  body.jump #jump{display:block}
+
+  /* ---------- overview ---------- */
+  body.ov #stage{position:static;left:auto;top:auto;width:auto;height:auto;transform:none;
+                 display:grid;grid-template-columns:repeat(4,1fr);gap:18px;padding:22px}
+  body.ov .cell{position:relative;inset:auto;display:block !important;aspect-ratio:16/9;cursor:pointer;
+                border:1px solid var(--hair);border-radius:6px;overflow:hidden;background:var(--surface-1)}
+  body.ov .cell.cur{outline:2px solid var(--s1);outline-offset:2px;border-color:transparent}
+  body.ov .cell .slide{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none}
+  body.ov .cell::before{content:attr(data-ref);position:absolute;z-index:5;left:7px;top:6px;
+        font-size:10px;letter-spacing:.08em;color:var(--ink-3);background:rgba(0,0,0,.6);
+        border-radius:3px;padding:2px 6px}
+        background:none;border:1px solid var(--hair);border-radius:999px;padding:4px 12px;cursor:pointer}
+
+  video{width:100%;height:100%;object-fit:contain;background:#000}
+  .vidbox{width:100%;height:100%;border:1px solid var(--hair);border-radius:8px;overflow:hidden;
+          display:flex;align-items:center;justify-content:center;background:#000;position:relative}
+  .vidbox .ph{color:var(--ink-3);font-size:14px;text-align:center;line-height:1.7;padding:0 40px}
+  .vidbox .ph code{color:var(--ink-2);font-size:13px}
+
+  .cols{display:flex;gap:44px;width:100%}
+  .col{flex:1;min-width:0}
+  .lead{font-size:19px;line-height:1.5;color:var(--ink);font-weight:600}
+  ul.pt{margin:0;padding:0;list-style:none}
+  ul.pt li{position:relative;padding-left:22px;margin-bottom:26px;font-size:inherit;line-height:1.55;color:var(--ink-2)}
+  ul.pt li::before{content:"";position:absolute;left:0;top:8px;width:9px;height:9px;border-radius:2px;background:var(--s1)}
+  ul.pt li b{color:var(--ink);font-weight:650}
+  ul.pt.n2 li::before{background:var(--s2)} ul.pt.n3 li::before{background:var(--s3)}
+
+  @media print{
+    @page{size:1280px 720px;margin:0}
+    html,body{overflow:visible;background:#fff}
+    #hud,#notes,#jump,.tbtn{display:none !important}
+    #stage{position:static;width:auto;height:auto;transform:none}
+    .cell{position:static;display:block !important;break-after:page;page-break-after:always}
+  }
+</style>
+</head>
+<body data-palette="#3987e5,#d95926,#199e70,#c98500">
+
+<!-- global svg defs, referenced by every inline svg -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="mM" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+    <path d="M0,0.8 L9.5,5 L0,9.2 z" fill="#898781"/></marker>
+  <marker id="mB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0.8 L9.5,5 L0,9.2 z" fill="#3987e5"/></marker>
+  <marker id="mX" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0.8 L9.5,5 L0,9.2 z" fill="#d03b3b"/></marker>
+  <marker id="mG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0.8 L9.5,5 L0,9.2 z" fill="#0ca30c"/></marker>
+  <marker id="mA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0.8 L9.5,5 L0,9.2 z" fill="#199e70"/></marker>
+</defs></svg>
+
+<div id="stage">
+<div class="cell" data-ref="components"><section class="slide" style="padding:34px 64px 30px">
+  <div class="eyebrow"><b>Live video streaming</b></div>
+  <h2 style="font-size:28px">User → App → Prefill → Decoder</h2>
+  <div class="body" style="margin-top:18px;align-items:flex-start">
+  <svg viewBox="0 0 1152 420" width="1152" height="420">
+<rect x="0" y="120" width="160" height="150" rx="10" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)" stroke-width="1.5"/>
+<text class="t-b" x="80.0" y="168" text-anchor="middle">User</text>
+<text class="t-s" x="80.0" y="200" text-anchor="middle">browser</text>
+<text class="t-m" x="80.0" y="224" text-anchor="middle">kubectl port-forward</text>
+<rect x="290" y="120" width="200" height="150" rx="10" fill="rgba(201,133,0,.08)" stroke="#c98500" stroke-width="1.5"/>
+<text class="t-b" x="390.0" y="168" text-anchor="middle">App</text>
+<text class="t-s" x="390.0" y="200" text-anchor="middle">web page · CPU pod</text>
+<text class="t-m" x="390.0" y="224" text-anchor="middle">lbw-v2-web</text>
+<rect x="620" y="120" width="220" height="150" rx="10" fill="rgba(57,135,229,.10)" stroke="#3987e5" stroke-width="1.5"/>
+<text class="t-b" x="730.0" y="168" text-anchor="middle">Prefill</text>
+<text class="t-s" x="730.0" y="200" text-anchor="middle">T5 + DiT · half a trn3</text>
+<text class="t-m" x="730.0" y="224" text-anchor="middle">lbw-v2-dit-t5 · 32 ranks · TP4×CP8</text>
+<rect x="970" y="120" width="182" height="150" rx="10" fill="rgba(217,89,38,.10)" stroke="#d95926" stroke-width="1.5"/>
+<text class="t-b" x="1061.0" y="168" text-anchor="middle">Decoder</text>
+<text class="t-s" x="1061.0" y="200" text-anchor="middle">VAE · 4 trn3 devices</text>
+<text class="t-m" x="1061.0" y="224" text-anchor="middle">lbw-v2-vae · 32 ranks</text>
+<path class="ar-b" d="M164,176 L284,176"/>
+<path class="ar-a" d="M286,216 L166,216"/>
+<text class="t-m" x="225.0" y="166" text-anchor="middle">Start · steer (W A S D)</text>
+<text class="t-m" x="225.0" y="236" text-anchor="middle">live frames</text>
+<path class="ar-b" d="M494,176 L614,176"/>
+<path class="ar-a" d="M616,216 L496,216"/>
+<text class="t-m" x="555.0" y="166" text-anchor="middle">/session · /control</text>
+<text class="t-m" x="555.0" y="236" text-anchor="middle">JPEG frames (SSE)</text>
+<path class="ar-b" d="M844,176 L964,176"/>
+<path class="ar-a" d="M966,216 L846,216"/>
+<text class="t-m" x="905.0" y="166" text-anchor="middle">latent chunks</text>
+<text class="t-m" x="905.0" y="236" text-anchor="middle">frames, per step</text>
+<text class="t-m" x="905" y="292" text-anchor="middle">TCP · streamed NDJSON</text>
+<text class="t-s" x="0" y="340">App: plays the stream at the generation rate from about one chunk of buffer; buttons and keys send /control.</text>
+<text class="t-s" x="0" y="366">Prefill: denoises 3 latent frames per chunk without pausing; each chunk's camera comes from the latest action.</text>
+<text class="t-s" x="0" y="392">Decoder: fused decoder on 4 × 8 tiles; sends each latent frame's 4 frames as soon as they are decoded.</text>
+  </svg>
+  </div>
+</section>
+<div class="nt">Four components. The user only talks to the app; the app only talks to prefill; prefill hands latent chunks to the decoder and relays its frames back. One session streams until the user stops it; the camera follows the user's last action.</div></div>
+<div class="cell" data-ref="seq"><section class="slide" style="padding:34px 64px 30px">
+  <div class="eyebrow"><b>One live session, step by step</b></div>
+  <h2 style="font-size:28px">User → prefill (DiT + T5) → decoder (VAE)</h2>
+  <div class="body" style="margin-top:18px;align-items:flex-start">
+  <svg viewBox="0 0 1152 572" width="1152" height="572">
+<rect class="bx" x="-20" y="0" width="260" height="46" rx="8"/><text class="t" x="110" y="20" text-anchor="middle">User · App (web page)</text><text class="t-m" x="110" y="37" text-anchor="middle">browser · lbw-v2-web</text>
+<rect class="bx-a" x="430" y="0" width="260" height="46" rx="8"/><text class="t" x="560" y="20" text-anchor="middle">Prefill · DiT + T5</text><text class="t-m" x="560" y="37" text-anchor="middle">lbw-v2-dit-t5 · 32 ranks</text>
+<rect x="880" y="0" width="260" height="46" rx="8" fill="rgba(217,89,38,.10)" stroke="#d95926" stroke-width="1.5"/><text class="t" x="1010" y="20" text-anchor="middle">Decoder · VAE</text><text class="t-m" x="1010" y="37" text-anchor="middle">lbw-v2-vae · 32 ranks</text>
+<line x1="110" y1="48" x2="110" y2="566" stroke="#383835" stroke-width="1.5" stroke-dasharray="3 5"/>
+<line x1="560" y1="48" x2="560" y2="566" stroke="#383835" stroke-width="1.5" stroke-dasharray="3 5"/>
+<line x1="1010" y1="48" x2="1010" y2="566" stroke="#383835" stroke-width="1.5" stroke-dasharray="3 5"/>
+<path class="ar-b" d="M110,76 L554,76"/>
+<text class="t-s" x="124" y="68"><tspan class="hl">1</tspan>  Start: POST /session  {prompt, scene, live}</text>
+<rect x="555" y="98" width="10" height="26" rx="2" fill="#199e70"/>
+<rect x="574" y="96" width="360" height="30" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="584" y="116"><tspan class="hl" style="fill:#199e70">2</tspan>  prompt: T5, cached (scene prompts at startup)</text>
+<rect x="555" y="134" width="10" height="26" rx="2" fill="#199e70"/>
+<rect x="574" y="132" width="400" height="30" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="584" y="152"><tspan class="hl" style="fill:#199e70">3</tspan>  start image: VAE-encoded at startup · init KV cache</text>
+<rect x="40" y="176" width="1110" height="280" rx="8" fill="none" stroke="#c98500" stroke-width="1.2" stroke-dasharray="6 4"/>
+<rect x="40" y="176" width="300" height="24" rx="4" fill="rgba(201,133,0,.18)"/>
+<text x="50" y="193" font-size="13" font-weight="650" fill="#c98500">loop · each chunk k, until the user stops</text>
+<rect x="555" y="208" width="10" height="26" rx="2" fill="#3987e5"/>
+<rect x="574" y="206" width="470" height="44" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="584" y="226"><tspan class="hl" style="fill:#3987e5">4</tspan>  latest action → camera; denoise chunk k · 4 steps + KV commit</text>
+<text class="t-m" x="604" y="242">≈ 0.58 s · 3 latent frames</text>
+<path class="ar-b" d="M560,282 L1004,282"/>
+<text class="t-s" x="574" y="274"><tspan class="hl">5</tspan>  send latent k to the decoder  ≈ 1.1 MB</text>
+<text class="t-m" x="574" y="298">TCP POST /decode?stream=1 · first=1 only for k = 0</text>
+<rect x="60" y="312" width="1070" height="132" rx="6" fill="rgba(12,163,12,.04)" stroke="#0ca30c" stroke-width="1.2" stroke-dasharray="4 4"/>
+<rect x="60" y="312" width="104" height="22" rx="4" fill="rgba(12,163,12,.18)"/>
+<text x="68" y="328" font-size="13" font-weight="650" fill="#0ca30c">in parallel</text>
+<rect x="555" y="338" width="10" height="26" rx="2" fill="#3987e5"/>
+<rect x="246" y="336" width="300" height="30" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="256" y="356"><tspan class="hl" style="fill:#3987e5">6a</tspan>  denoise chunk k+1  (back to 4)</text>
+<rect x="1005" y="338" width="10" height="26" rx="2" fill="#d95926"/>
+<rect x="746" y="336" width="250" height="44" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="756" y="356"><tspan class="hl" style="fill:#d95926">6b</tspan>  decode chunk k</text>
+<text class="t-m" x="776" y="372">≈ 0.1 s · 4 frames per step</text>
+<path class="ar-a" d="M1010,400 L116,400"/>
+<text class="t-s" x="124" y="392"><tspan class="hl">7</tspan>  frames to the app  (9–12 JPEGs per chunk)</text>
+<text class="t-m" x="574" y="392">relayed by DiT rank 0 → SSE, with server timings</text>
+<rect x="105" y="416" width="10" height="26" rx="2" fill="#c98500"/>
+<rect x="124" y="414" width="400" height="30" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="134" y="434"><tspan class="hl" style="fill:#c98500">8</tspan>  page plays them at ≈ 17 fps, about one chunk buffered</text>
+<path class="ar-b" d="M110,486 L554,486"/>
+<text class="t-s" x="124" y="478"><tspan class="hl">9</tspan>  user steers: POST /control  {action}  → applies from the next chunk</text>
+<rect x="105" y="504" width="10" height="26" rx="2" fill="#c98500"/>
+<rect x="124" y="502" width="700" height="30" rx="6" fill="rgba(255,255,255,.035)" stroke="rgba(255,255,255,.18)"/>
+<text class="t-s" x="134" y="522"><tspan class="hl" style="fill:#c98500">10</tspan>  press → frames at the browser ≈ 1.1 s  (wait 0.25 · DiT 0.58 · VAE 0.1 · net 0.13)</text>
+<path class="ar-b" d="M110,562 L554,562"/>
+<text class="t-s" x="124" y="554"><tspan class="hl">11</tspan>  Stop, or the tab closes → POST /stop · session ends</text>
+  </svg>
+  </div>
+</section>
+<div class="nt">Start images and scene prompts are encoded once when the server starts (steps 2-3). Then each chunk: rank 0 reads the latest action, the DiT denoises the chunk with that camera, and sends the latent to the decoder; the DiT denoises the next chunk while the decoder streams this chunk's frames back. Timings measured through the web page on half a trn3 (TP4 × CP8): 0.58 s per DiT chunk, 17.3 fps, median 1.07 s from a press to its first frame at the browser.</div></div>
+
+</div><!-- /stage -->
+
+<div id="jump"></div>
+<div id="hud"></div>
+<div id="notes"><h4>Presenter note</h4><p id="ntxt"></p></div>
+
+<script>
+(function(){
+  const stage = document.getElementById('stage');
+  const cells = [...document.querySelectorAll('.cell')];
+  const hud   = document.getElementById('hud');
+  const ntxt  = document.getElementById('ntxt');
+  const jumpEl= document.getElementById('jump');
+  let i = 0, ov = false, buf = '', bufT = null;
+
+  // lift .nt payloads out of the flow
+  const notes = cells.map(c => {
+    const n = c.querySelector('.nt');
+    const t = n ? n.textContent.trim() : '';
+    if (n) n.remove();
+    return t;
+  });
+
+  function fit(){
+    if (ov){
+      // thumbnails: scale each slide into its cell
+      cells.forEach(c => {
+        const s = c.clientWidth / 1280;
+        c.querySelector('.slide').style.transform = 'scale(' + s + ')';
+      });
+      stage.style.transform = 'none';
+    } else {
+      cells.forEach(c => c.querySelector('.slide').style.transform = 'none');
+      const s = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+      stage.style.transform = 'translate(-50%,-50%) scale(' + s + ')';
+    }
+  }
+
+  function render(){
+    cells.forEach((c, k) => {
+      c.hidden = !ov && k !== i;
+      c.classList.toggle('cur', k === i);
+    });
+    const ref = cells[i].dataset.ref;
+    hud.innerHTML = (ov ? 'overview · click a slide · ' : '')
+      + ref + ' &nbsp; ' + (i + 1) + '/' + cells.length
+      + ' &nbsp;&nbsp; <kbd>←→</kbd> <kbd>O</kbd> <kbd>N</kbd>';
+    ntxt.textContent = notes[i] || '—';
+    if (location.hash.slice(1) !== ref) history.replaceState(null, '', '#' + ref);
+    fit();
+    if (ov) cells[i].scrollIntoView({block:'nearest'});
+  }
+
+  function go(n){ i = Math.max(0, Math.min(cells.length - 1, n)); render(); }
+
+  function fromHash(){
+    const h = decodeURIComponent(location.hash.slice(1)).toUpperCase();
+    if (!h) return;
+    const k = cells.findIndex(c => c.dataset.ref.toUpperCase() === h);
+    if (k >= 0) i = k;
+  }
+
+  function jumpToRef(num){
+    const want = ('B' + num).toUpperCase();
+    const k = cells.findIndex(c => c.dataset.ref.toUpperCase() === want);
+    if (k >= 0) go(k);
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const k = e.key;
+    // digits open a jump buffer; a trailing letter extends it (so "9a" -> B9a)
+    if (/^[0-9]$/.test(k) || (buf && /^[a-z]$/i.test(k))){
+      buf += k; jumpEl.textContent = 'B' + buf;
+      document.body.classList.add('jump');
+      clearTimeout(bufT);
+      bufT = setTimeout(() => { document.body.classList.remove('jump'); buf = ''; }, 1400);
+      e.preventDefault(); return;
+    }
+    if (k === 'Enter'){
+      if (buf){ jumpToRef(buf); buf = ''; document.body.classList.remove('jump'); if (ov) toggleOv(); }
+      e.preventDefault(); return;
+    }
+    if (k === 'ArrowRight' || k === 'PageDown' || k === ' '){ go(i + 1); e.preventDefault(); }
+    else if (k === 'ArrowLeft' || k === 'PageUp'){ go(i - 1); e.preventDefault(); }
+    else if (k === 'ArrowDown' && ov){ go(i + 4); e.preventDefault(); }
+    else if (k === 'ArrowUp' && ov){ go(i - 4); e.preventDefault(); }
+    else if (k === 'Home'){ go(0); }
+    else if (k === 'End'){ go(cells.length - 1); }
+    else if (k === 'o' || k === 'O'){ toggleOv(); }
+    else if (k === 'n' || k === 'N'){ document.body.classList.toggle('notes'); }
+    else if (k === 'Escape'){ if (ov) toggleOv(); else document.body.classList.remove('notes'); }
+  });
+
+  function toggleOv(){ ov = !ov; document.body.classList.toggle('ov', ov); render(); }
+
+  cells.forEach((c, k) => c.addEventListener('click', () => { if (ov){ i = k; toggleOv(); } }));
+  window.addEventListener('resize', fit);
+
+
+  window.addEventListener('hashchange', () => { fromHash(); render(); });
+  fromHash();
+  render();
+})();
+</script>
+</body>
+</html>
