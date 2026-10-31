@@ -76,7 +76,7 @@ spec:
               mountPath: /dev/shm
           env:
             - name: BRANCH
-              value: "loop_engineering_xl"
+              value: "main"
             - name: LNC
               value: "2"
             - name: LAYOUTS
