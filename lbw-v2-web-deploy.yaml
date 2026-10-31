@@ -40,7 +40,7 @@ spec:
               exec python -u /app/web_app.py
           env:
             - name: BRANCH
-              value: "live-controls"
+              value: "main"
             - name: HOST
               value: "0.0.0.0"
             - name: LBW_URL

@@ -93,7 +93,7 @@ spec:
               mountPath: /logs
           env:
             - name: BRANCH
-              value: "live-controls"
+              value: "main"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC

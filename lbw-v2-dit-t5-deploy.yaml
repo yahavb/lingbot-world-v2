@@ -1,5 +1,7 @@
-# DiT + T5 streaming server (serve.py) on a whole trn3 node (16 devices, 64 ranks), with the
-# loop_engineering flags of kiro/LOOP_ENGINEERING.md (TP4 x CP16). Latent chunks go to
+# DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
+# with the q20_kbnw flags -- the half-instance row of kiro/LOOP_ENGINEERING.md (17.88 fps with an
+# inline VAE); streaming with lbw-v2-vae it measured 17.3 fps and ~1.1 s from a control press to
+# its frames at the browser. Latent chunks go to
 # lbw-v2-vae (VAE_URL). The converted checkpoint and compiled NEFFs live on the node
 # (hostPath /opt/lingbot-world-v2), shared with lbw-v2-i2v-validate-job.yaml.
 apiVersion: v1
@@ -33,7 +35,7 @@ spec:
         node-type: trn3-dev1
       resourceClaims:
         - name: neuroncores
-          resourceClaimTemplateName: xxl-lnc2
+          resourceClaimTemplateName: xl-lnc2
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
@@ -49,7 +51,7 @@ spec:
               CKPT=$NODE/lingbot-world-v2-14b-causal-fast
               export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
-              export NKI_ENABLE_TRACE_CACHE=1
+              export NKI_ENABLE_TRACE_CACHE="${NKI_ENABLE_TRACE_CACHE:-1}"
               export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
               export HF_HOME=/tmp/hf-cache
 
@@ -99,12 +101,12 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "180"
-              memory: 1800Gi
+              cpu: "90"
+              memory: 900Gi
               ephemeral-storage: 600Gi
             limits:
-              cpu: "190"
-              memory: 1900Gi
+              cpu: "95"
+              memory: 950Gi
               ephemeral-storage: 600Gi
           volumeMounts:
             - name: node-cache
@@ -115,7 +117,7 @@ spec:
               mountPath: /logs
           env:
             - name: BRANCH
-              value: "live-controls"
+              value: "main"
             - name: SEG_CHUNKS
               value: "14"
             - name: VAE_URL
@@ -123,11 +125,11 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
-              value: "64"
+              value: "32"
             - name: LNC
               value: "2"
             - name: CP
-              value: "16"
+              value: "8"
             - name: TP
               value: "4"
             - name: SIZE
@@ -199,6 +201,17 @@ spec:
             - name: LINGBOT_KEY_THREADS
               value: "4"
             - name: LINGBOT_IMG_BLOCK
+              value: "1"
+            # q20_kbnw (kiro/k8s_sweep.sh)
+            - name: LINGBOT_CTE_LOCAL
+              value: "1"
+            - name: LINGBOT_CTE_VGROUP
+              value: "8"
+            - name: NKI_ENABLE_TRACE_CACHE
+              value: "0"
+            - name: LINGBOT_K_BLOCKED
+              value: "1"
+            - name: LINGBOT_STEP_NOWRITE
               value: "1"
             - name: NEURON_CC_FLAGS
               value: "--internal-backend-options=--disable-cb-before-global-cc"
