@@ -435,6 +435,25 @@ def main():
         seq_mode=args.seq_mode)
 
     first_img = load_image(args.image)
+
+    # T5 embeddings by prompt: a new prompt costs ~3.5 s of the first chunk. Every rank runs the
+    # same prompts in the same order, so every rank's cache holds the same keys.
+    t5_cache = {}
+
+    def encode_prompt(p):
+        if p not in t5_cache:
+            if len(t5_cache) >= 64:
+                t5_cache.pop(next(iter(t5_cache)))
+            t5_cache[p] = [t.cpu() for t in t5([p], dev)]
+        return t5_cache[p]
+
+    t0 = time.perf_counter()
+    for sid in sorted(scene_imgs):
+        f = f"examples/{sid}/prompt.txt"
+        if os.path.isfile(f):
+            encode_prompt(open(f).read().strip())
+    if rank == 0:
+        logging.info(f"encoded {len(t5_cache)} scene prompts in {time.perf_counter() - t0:.1f} s")
     max_area = MAX_AREA_CONFIGS[args.size]
     target_hw = EXACT_GRID_SIZES.get(args.size)
     pipe.prewarm(first_img, max_area=max_area, target_hw=target_hw,
@@ -467,7 +486,7 @@ def main():
         rank switches, steers, pauses or stops at the same chunk. state["emit"] says
         where that chunk's frames go.
         """
-        embeds = [t.cpu() for t in t5([prompt], dev)]
+        embeds = encode_prompt(prompt)
         actions, starts = {}, {}
 
         def on_chunk(chunk_id, x0):
@@ -496,7 +515,7 @@ def main():
                 starts[chunk_id] = time.time()
                 out = {"camera": action_poses(action, args.chunk_size)}
                 if new_prompt is not None:
-                    out["context"] = [t.cpu() for t in t5([new_prompt], dev)]
+                    out["context"] = encode_prompt(new_prompt)
                 return out
 
         pipe.generate(
