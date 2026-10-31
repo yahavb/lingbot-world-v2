@@ -27,8 +27,10 @@ Decode runs in one of two places:
     POST /session   {"prompt": str, "scene": "02", "seed": int, "live": bool}
     POST /continue  {"prompt": str}                              -> next segment
         both -> text/event-stream of {"frame_index", "frame"(base64 JPEG), "chunk",
-           "action"}, ... {"done", "segment", "frames", "seconds"}
-    POST /control   {"action": str, "prompt": str}  (both optional) -> {"action"}
+           "action", "t"}, ... {"done", "segment", "frames", "seconds"}
+           t: server wall times of that chunk -- ctl (the /control it follows was
+           received), start (its denoise began), x0 (denoised), dec (frame decoded)
+    POST /control   {"action": str, "prompt": str}  (both optional) -> {"action", "t"}
     POST /stop      ends the running session
     GET  /health
     GET  /readiness
@@ -105,10 +107,10 @@ class Job:
         self.count = 0
         self.t0 = None
 
-    def emit(self, frame, chunk=None, action=None):
+    def emit(self, frame, chunk=None, action=None, t=None):
         self.count += 1
         self.frames.put({"frame_index": self.count - 1, "frame": frame,
-                         "chunk": chunk, "action": action})
+                         "chunk": chunk, "action": action, "t": t})
         # A dead connection behind a proxy (kubectl port-forward) may never look
         # disconnected; a live client that stops reading ends the session instead.
         if self.live and self.on_backlog is not None and self.frames.qsize() > BACKLOG:
@@ -137,6 +139,7 @@ class Scheduler:
         self.stop = False       # end the running session
         self.current = None     # job whose stream is open
         self.action = "auto"    # live camera control
+        self.action_t = None    # when it was received
         self.prompt = None      # live prompt switch, taken once
 
     def _drop(self, job, why):
@@ -150,22 +153,22 @@ class Scheduler:
             self._drop(self.cont, "a newer session started")
             self.pending, self.cont = job, None
             self.stop = self.running
-            self.action, self.prompt = "auto", None
+            self.action, self.action_t, self.prompt = "auto", None, None
             self.cv.notify_all()
 
     def control(self, action=None, prompt=None):
         with self.cv:
             if action is not None:
-                self.action = action
+                self.action, self.action_t = action, time.time()
             if prompt:
                 self.prompt = prompt
             return self.action
 
     def take_control(self):
-        """(action, prompt or None) for the next chunk."""
+        """(action, prompt or None, when the action arrived) for the next chunk."""
         with self.cv:
             p, self.prompt = self.prompt, None
-            return self.action, p
+            return self.action, p, self.action_t
 
     def stop_job(self, job):
         """End the session if `job` is still the one streaming (its client went away)."""
@@ -239,11 +242,19 @@ class RemoteDecoder:
                 if self.error is None:
                     buf = io.BytesIO()
                     torch.save(x0, buf)
-                    r = self.session.post(f"{self.url}/decode", params={"first": int(first)},
-                                          data=buf.getvalue(), timeout=600)
-                    r.raise_for_status()
-                    for frame in r.json()["frames"]:
-                        emit(frame)
+                    # stream=1: the VAE server sends each decode step's frames (NDJSON) as
+                    # soon as they exist, not the whole chunk at the end.
+                    with self.session.post(f"{self.url}/decode", params={"first": int(first), "stream": 1},
+                                           data=buf.getvalue(), timeout=600, stream=True) as r:
+                        r.raise_for_status()
+                        for line in r.iter_lines():
+                            if not line:
+                                continue
+                            part = json.loads(line)
+                            if "error" in part:
+                                raise RuntimeError(part["error"])
+                            for frame in part["frames"]:
+                                emit(frame)
             except Exception as e:
                 logging.exception("remote decode failed")
                 self.error = str(e)
@@ -333,7 +344,7 @@ def run_server(sched):
             raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
         action = sched.control(req.action, req.prompt)
         logging.info(f"control: action={action}" + (f" prompt={req.prompt[:60]!r}" if req.prompt else ""))
-        return {"action": action}
+        return {"action": action, "t": time.time()}
 
     @app.post("/stop")
     def stop():
@@ -428,17 +439,20 @@ def main():
         where that chunk's frames go.
         """
         embeds = [t.cpu() for t in t5([prompt], dev)]
-        actions = {}
+        actions, starts = {}, {}
 
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
+            x0 = x0.cpu() if rank == 0 else x0
+            times = {"ctl": ctl_times.pop(chunk_id, None), "start": starts.pop(chunk_id, None),
+                     "x0": time.time()}
 
             def emit(frame):
-                job_emit(frame, chunk_id, action)
+                job_emit(frame, chunk_id, action, dict(times, dec=time.time()))
             if VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None:
-                remote.submit(chunk_id == 0, x0.cpu(), emit)
+                remote.submit(chunk_id == 0, x0, emit)
 
         def chunk_control(chunk_id):
             while True:
@@ -450,6 +464,7 @@ def main():
                 if verb == "stop":
                     return {"stop": True}
                 actions[chunk_id] = action or "auto"
+                starts[chunk_id] = time.time()
                 out = {"camera": action_poses(action, args.chunk_size)}
                 if new_prompt is not None:
                     out["context"] = [t.cpu() for t in t5([new_prompt], dev)]
@@ -473,7 +488,8 @@ def main():
             chunk_control=chunk_control,
             max_chunks=MAX_CHUNKS)
 
-    state = {"emit": lambda f, c=None, a=None: None}
+    state = {"emit": lambda f, c=None, a=None, t=None: None}
+    ctl_times = {}  # rank 0: chunk -> when the /control it follows arrived
 
     # Warmup: a 3-segment session, switching prompts at both boundaries and steering the
     # camera in between, so every graph a real session uses -- including the prompt-switch
@@ -515,6 +531,7 @@ def main():
         live = rank == 0 and job.live
         seg = {"job": job, "n": 1, "end": MAX_CHUNKS if live else SEG_CHUNKS,
                "open": True, "idle": None}
+        ctl_times.clear()
         if rank == 0:
             job.t0 = time.perf_counter()
             state["emit"] = job.emit
@@ -531,7 +548,8 @@ def main():
             if chunk_id < seg["end"]:
                 if sched.stop:
                     return ("stop", None, None)
-                action, new_prompt = sched.take_control()
+                action, new_prompt, t_ctl = sched.take_control()
+                ctl_times[chunk_id] = t_ctl
                 return ("go", new_prompt, action)
             if seg["open"]:
                 close_segment()
@@ -545,7 +563,8 @@ def main():
             nxt.t0 = time.perf_counter()
             state["emit"] = nxt.emit
             logging.info(f"segment {seg['n']}: {nxt.prompt[:80]!r}")
-            return ("go", nxt.prompt, sched.take_control()[0])
+            action, _, ctl_times[chunk_id] = sched.take_control()
+            return ("go", nxt.prompt, action)
 
         try:
             run_session(m["prompt"], img, m["seed"], m["action_path"], control)
@@ -558,7 +577,7 @@ def main():
             raise
         finally:
             if rank == 0:
-                state["emit"] = lambda f, c=None, a=None: None
+                state["emit"] = lambda f, c=None, a=None, t=None: None
                 sched.end_session()
                 logging.info("session ended")
 

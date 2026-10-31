@@ -1,5 +1,5 @@
 # Streaming VAE decode server (vae_serve.py) for lbw-v2-dit-t5: 4 trn3 devices, 32 ranks, the
-# fused decoder on 4 x 8 height x width tiles (LINGBOT_VAE_FUSED / _2D), 3 latent frames per step.
+# fused decoder on 4 x 8 height x width tiles (LINGBOT_VAE_FUSED / _2D), frames streamed per step.
 apiVersion: v1
 kind: Service
 metadata:
@@ -116,8 +116,9 @@ spec:
               value: "-O1"
             - name: LINGBOT_VAE_NORM
               value: "mm"
+            # one latent frame (4 video frames) per step: each step's frames stream out as it lands
             - name: LINGBOT_VAE_T
-              value: "3"
+              value: "1"
             - name: LINGBOT_VAE_PER_DEVICE
               value: "4"
             - name: NEURON_CC_FLAGS

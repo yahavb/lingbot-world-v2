@@ -445,10 +445,11 @@ class FusedWidthDecoder:
         return out.transpose(-1, -2).contiguous() if _SWAP else out
 
     @torch.no_grad()
-    def decode_chunk(self, z, scale, first):
+    def decode_chunk(self, z, scale, first, on_step=None):
         """decode() split over consecutive latent chunks: the causal caches carry over between
         calls, first=True on the first chunk. The chunks of one video decode to the same frames
-        as one decode() of the whole latent."""
+        as one decode() of the whole latent. on_step(frames) gets each step's frames as soon as
+        that step is issued (LINGBOT_VAE_T latent frames per step); the call then returns None."""
         if self.sel is None:
             self.sel = _selectors(z.device)
         zd = self.model.z_dim
@@ -461,13 +462,20 @@ class FusedWidthDecoder:
             x = x.transpose(-1, -2).contiguous()
         k = max(1, int(os.environ.get("LINGBOT_VAE_T", "1")))
         outs, i, n = [], 0, x.shape[2]
+
+        def put(out):
+            out = out.transpose(-1, -2).contiguous() if _SWAP else out
+            if on_step is not None:
+                on_step(out)
+            else:
+                outs.append(out)
         if first:
             out, self._caches = self._step(x[:, :, :1], None, first=True)
-            outs, i = [out], 1
+            put(out)
+            i = 1
         while i < n:
             j = min(n, i + k)
             out, self._caches = self._step(x[:, :, i:j], self._caches, first=False)
-            outs.append(out)
+            put(out)
             i = j
-        out = torch.cat(outs, 2)
-        return out.transpose(-1, -2).contiguous() if _SWAP else out
+        return None if on_step is not None else torch.cat(outs, 2)

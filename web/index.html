@@ -73,6 +73,7 @@ const KEYS = { w: "forward", arrowup: "forward", s: "back", arrowdown: "back", a
   arrowleft: "left", d: "right", arrowright: "right", r: "up", f: "down", " ": "stop", p: "auto" };
 let scenes = [], abort = null, buffer = [], arrivals = [], shown = [], lastChunk = -1;
 let playing = false, nextAt = 0, playFps = 16, pressed = null, latencyMs = null, total = 0;
+let offsetMs = 0, breakdown = "";  // server clock - local clock (ms), from /control round trips
 
 function say(msg) { statusEl.textContent = msg; }
 
@@ -93,8 +94,13 @@ function setPressed(action) {
 }
 
 async function control(body) {
+  const t0 = Date.now();
   const r = await fetch("api/control", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body) });
+  if (r.ok) {
+    const j = await r.json(), t1 = Date.now();
+    if (j.t) offsetMs = j.t * 1000 - (t0 + t1) / 2;
+  }
   return r.ok;
 }
 
@@ -104,6 +110,18 @@ async function act(action) {
   latencyMs = null;
   if (abort) await control({ action });
   say(action === "auto" ? "Following the scene path." : action === "stop" ? "Holding still." : `Moving ${action}.`);
+}
+
+// Where the press-to-screen time went, from the server times on the first frame that shows it.
+function timing(f, shownAt) {
+  const t = f.t;
+  if (!t || !t.start) return "";
+  const local = (x) => (x * 1000 - offsetMs);                    // server s -> local epoch ms
+  const pressEpoch = performance.timeOrigin + pressed.t, shownEpoch = performance.timeOrigin + shownAt;
+  const arriveEpoch = performance.timeOrigin + f.arrived;
+  const sec = (a, b) => ((b - a) / 1000).toFixed(2);
+  return `wait ${sec(pressEpoch, local(t.start))}  dit ${sec(local(t.start), local(t.x0))}  ` +
+    `vae ${sec(local(t.x0), local(t.dec))}  net ${sec(local(t.dec), arriveEpoch)}  buf ${sec(arriveEpoch, shownEpoch)}`;
 }
 
 function rate(list, windowMs) {
@@ -117,19 +135,24 @@ function tick(now) {
     const f = buffer.shift();
     img.src = "data:image/jpeg;base64," + f.frame;
     shown.push(now);
-    if (pressed && latencyMs === null && f.action === pressed.action && f.chunk > pressed.after)
+    if (pressed && latencyMs === null && f.action === pressed.action && f.chunk > pressed.after) {
       latencyMs = now - pressed.t;
-    // Play at the generation rate; drift faster or slower to keep about two chunks buffered.
+      breakdown = timing(f, now);
+    }
+    // Play at the generation rate, about one chunk buffered. After a press, frames made before
+    // it play 1.5x faster so the new motion comes on screen sooner.
     const gen = rate(arrivals, 6000);
     if (gen > 0) playFps = gen;
-    const adj = buffer.length > 30 ? 1.15 : buffer.length < 8 ? 0.85 : 1;
+    const catchUp = pressed && latencyMs === null;
+    const adj = catchUp ? 1.5 : buffer.length > 20 ? 1.15 : buffer.length < 3 ? 0.85 : 1;
     nextAt = Math.max(nextAt + 1000 / (playFps * adj), now - 50);
   }
   if (playing && !buffer.length && abort === null) playing = false;
   hud.textContent =
     `generated ${rate(arrivals, 6000).toFixed(1)} fps   shown ${rate(shown, 3000).toFixed(1)} fps\n` +
     `buffer ${buffer.length}   frames ${total}   chunk ${lastChunk}\n` +
-    `control latency ${latencyMs === null ? "-" : (latencyMs / 1000).toFixed(2) + " s"}`;
+    `control latency ${latencyMs === null ? "-" : (latencyMs / 1000).toFixed(2) + " s"}` +
+    (breakdown ? `\n${breakdown}` : "");
   requestAnimationFrame(tick);
 }
 
@@ -159,10 +182,11 @@ async function start() {
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
         if (ev.frame) {
-          buffer.push(ev); arrivals.push(performance.now()); total++;
+          ev.arrived = performance.now();
+          buffer.push(ev); arrivals.push(ev.arrived); total++;
           if (ev.chunk > lastChunk) lastChunk = ev.chunk;
           if (first) { first = false; say("Streaming. Use the arrows or W A S D to steer."); }
-          if (!playing && buffer.length >= 12) { playing = true; nextAt = performance.now(); }
+          if (!playing && buffer.length >= 8) { playing = true; nextAt = performance.now(); }
         } else if (ev.error) say(`Error: ${ev.error}`);
         else if (ev.superseded) say(`Stopped: ${ev.superseded}`);
         else if (ev.done) say(`Session ended: ${ev.frames} frames in ${ev.seconds} s.`);
