@@ -69,6 +69,26 @@ chunk-0 prediction is 0.33 from fp32 (13× `main`'s error), so its 10 dB traject
 There is no fp32 reference for the whole 7-chunk rollout; the per-chunk growth of the `loop` vs
 `main` difference matches the layout-vs-layout divergence in Correctness.
 
+## Half an instance: 8 trn3 devices (`kiro/k8s_sweep.sh`, `lbw-v2-i2v-sweep-lnc{1,2}-job.yaml`)
+
+`q20_kbnw` flags, one k8s pod per claim (`xl-lnc2`: 8 devices, 32 ranks; `xl-lnc1`: 8 devices,
+64 ranks), public image torch-neuronx 2.14.0 / SDK 2.33, the job's spec. GEN = the steady pass of
+`LINGBOT_BENCH_RUNS=2`; VAE = the faster of two decodes; fps = 81 / (GEN + VAE). Quality: c0s0 vs
+the fp32 CPU forward (`kiro/ref_fp32_c0s0.py`; 16-device `main` 0.0257, `q16` 0.0125) and the VAE
+frames vs an fp32 CPU decode of the same latents.
+
+| Claim | Layout | GEN (s) | VAE (s) | fps | c0s0 vs fp32 | VAE vs fp32 decode |
+|---|---|---|---|---|---|---|
+| `xl-lnc2` | **TP4 × CP8** | **4.12** | **0.41** | **17.88** (repeat 17.85, bit-identical) | 0.0108 | 52.71 dB |
+| `xl-lnc2` | TP8 × CP4 | 4.44 | 0.41 | 16.70 | 0.0102 | 52.71 dB |
+| `xl-lnc2` | TP2 × CP16 | 5.08 | 0.41 | 14.74 | 0.0146 | 52.70 dB |
+| `xl-lnc1` | TP8 × CP8 | 4.94 | 0.48 | 14.97 | 0.0122 | 52.70 dB |
+| `xl-lnc1` | TP4 × CP16 | -- | -- | out of device memory (twice) | -- | -- |
+
+**Half an instance gives 17.9 fps at TP4 × CP8, LNC2** (16 devices, TP4 × CP16: 23.0 fps on the
+same harness with `q16`). At LNC1 every rank has half the device memory of an LNC2 rank: TP4's
+weight share plus the KV cache does not fit, and TP8 × CP8 is slower than LNC2's TP4 × CP8.
+
 ## Toward 4.8 s per video, measured step by step (16 devices)
 
 Each row is `kiro/run_job16.sh` on all 16 devices at TP4 × CP16 and adds to the row above (flags
