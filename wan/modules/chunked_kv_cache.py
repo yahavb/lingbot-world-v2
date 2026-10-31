@@ -77,7 +77,7 @@ def chunk_routing(chunk_index, n_chunks):
 
 
 def allocate_self_kv_chunks(num_layers, batch, chunk_tokens, heads, head_dim,
-                            n_chunks, dtype, device, n_major=False):
+                            n_chunks, dtype, device, n_major=False, own_tokens=0):
     """Per block, `n_chunks` INDEPENDENT K and V buffers.
 
     Layout is `[B, chunk_tokens, N, D]`, or `(N, chunk_tokens, D)` when `n_major`.
@@ -87,6 +87,10 @@ def allocate_self_kv_chunks(num_layers, batch, chunk_tokens, heads, head_dim,
     distinct graph per destination ordering: the tuple shape is constant at steady
     state, so tensor identity is the only thing distinguishing one routing from
     another.
+
+    own_tokens > 0 (LINGBOT_ATTN_SPLIT, N-major layers only): per chunk slot also "ko"/"vo", this
+    CP rank's own `own_tokens` of the chunk (its pre-gather shard, same layouts), so the split
+    attention can read its slice of every cached chunk without a rank-dependent offset.
     """
     # PER-LAYER layout. n_major may be a bool (every layer the same, the old behaviour)
     # or a per-layer sequence, because hybrid per-layer attention gives a hot layer the
@@ -147,7 +151,21 @@ def allocate_self_kv_chunks(num_layers, batch, chunk_tokens, heads, head_dim,
                     pass
             k_chunks.append(k)
             v_chunks.append(v)
-        cache.append({"k": k_chunks, "v": v_chunks})
+        entry = {"k": k_chunks, "v": v_chunks}
+        if own_tokens and n_major:
+            ko_shape = ((heads, own_tokens, head_dim) if _k_nld else (heads, head_dim, own_tokens))
+            entry["ko"], entry["vo"] = [], []
+            for _ in range(n_chunks):
+                ko = torch.zeros(*ko_shape, dtype=dtype, device=device)
+                vo = torch.zeros(heads, own_tokens, head_dim, dtype=dtype, device=device)
+                for t in (ko, vo):
+                    try:
+                        torch._dynamo.mark_static_address(t)
+                    except Exception:
+                        pass
+                entry["ko"].append(ko)
+                entry["vo"].append(vo)
+        cache.append(entry)
     return cache
 
 
@@ -164,11 +182,19 @@ def ordered_chunks_by_block(cache, destination, leading):
     return tuple(p[0] for p in pairs), tuple(p[1] for p in pairs)
 
 
+def ordered_own_chunks_by_block(cache, destination, leading):
+    """The own-shard buffers ("ko"/"vo", see allocate_self_kv_chunks) in the same order, per block;
+    None for a block without them."""
+    order = (*leading, destination)
+    return tuple((tuple(bc["ko"][i] for i in order), tuple(bc["vo"][i] for i in order))
+                 if "ko" in bc else None for bc in cache)
+
+
 def chunk_bytes(cache):
     """Total bytes held by a chunked cache, for the HBM banner."""
     total = 0
     for bc in cache:
-        for key in ("k", "v"):
-            for t in bc[key]:
+        for key in ("k", "v", "ko", "vo"):
+            for t in bc.get(key, ()):
                 total += t.numel() * t.element_size()
     return total

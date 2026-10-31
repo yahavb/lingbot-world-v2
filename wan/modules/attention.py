@@ -70,12 +70,17 @@ if ATTENTION_BACKEND == "cte":
         # "module ... has no attribute 'func'". Import from the submodule and
         # assert callable, so a future layout change fails on this line with a
         # clear message instead of inside the kernel wrapper.
-        from nkilib.core.attention.attention_cte import attention_cte as _cte_kernel
+        if os.environ.get("LINGBOT_CTE_LOCAL", "0") == "1":
+            # kernels/attention_cte_lb.py: the installed kernel vendored for tuning (lingbot: marks)
+            from kernels.attention_cte_lb import attention_cte as _cte_kernel
+        else:
+            from nkilib.core.attention.attention_cte import attention_cte as _cte_kernel
         assert callable(_cte_kernel), (
             f"expected a callable attention_cte, got {type(_cte_kernel)}")
         _attention_cte = wrap_nki(_cte_kernel)
         _CTE_AVAILABLE = True
-        _log_kernel_ok("[attention.py] kernel: attention_cte (only)")
+        _log_kernel_ok("[attention.py] kernel: attention_cte (only)"
+                       + (" [vendored]" if os.environ.get("LINGBOT_CTE_LOCAL", "0") == "1" else ""))
     except Exception as e:
         print(f"[attention.py] attention_cte: FAILED rank={_RANK} ({e})")
         raise RuntimeError(
@@ -517,17 +522,20 @@ def cte_prep_q(q, dtype=torch.bfloat16):
     return q_c, lq
 
 
-def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None):
+def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1):
     """Unnormalized attention (out, row max, row sum) of one KV chunk -- or of two, with the
     second given as the kernel's prefix-caching prior (k_prior/v_prior, all of it used) -- for
     cte_merge. Two chunks in one call is the same softmax over their union, computed by the
-    kernel's own online softmax instead of by cte_merge."""
+    kernel's own online softmax instead of by cte_merge. k_blocks > 1 (vendored kernel only,
+    LINGBOT_K_BLOCKED): K and the K prior are in rank-blocked memory, see kernels/attention_cte_lb."""
     d = int(q_c.shape[-1])
     tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
     kw = {}
+    if k_blocks > 1:
+        kw["k_blocks"] = int(k_blocks)
     if k_prior is not None:
         lp = int(v_prior.shape[1])
-        kw = dict(k_prior=k_prior, v_prior=v_prior,
+        kw.update(k_prior=k_prior, v_prior=v_prior,
                   prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
     o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
                                    tp_q=True, tp_k=tp_k, tp_out=False,

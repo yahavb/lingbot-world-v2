@@ -38,7 +38,8 @@ from wan.modules.attention import (
     fa2_ag_attention,
     fa2_ag_available,
 )
-from wan.modules.chunked_kv_cache import chunk_routing, ordered_chunks_by_block
+from wan.modules.chunked_kv_cache import (chunk_routing, ordered_chunks_by_block,
+                                          ordered_own_chunks_by_block)
 
 # HYBRID PER-LAYER ATTENTION -- the reference implementation PR #90, the half of const-max we never ported.
 #
@@ -142,6 +143,32 @@ _KV_CLONE = os.environ.get("LINGBOT_KV_CLONE", "0") == "1"
 # work at the price of 128. Run the first floor(Lq / 128) * 128 queries through the kernel and the
 # remaining rows as fp32 matmuls + softmax over all KV chunks (xla_attention_rows).
 _ATTN_REM = os.environ.get("LINGBOT_ATTN_REM", "0") == "1"
+# LINGBOT_ATTN_SPLIT=1 (with LINGBOT_ATTN_EARLY, needs the own-shard cache): the same split of the
+# queries into full 128-row tiles + a remainder (14 of 270 rows per rank), but the remainder rows
+# of ALL CP ranks are gathered and every rank attends them to ITS OWN shard of each KV chunk
+# (1/16 of the keys); an all-to-all returns each rank the 16 partial results of its rows, merged
+# with the exact running-max rescale. Per rank: 2 query tiles over all keys + 2 over 1/16 of them,
+# instead of 3 over all keys.
+_ATTN_SPLIT = os.environ.get("LINGBOT_ATTN_SPLIT", "0") == "1"
+_DUMP_BLOCKS = os.environ.get("LINGBOT_DUMP_BLOCKS", "")
+_Q_FIRST = os.environ.get("LINGBOT_Q_FIRST", "0") == "1"
+_STEP_NOWRITE = os.environ.get("LINGBOT_STEP_NOWRITE", "0") == "1"
+# LINGBOT_LEAD_AFTER_KV=1 (with LINGBOT_ATTN_EARLY): the attention calls on the cached chunks take Q
+# through a zero-valued term computed from the new chunk's local K and V shards (the inputs of the
+# CP gathers), so the scheduler has to run the K/V projections, and can issue both gathers, before
+# those calls, which then overlap the gathers. Profiled without it (STEP_NOWRITE + Q_FIRST), the
+# cached calls ran first (200-600 us), then the K/V projections, then both gathers with every engine
+# idle from 800 to 1100 us. Q gains +0.0, so the values are unchanged.
+_LEAD_AFTER_KV = os.environ.get("LINGBOT_LEAD_AFTER_KV", "0") == "1"
+# LINGBOT_K_BLOCKED=1 (with LINGBOT_ATTN_EARLY and LINGBOT_CTE_LOCAL): the K cache holds each chunk
+# as gathered, CP rank blocks [cp, n, d, l] viewed as [n, d, cp * l], and the vendored kernel loads
+# it with k_blocks=cp. Saves the [cp, n, d, l] -> [n, d, cp, l] permute (11 MB in 540-byte runs).
+# Key order is rank-major in both layouts, so V (still permuted) matches and the math is the same.
+_K_BLOCKED = os.environ.get("LINGBOT_K_BLOCKED", "0") == "1"
+# LINGBOT_STEP_NOWRITE=1 (with LINGBOT_ATTN_EARLY): a denoise-step forward (image2video passes
+# kv_commit=False) does not write the new chunk's K/V into its cache slot. The next step overwrites
+# the slot and the chunk's commit forward (t=0) writes the K/V later chunks read, so these writes
+# are dead; the attention reads the gathered tensors directly. Same values, no 2 x 11 MB copies.
 # LINGBOT_FILM_BATCH=1 (with LINGBOT_FILM_A2A): all 40 blocks' camera FiLM params in ONE compiled
 # graph per chunk instead of 40 (22 ms per chunk measured, mostly per-graph launch cost).
 _FILM_BATCH = os.environ.get("LINGBOT_FILM_BATCH", "0") == "1"
@@ -155,6 +182,8 @@ _HEAD_COMPILE = os.environ.get("LINGBOT_HEAD_COMPILE", "0") == "1"
 # all-gather of the stacked local shards instead of two. Profiled, the two 11 MB Ring all-gathers ran
 # back to back with a ~110 us gap between them. Data movement only.
 _KV_GATHER1 = os.environ.get("LINGBOT_KV_GATHER1", "0") == "1"
+assert not (_K_BLOCKED and (_KV_GATHER1 or _ATTN_SPLIT or _ATTN_REM)), \
+    "LINGBOT_K_BLOCKED: the KV_GATHER1 / ATTN_SPLIT / ATTN_REM paths read K in the plain layout"
 
 
 def _films_multi(raw_blocks, c_cat, K, P):
@@ -175,6 +204,37 @@ def _films_multi(raw_blocks, c_cat, K, P):
             pair.append(y)
         out.append(tuple(pair))
     return out
+
+
+def _split_remainder(qrg, own_kv, cp, rr, n, d):
+    """LINGBOT_ATTN_SPLIT: exact attention of every CP rank's remainder query rows, computed
+    across the CP group. qrg [cp * rr, n, d] holds the rr remainder rows of each rank in rank
+    order; own_kv lists this rank's OWN shard of every KV chunk in the window (K [n, d, l] or
+    [n, l, d], V [n, l, d]). One kernel call attends all cp * rr rows to the concatenated own
+    shards, an all-to-all hands rank t the cp partials (unnormalized out, row max, row sum) of
+    its rows, and they are merged with the running-max rescale. Returns [1, rr, n, d] bf16."""
+    q_c, _ = cte_prep_q(qrg.unsqueeze(0))                         # [n, ceil(cp*rr/128)*128, d]
+    if len(own_kv) == 1:
+        kc, vc = own_kv[0]
+    else:
+        _k_ndl = int(own_kv[0][0].shape[1]) == d and int(own_kv[0][0].shape[-1]) != d
+        kc = torch.cat([k_ for k_, _ in own_kv], dim=2 if _k_ndl else 1)
+        vc = torch.cat([v_ for _, v_ in own_kv], dim=1)
+    o, m, s = cte_partial(q_c, kc, vc)
+    R = cp * rr
+    g = int(m.shape[2])
+    m = m.transpose(1, 2).reshape(n, g * 128)[:, :R]               # per query, [n, R]
+    s = s.transpose(1, 2).reshape(n, g * 128)[:, :R]
+    pk = torch.cat([o[:, :R].float(), m.unsqueeze(-1), s.unsqueeze(-1)], dim=-1)   # [n, R, d+2]
+    pk = pk.view(n, cp, rr, d + 2).permute(1, 0, 2, 3).reshape(cp * n * rr, d + 2)
+    r = fc.all_to_all_single(pk.contiguous(), None, None, tp.mesh_submesh("cp"))
+    r = r.view(cp, n, rr, d + 2)                                  # partials of MY rows, by source
+    o_r, m_r, s_r = r[..., :d], r[..., d], r[..., d + 1]
+    mx = m_r.amax(0)                                              # [n, rr]
+    w = torch.exp(m_r - mx.unsqueeze(0))                          # [cp, n, rr]
+    den = (w * s_r).sum(0)
+    out = (w.unsqueeze(-1) * o_r).sum(0) / den.unsqueeze(-1)      # [n, rr, d]
+    return out.permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
 
 
 def _film_check_log(used, ref, k):
@@ -704,6 +764,7 @@ class CausalWanSelfAttention(nn.Module):
         grid_ints=None,
         _sp_scatter=False,
         fused=None,
+        kv_write=True,
     ):
         r"""
         Args:
@@ -723,6 +784,16 @@ class CausalWanSelfAttention(nn.Module):
         # query, key, value function
         def qkv_fn(x):
             x = x.to(self.q.weight.dtype)
+            if _Q_FIRST and getattr(self, 'tp_enabled', False) and self.qk_norm:
+                # LINGBOT_Q_FIRST=1: Q (projection + norm) first; K and V take their input through a
+                # zero-valued term computed from Q, so the scheduler cannot start them (and the CP
+                # gathers they feed) before Q, and the attention on the cached chunks, which needs
+                # only Q, can overlap the gathers. The term is exactly 0 for finite Q.
+                q = _tp_rms_norm(self.q(x), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                xk = x + (q[:, :1, :1, :1].float() * 0.0).to(x.dtype)
+                k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                v = self.v(xk).view(b, s, n, d)
+                return q, k, v
             if getattr(self, 'tp_enabled', False) and self.qk_norm:
                 q = _tp_rms_norm(self.q(x), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
                 k = _tp_rms_norm(self.k(x), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
@@ -883,7 +954,9 @@ class CausalWanSelfAttention(nn.Module):
             x = torch.cat([cte_merge_rows(parts_a), cte_merge_rows(parts_b)], dim=1)
             return self._out_proj(x, _async_out, scatter=_sp_scatter)
         if kv_chunks is not None:
-            k_chunks, v_chunks = kv_chunks
+            k_chunks, v_chunks = kv_chunks[0], kv_chunks[1]
+            # (k own shards, v own shards) of the same slots (LINGBOT_ATTN_SPLIT), else None
+            own_chunks = kv_chunks[2] if len(kv_chunks) > 2 else None
             # FUSED all-gather + const-max attention when that backend is loaded. The
             # kernel does the CP gather itself and writes the gathered chunk into
             # k_chunks[-1]/v_chunks[-1] as must-alias outputs, so it replaces the
@@ -911,12 +984,26 @@ class CausalWanSelfAttention(nn.Module):
                 # chunk: local shard -> cache layout -> all-gather on a new leading axis -> one
                 # contiguous-run permute into the destination buffer.
                 _lq_all = int(roped_query.shape[1])
-                _lq_main = (_lq_all // 128) * 128 if (_ATTN_REM and _lq_all % 128) else _lq_all
-                q_c, lq = cte_prep_q(roped_query[:, :_lq_main])
                 kd, vd = k_chunks[-1], v_chunks[-1]
                 _cp = cp_w_shard[0]
                 _l, _n, _d = (int(t) for t in roped_key.shape[1:])
                 _k_ndl = int(kd.shape[1]) == _d                 # K [n, d, L] (else [n, L, d])
+                _split = (_ATTN_SPLIT and own_chunks is not None and _l % 128 != 0
+                          and _l > 128)
+                if _split:
+                    _lq_main = (_l // 128) * 128                # full tiles of REAL rows
+                elif _ATTN_REM and _lq_all % 128:
+                    _lq_main = (_lq_all // 128) * 128
+                else:
+                    _lq_main = _lq_all
+                q_c, lq = cte_prep_q(roped_query[:, :_lq_main])
+                # The local K / V shards in the cache layout, as the gathers take them (computed once
+                # here when LINGBOT_LEAD_AFTER_KV needs them, else inline below: the same ops).
+                _kin = _vin = None
+                if _LEAD_AFTER_KV and not _KV_GATHER1:
+                    _kin = (roped_key[0].permute(1, 2, 0) if _k_ndl
+                            else roped_key[0].permute(1, 0, 2)).contiguous()
+                    _vin = v[0].permute(1, 0, 2).contiguous()
 
                 def _gather_new():
                     if _KV_GATHER1:
@@ -930,32 +1017,68 @@ class CausalWanSelfAttention(nn.Module):
                         else:
                             kg = g[:, 0].view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
                         return kg, g[:, 1].view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
-                    if _k_ndl:
-                        kg = tp.all_gather_fn(roped_key[0].permute(1, 2, 0).contiguous(), 0, "cp")
+                    kin = _kin if _kin is not None else (
+                        roped_key[0].permute(1, 2, 0) if _k_ndl
+                        else roped_key[0].permute(1, 0, 2)).contiguous()
+                    vin = _vin if _vin is not None else v[0].permute(1, 0, 2).contiguous()
+                    if _k_ndl and _K_BLOCKED:
+                        kg = tp.all_gather_fn(kin, 0, "cp")
+                        kg = kg.view(_n, _d, _cp * _l)          # memory: [cp, n, d, l]
+                    elif _k_ndl:
+                        kg = tp.all_gather_fn(kin, 0, "cp")
                         kg = kg.view(_cp, _n, _d, _l).permute(1, 2, 0, 3)
                     else:
-                        kg = tp.all_gather_fn(roped_key[0].permute(1, 0, 2).contiguous(), 0, "cp")
+                        kg = tp.all_gather_fn(kin, 0, "cp")
                         kg = kg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
-                    vg = tp.all_gather_fn(v[0].permute(1, 0, 2).contiguous(), 0, "cp")
+                    vg = tp.all_gather_fn(vin, 0, "cp")
                     return kg, vg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
                 if _ATTN_EARLY == 2:
                     kg, vg = _gather_new()
+                if _split:
+                    # remainder rows [_lq_main, _l) of every CP rank, in rank order
+                    _rr = _l - _lq_main
+                    qrg = tp.all_gather_fn(roped_query[0, _lq_main:_l].contiguous(), 0, "cp")
                 lead = list(zip(k_chunks[:-1], v_chunks[:-1]))
                 if _KV_CLONE:
                     lead = [(kc_ * 1, vc_ * 1) for kc_, vc_ in lead]
                 last = lead.pop() if (_ATTN_PAIR and lead) else None
                 parts = []
+                _kb = _cp if (_K_BLOCKED and _k_ndl) else 1
+                q_lead = q_c
+                if _kin is not None and lead:
+                    # LINGBOT_LEAD_AFTER_KV: +0.0 from one element of each gather input
+                    _z = _kin.reshape(-1)[:1].float() * 0.0 + _vin.reshape(-1)[:1].float() * 0.0
+                    q_lead = q_c + _z.to(q_c.dtype)
                 while _ATTN_PAIR and len(lead) >= 2:
                     (ka, va), (kb, vb) = lead.pop(0), lead.pop(0)
-                    parts.append(cte_partial(q_c, kb, vb, ka, va))
-                parts += [cte_partial(q_c, kc, vc) for kc, vc in lead]
+                    parts.append(cte_partial(q_lead, kb, vb, ka, va, k_blocks=_kb))
+                parts += [cte_partial(q_lead, kc, vc, k_blocks=_kb) for kc, vc in lead]
+                if _split:
+                    # This rank's own shard of the new chunk (the pre-gather K/V, cache layout)
+                    # into its own-shard slot; the remainder attends it straight from the graph.
+                    ko_l, vo_l = own_chunks
+                    k_own = (roped_key[0].permute(1, 2, 0) if _k_ndl
+                             else roped_key[0].permute(1, 0, 2)).contiguous()
+                    v_own = v[0].permute(1, 0, 2).contiguous()
+                    ko_l[-1].copy_(k_own)
+                    vo_l[-1].copy_(v_own)
+                    x_rem = _split_remainder(qrg, list(zip(ko_l[:-1], vo_l[:-1])) + [(k_own, v_own)],
+                                             _cp, _rr, _n, _d)
                 if _ATTN_EARLY != 2:
                     kg, vg = _gather_new()
-                kd.copy_(kg.reshape(kd.shape))
-                vd.copy_(vg.reshape(vd.shape))
-                parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ())))
+                if kv_write:
+                    kd.copy_(kg.reshape(kd.shape))
+                    vd.copy_(vg.reshape(vd.shape))
+                else:
+                    # LINGBOT_STEP_NOWRITE: dead write skipped, attend the gathered chunk itself
+                    kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ()),
+                                         k_blocks=_kb))
                 x = cte_merge(parts, lq)
-                if _lq_main < _lq_all:
+                if _split:
+                    x = torch.cat([x, x_rem] + ([x.new_zeros(1, _lq_all - _l, _n, _d)]
+                                                if _lq_all > _l else []), dim=1)
+                elif _lq_main < _lq_all:
                     x_rem = xla_attention_rows(roped_query[:, _lq_main:],
                                                list(k_chunks[:-1]) + [kd], list(v_chunks[:-1]) + [vd])
                     x = torch.cat([x, x_rem], dim=1)
@@ -1392,6 +1515,7 @@ class CausalWanAttentionBlock(nn.Module):
         kv_chunks=None,
         grid_ints=None,
         fused=None,
+        kv_write=True,
     ):
         r"""
         Args:
@@ -1424,7 +1548,7 @@ class CausalWanAttentionBlock(nn.Module):
                 kv_write_start=kv_write_start, kv_write_end=kv_write_end,
                 kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
                 kv_current_end=kv_current_end, kv_chunks=kv_chunks,
-                grid_ints=grid_ints, _sp_scatter=True, fused=fused)
+                grid_ints=grid_ints, _sp_scatter=True, fused=fused, kv_write=kv_write)
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 xs = (xs + y * e[2].squeeze(2)).to(_rdt)
             if dit_cond_dict is not None and "cam_film" in dit_cond_dict:
@@ -1460,7 +1584,7 @@ class CausalWanAttentionBlock(nn.Module):
             kv_write_start=kv_write_start, kv_write_end=kv_write_end,
             kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
             kv_current_end=kv_current_end, kv_chunks=kv_chunks,
-            grid_ints=grid_ints)
+            grid_ints=grid_ints, kv_write=kv_write)
 
         # cam injection (only if dit_cond_dict is provided and contains c2ws_plucker_emb)
         if dit_cond_dict is not None and ("cam_film" in dit_cond_dict or "c2ws_plucker_emb" in dit_cond_dict):
@@ -1705,6 +1829,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         frame_seqlen=None,
         cross_attn_first_call=None,
         skip_head=False,
+        kv_commit=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -2152,6 +2277,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
             # supplied, so letting it in would reintroduce one graph per chunk position.
             assert _rope_cos is not None, "chunked cache requires prebuilt rope_grids"
             _ks, _vs = ordered_chunks_by_block(kv_cache, _dest, _leading)
+            # LINGBOT_ATTN_SPLIT: each block's own-shard buffers in the same order, if allocated
+            _own = (ordered_own_chunks_by_block(kv_cache, _dest, _leading)
+                    if "ko" in kv_cache[0] else None)
             _stacks = self._block_stacks(_n_chunks)
             if _stacks is not None:
                 x = _stacks[_dest](x, _ks, _vs, tuple(crossattn_cache),
@@ -2172,10 +2300,27 @@ class WanModelFast(ModelMixin, ConfigMixin):
                     if _films is not None:
                         _kw = dict(kwargs)
                         _kw["dit_cond_dict"] = {"cam_film": _films[block_index]}
-                    x = block(x, kv_cache=None,
-                              kv_chunks=(list(_ks[block_index]), list(_vs[block_index])),
+                    if kv_commit is False and _STEP_NOWRITE:
+                        if _kw is kwargs:
+                            _kw = dict(kwargs)
+                        _kw["kv_write"] = False
+                    _kvc = (list(_ks[block_index]), list(_vs[block_index]))
+                    if _own is not None and _own[block_index] is not None:
+                        _kvc = _kvc + ((list(_own[block_index][0]), list(_own[block_index][1])),)
+                    x = block(x, kv_cache=None, kv_chunks=_kvc,
                               crossattn_cache=crossattn_cache[block_index],
                               current_start=0, **_kw)
+                    if (_DUMP_BLOCKS and not getattr(self, "_blocks_dumped", False)
+                            and getattr(self, "_films_cur", None) is not None):
+                        # LINGBOT_DUMP_BLOCKS=<dir> (diagnostic, with LINGBOT_FILM_ALL): rank 0
+                        # saves every block's output token shard of the first generation forward
+                        # (c0s0; the prewarm forwards run on dummy inputs and are skipped).
+                        if not dist.is_initialized() or dist.get_rank() == 0:
+                            os.makedirs(_DUMP_BLOCKS, exist_ok=True)
+                            torch.save(x.detach().float().cpu(),
+                                       os.path.join(_DUMP_BLOCKS, f"b{block_index:02d}.pt"))
+                        if block_index == len(self.blocks) - 1:
+                            self._blocks_dumped = True
                 _phase_mark(self, "blocks")
                 if skip_head:
                     # The caller discards the output (KV-cache commit forward): the blocks have

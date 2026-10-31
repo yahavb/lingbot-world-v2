@@ -1,0 +1,106 @@
+# Half-instance layout sweep (8 devices, xl-lnc2, LNC2, 32 ranks) of the loop_engineering
+# q20_kbnw flags with quality checks: kiro/k8s_sweep.sh.
+#   kubectl apply -f lbw-v2-i2v-sweep-lnc2-job.yaml ; kubectl logs -f job/lbw-v2-i2v-sweep-lnc2
+# The checkpoint (converted once) and the compiled NEFFs live on the node (hostPath
+# /opt/lingbot-world-v2), so later runs on the same node skip the download and most compiles.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-v2-i2v-sweep-lnc2
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 100800
+  template:
+    metadata:
+      labels:
+        app: lbw-v2-i2v-sweep-lnc2
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: xl-lnc2
+      containers:
+        - name: inference
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              cd /tmp/lingbot
+              echo "commit: $(git log --oneline -1)"
+              OUT=/tmp/sweep; mkdir -p "$OUT"
+              trap 'echo "kubectl cp $(hostname):$OUT.tar.gz ./sweep.tar.gz"; sleep "$KEEP_ALIVE_SECONDS"' EXIT
+              NODE=/node-cache; mkdir -p "$NODE"
+              export CKPT=$NODE/lingbot-world-v2-14b-causal-fast
+              export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              export NKI_ENABLE_TRACE_CACHE=1
+              export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
+              export HF_HOME=/tmp/hf-cache
+
+              pip install -q -r requirements_neuron.txt huggingface_hub
+              python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
+              python3 -c "import torch, torch_neuronx; print('torch', torch.__version__, 'torch_neuronx', torch_neuronx.__version__)"
+              pip list 2>/dev/null | grep -iE "^(nki|neuronx-cc|torch-neuronx|torch) " || true
+
+              # checkpoint: download + convert once per node (flock; .complete marks a finished entry)
+              flock "$NODE/ckpt.lock" bash -c '
+                [ -f "$1/.complete" ] && { echo "ckpt: on node cache"; exit 0; }
+                hf download robbyant/lingbot-world-v2-14b-causal-fast --local-dir "$1"
+                [ -f "$1/transformers/config.json" ] || cp "$1/config.json" "$1/transformers/config.json"
+                python3 scripts/inference/convert_dit_to_pth.py --ckpt_dir "$1"
+                rm -f "$1"/transformers/*.safetensors
+                touch "$1/.complete"' _ "$CKPT"
+
+              python3 scripts/analysis/qk_gamma_temperature.py --ckpt_dir "$CKPT" | tee /tmp/qk.txt
+              export FLASH_ATTN_LAYERS=$(grep -oE "CANDIDATE HOT LAYERS \([0-9]+\): [0-9,]+" /tmp/qk.txt | sed -E "s/.*: //" || true)
+              echo "FLASH_ATTN_LAYERS=$FLASH_ATTN_LAYERS"
+
+              OUT=$OUT bash kiro/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
+              echo "SWEEP COMPLETE"
+          resources:
+            claims:
+              - name: neuroncores
+            requests:
+              ephemeral-storage: 600Gi
+            limits:
+              ephemeral-storage: 600Gi
+          volumeMounts:
+            - name: node-cache
+              mountPath: /node-cache
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+            - name: BRANCH
+              value: "main"
+            - name: LNC
+              value: "2"
+            - name: LAYOUTS
+              value: "4x8 8x4 2x16"
+            - name: REPEAT
+              value: "4x8"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: KEEP_ALIVE_SECONDS
+              value: "86400"
+            - name: NPROC
+              value: "32"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+                  optional: true
+      volumes:
+        - name: node-cache
+          hostPath:
+            path: /opt/lingbot-world-v2
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
