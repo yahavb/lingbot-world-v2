@@ -247,7 +247,9 @@ class RemoteDecoder:
                     with self.session.post(f"{self.url}/decode", params={"first": int(first), "stream": 1},
                                            data=buf.getvalue(), timeout=600, stream=True) as r:
                         r.raise_for_status()
-                        for line in r.iter_lines():
+                        # Big reads: iter_lines' default 512 B pieces keep this thread busy in
+                        # Python, and rank 0's main thread, which issues the DiT, waits on the GIL.
+                        for line in r.iter_lines(chunk_size=1 << 16):
                             if not line:
                                 continue
                             part = json.loads(line)
