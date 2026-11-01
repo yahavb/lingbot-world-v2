@@ -12,7 +12,11 @@ CASES=table: every shape of SWEEP, the branch kernel against main: ms per call (
   REPS calls, the fastest block, and main's spread over its blocks), K + V copies per head, and for every
   output the elements that differ, their largest difference in absolute terms and in units in the last
   place, plus both kernels' error against an fp32 reference on the host; then k_blocks against the plain
-  layout on CASES. One JSON object per line ([nkl_table] / [nkl_table_kb])."""
+  layout on CASES. One JSON object per line ([nkl_table] / [nkl_table_kb]).
+CASES=layout: the branch kernel against itself: token-major V (v_token_major) vs the plain layout on CASES and
+  two SWEEP shapes ([nkl_table_vtm]); the whole prior without its mask (prior_full) vs the masked call on the
+  shapes whose prior is fully used ([nkl_table_pf]); and all three context-parallel options at once (k_blocks,
+  v_token_major, prior_full) vs plain layouts with the mask ([nkl_table_cp])."""
 import importlib
 import json
 import math
@@ -81,6 +85,19 @@ def blocked(k, nb):
     return k.view(bs_kv, d, nb, seqlen // nb).permute(2, 0, 1, 3).contiguous().view(bs_kv, d, seqlen)
 
 
+def token_major(v):
+    """(bs_kv, seqlen, d) V stored token-major, [seqlen, bs_kv, d], under the same shape."""
+    return v.permute(1, 0, 2).contiguous().view(v.shape)
+
+
+# shapes with the whole prior used, beyond those of SWEEP
+PF_EXTRA = [
+    ("prior 4096 full + 2048", 4, 4, 512, 128, 4096, 4096, 2048, False, True),
+    ("gqa4 d64 prior 8192 + 4096", 8, 2, 512, 64, 8192, 8192, 4096, False, False),
+    ("short q prior 16384 + 512", 16, 16, 128, 128, 16384, 16384, 512, False, False),
+]
+
+
 def make(case):
     name, bs, bs_kv, lq, d, lp, pul, lk, causal, ring = case
     q = r(bs, lq, d, scale=1.0 / d ** 0.5)
@@ -89,7 +106,7 @@ def make(case):
     return q, k, v, kp, vp
 
 
-def caller(kern, case, k_blocks=1):
+def caller(kern, case, k_blocks=1, v_token_major=False, prior_full=False):
     name, bs, bs_kv, lq, d, lp, pul, lk, causal, ring = case
 
     def f(q, k, v, kp=None, vp=None):
@@ -100,6 +117,10 @@ def caller(kern, case, k_blocks=1):
             kw.update(cache_softmax=True, skip_output_normalization=True)
         if k_blocks > 1:
             kw["k_blocks"] = k_blocks
+        if v_token_major:
+            kw["v_token_major"] = True
+        if prior_full:
+            kw["prior_full"] = True
         out = kern(q, k, v, scale=1.0, causal_mask=causal, tp_q=True, tp_k=False, tp_out=False, **kw)
         return out if isinstance(out, tuple) else (out,)
 
@@ -329,3 +350,44 @@ if mode == "one":
     args = device_args(case)
     first(f, args)
     print(f"[nkl_one] {case[0]} {os.environ.get('ONE_TAG')} {timed(f, args):.3f} ms", flush=True)
+
+
+def spread(ts):
+    return (max(ts) / min(ts) - 1) * 100
+
+
+def layout_row(name, ta, tb, oa, ob, a_key, b_key):
+    return {"name": name, a_key: min(ta), b_key: min(tb), a_key.replace("_ms", "_spread_pct"): spread(ta),
+            b_key.replace("_ms", "_spread_pct"): spread(tb), "change_pct": (min(tb) / min(ta) - 1) * 100,
+            "outputs": [diff_stats(a, b, dt) for (a, dt), (b, _) in zip(oa, ob)]}
+
+
+if mode == "layout":
+    only = os.environ.get("VCASES", "")
+    by_name = {c[0]: c for c in SWEEP + PF_EXTRA}
+    keep = lambda cs: [c for c in cs if not only or c[0] in only.split(",")]  # noqa: E731
+    for case in keep(CASES + [by_name["causal 4096 bs2"], by_name["causal prior 2048 + 2048"]]):
+        lp = case[5]
+        host = make(case)
+        args = [t.to(dev) for t in host[:3] + ((host[3], host[4]) if lp else ())]
+        targs = [args[0], args[1], token_major(args[2])] + ([args[3], token_major(args[4])] if lp else [])
+        o_pl, t_pl, o_tm, t_tm = ab_trials(caller(A_NEW, case), args, caller(A_NEW, case, v_token_major=True), targs)
+        print("[nkl_table_vtm] " + json.dumps(layout_row(case[0], t_pl, t_tm, o_pl, o_tm, "plain_ms", "tm_ms")),
+              flush=True)
+    pf_cases = [by_name["dit self prior 4320 + 4320"], by_name["causal prior 2048 + 2048"]] + PF_EXTRA
+    for case in keep(pf_cases):
+        host = make(case)
+        args = [t.to(dev) for t in host]
+        o_m, t_m, o_pf, t_pf = ab_trials(caller(A_NEW, case), args, caller(A_NEW, case, prior_full=True), args)
+        print("[nkl_table_pf] " + json.dumps(layout_row(case[0], t_m, t_pf, o_m, o_pf, "masked_ms", "pf_ms")),
+              flush=True)
+    for case in keep([by_name["dit self prior 4320 + 4320"]]):
+        host = make(case)
+        args = [t.to(dev) for t in host]
+        cargs = [args[0], blocked(args[1], 16), token_major(args[2]), blocked(args[3], 16), token_major(args[4])]
+        o_pl, t_pl, o_cp, t_cp = ab_trials(caller(A_NEW, case), args,
+                                           caller(A_NEW, case, k_blocks=16, v_token_major=True, prior_full=True),
+                                           cargs)
+        print("[nkl_table_cp] " + json.dumps(layout_row(case[0], t_pl, t_cp, o_pl, o_cp, "plain_masked_ms",
+                                                        "cp_ms")), flush=True)
+
