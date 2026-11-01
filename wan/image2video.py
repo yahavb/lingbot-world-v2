@@ -1471,9 +1471,27 @@ class WanI2VCausal:
             _dump_tags = set(filter(None, _dump_tags.split(",")))
 
             def _maybe_dump(tag, t_):
-                if _dump_dir and tag in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0):
+                # Written once per process (the first generation): with LINGBOT_BENCH_RUNS > 1
+                # the timed pass does no device-to-host copies.
+                if _dump_dir and tag in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0) \
+                        and not os.path.exists(os.path.join(_dump_dir, f"{tag}.pt")):
                     os.makedirs(_dump_dir, exist_ok=True)
                     torch.save(t_.detach().float().cpu(), os.path.join(_dump_dir, f"{tag}.pt"))
+
+            def _maybe_dump_inputs(x_, t_, kw_):
+                # c0s0 inputs for the fp32 CPU reference (kiro/ref_fp32_c0s0.py): chunk 0, step 0
+                # runs on zeroed KV caches, so these tensors and scalars define it completely.
+                p_ = os.path.join(_dump_dir, "c0s0_inputs.pt")
+                if _dump_dir and "c0s0" in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0) \
+                        and not os.path.exists(p_):
+                    os.makedirs(_dump_dir, exist_ok=True)
+                    torch.save({"x": x_.detach().float().cpu(), "t": t_.detach().float().cpu(),
+                                "context": kw_["context"][0].detach().float().cpu(),
+                                "y": kw_["y"][0].detach().float().cpu(),
+                                "cam": [c.detach().float().cpu() for c in kw_["dit_cond_dict"]["c2ws_plucker_emb"]],
+                                "seq_len": kw_["seq_len"], "frame_seqlen": kw_["frame_seqlen"],
+                                "max_attention_size": kw_["max_attention_size"],
+                                "current_start": kw_["current_start"]}, p_)
             for chunk_id in tqdm(range(n_chunks)):
                 if chunk_control is not None:
                     ctl = chunk_control(chunk_id)
@@ -1587,6 +1605,8 @@ class WanI2VCausal:
                     if chunk_id == 0 and timestep_idx == 0:
                         _sub("first_fwd_issued")
                     _maybe_dump(f"c{chunk_id}s{timestep_idx}", noise_pred)
+                    if chunk_id == 0 and timestep_idx == 0:
+                        _maybe_dump_inputs(latent_model_input[0], timestep, kwargs)
                     self._cross_attn_initialized = True
 
                     if offload_model:
@@ -1693,6 +1713,7 @@ class WanI2VCausal:
                 self._dit_fwd_ms.append((time.perf_counter() - _f0) * 1000)
                 self._dit_fwd_tag.append(f"c{chunk_id}commit")
 
+            _sub("loop_end")
             if os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1":
                 # LINGBOT_ROWMAX_GRAPH (diagnostic): this generation's per-layer, per-head row-max range.
                 from wan.modules.model_fast import rowmax_graph_report, rowmax_graph_reset
@@ -1746,9 +1767,12 @@ class WanI2VCausal:
                 if dist.is_initialized():
                     dist.barrier()
                 return None
+            _sub("stats_logged")
             _t0 = time.perf_counter()
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
+            _sub("cat_issued")
             torch.neuron.synchronize()
+            _sub("cat_synced")
             self._gen_phase["cat"] += time.perf_counter() - _t0
             memlog("generate, after chunk loop")
             # The last chunk's camera embedding / FiLM params cannot be hit again (the next
@@ -1763,13 +1787,17 @@ class WanI2VCausal:
 
             skip_decode = save_latents_path is not None or return_latents
             _post0 = time.perf_counter()
+            _lat_cpu = None
             if self.rank == 0:
                 if save_latents_path is not None:
                     save_latents_dir = Path(save_latents_path).parent
                     if not save_latents_dir.exists():
                         save_latents_dir.mkdir(parents=True, exist_ok=True)
                         logging.info(f"Created directory {save_latents_dir} for save_latents_path")
-                    torch.save(pred_latent_chunks.cpu(), save_latents_path)
+                    _lat_cpu = pred_latent_chunks.cpu()
+                    _sub("latents_d2h")
+                    torch.save(_lat_cpu, save_latents_path)
+                    _sub("latents_saved")
                     logging.info(f"Saved pre-decode latent to {save_latents_path}")
                 if not skip_decode:
                     self.vae.model.to('cpu')
@@ -1783,14 +1811,29 @@ class WanI2VCausal:
         if offload_model:
             gc.collect()
             torch.neuron.synchronize()
-        if dist.is_initialized():
+        # LINGBOT_POST_LEAN=1 (the job's mode: latents saved by rank 0, not returned for a decode here): the other
+        # ranks neither wait here for rank 0's save nor copy the latents to the host for a return value nobody reads;
+        # the caller's barrier (generate.py) still waits for the save. In the d8 host trace the end of GEN was rank 0's
+        # copy + save (8 ms), this barrier (~4 ms) and the other ranks' 7.7 MB copies (~8 ms) back to back.
+        _lean = (os.environ.get("LINGBOT_POST_LEAN", "0") == "1" and save_latents_path is not None
+                 and not return_latents and not offload_model)
+        if dist.is_initialized() and not _lean:
             dist.barrier()
+        _sub("post_barrier")
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             logging.info(f"[BENCH] GEN post (latents .cpu() + save + barrier): "
                          f"{(time.perf_counter() - _post0) * 1000:.0f} ms")
         if skip_decode:
-            return pred_latent_chunks.cpu()
+            # rank 0 already copied the latents to the host for the save
+            _ret = (_lat_cpu if _lat_cpu is not None else
+                    None if _lean else pred_latent_chunks.cpu())
+            _sub("return_d2h")
+            if _host_trace and (not dist.is_initialized() or dist.get_rank() == 0):
+                _i = next((i for i, (n, _) in enumerate(_host_trace) if n == "loop_end"), len(_host_trace))
+                logging.info("[BENCH] host trace end (ms from GEN start): " + " ".join(
+                    f"{n}={ms:.1f}" for n, ms in _host_trace[_i:]))
+            return _ret
         return videos[0] if self.rank == 0 else None
 
     def _generate_causal_pretrain(self,

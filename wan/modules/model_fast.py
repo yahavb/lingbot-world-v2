@@ -167,6 +167,19 @@ _Q_FIRST = os.environ.get("LINGBOT_Q_FIRST", "0") == "1"
 # (148-583 us) before the K/V projections, so the gathers started at 720 us. Q gains +0.0.
 _KV_FIRST = os.environ.get("LINGBOT_KV_FIRST", "0") == "1"
 assert not (_Q_FIRST and _KV_FIRST), "LINGBOT_Q_FIRST and LINGBOT_KV_FIRST are opposite orders"
+# LINGBOT_COMMIT_Q_FIRST (commit forwards only, kv_write=True, TP QK-norm): in the commit block the scheduler
+# projected K and V before Q (the cache write lengthens the K / V chain), so the Q norm's TP all-reduce queued behind
+# the 22 MB K / V CP all-gather on the collective cores and every engine sat idle ~300 us before the cached-chunk
+# attention, which needs only Q (CP8 lead-3 commit block 3.02 ms against 2.70 for the step block, where Q goes first).
+# 1: K and V take their input through a zero-valued term from the raw Q projection, so they cannot be projected
+# before it (block 3.11 ms: no gain). 2: the same term from the normed Q, so the Q norm's all-reduce also precedes
+# them: 2.73 ms, bitwise equal on all 32 ranks. Exact for finite Q. Constant-offset layers only: in the chained exact
+# layer 33 it is slower (3.31 vs 3.26 ms with 1) and changes rounding.
+_COMMIT_Q_FIRST = int(os.environ.get("LINGBOT_COMMIT_Q_FIRST", "0") or 0)
+# LINGBOT_COMMIT_FROM_GATHER=1 (commit forwards on the constant-offset path): the new chunk's attention call reads
+# the gathered K / V instead of the cache slot written from them (the same values), so the 22 MB slot copy has no
+# consumer inside the block.
+_COMMIT_FROM_GATHER = os.environ.get("LINGBOT_COMMIT_FROM_GATHER", "0") == "1"
 # LINGBOT_KV_REAL=1 (LINGBOT_TOKEN_PAD + TP QK-norm): the K and V projections, the K norm and RoPE run on this
 # rank's real tokens only (270 of the 288 padded rows). The padding rows used to be sliced off before the CP
 # gathers, and in the q25 block profile that slice was a copy (142 us on the Scalar DMA queue, behind the cached-
@@ -990,6 +1003,17 @@ class CausalWanSelfAttention(nn.Module):
                 xq = x + (k[:, :1, :1, :1].float() * 0.0 + v[:, :1, :1, :1].float() * 0.0).to(x.dtype)
                 q = _tp_rms_norm(self.q(xq), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
                 return q, k, v
+            if (_COMMIT_Q_FIRST and kv_write and getattr(self, 'use_cmax', False)
+                    and getattr(self, 'tp_enabled', False) and self.qk_norm):
+                # LINGBOT_COMMIT_Q_FIRST: Q (and with 2 its norm) before K and V in the commit forward of a
+                # constant-offset layer (the chained exact layers, 2 / 13 / 33 / 34 / 38 / 39, are slower with it)
+                qr = self.q(x)
+                q = _tp_rms_norm(qr, self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                _zq = (q[:, :1, :1, :1].reshape(-1) if _COMMIT_Q_FIRST >= 2 else qr[:, :1, :1].reshape(-1))
+                xk = x + (_zq.float() * 0.0).to(x.dtype)
+                k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                v = self.v(xk).view(b, s, n, d)
+                return q, k, v
             _r = _REAL_TOKENS[0]
             if (_KV_REAL and getattr(self, 'tp_enabled', False) and self.qk_norm and _r is not None
                     and _r < s):
@@ -1299,6 +1323,8 @@ class CausalWanSelfAttention(nn.Module):
                     if kv_write:
                         kd.copy_(kg.reshape(kd.shape))
                         vd.copy_(vg.reshape(vd.shape))
+                        if _COMMIT_FROM_GATHER:   # the same values; the slot copy leaves the call's path
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                     else:
                         if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
                             kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)

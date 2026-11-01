@@ -2,8 +2,8 @@
 
 One 81-frame 480×768 video from `examples/03`, chunk 3, window 12, sink 1, 4 denoise steps,
 seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1` container
-(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0). On 8 devices the same video takes 4.86 s (16.68 fps, see
-"8 devices").
+(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0). On 8 devices the same video takes 4.35 s (18.64 fps, see
+"8 devices"), validated against an fp32 CPU reference with the owner's checks (see "Accuracy (8 devices)").
 
 ## 16 devices (64 ranks, LNC2)
 
@@ -323,13 +323,16 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_camsh` | the per-chunk camera embedding MLP on each CP rank's 540 tokens (`LINGBOT_FILM_SHARD=1`); the per-step draws copied from the draw worker (`LINGBOT_START_OVERLAP=4`, no gain alone: `d8_up4` 4.28 s) | 4.27 | 0.42 | 4.69 | 17.27 | latents bitwise equal to `d8_coal` |
 | `d8_rs` | the SP reduce-scatters and the FiLM graph's all-reduce on bf16 payloads (`LINGBOT_RS_BF16=1 LINGBOT_FILM_AR_BF16=1`) | 4.09 | 0.43 | 4.51 | 17.96 | latents 0.144 vs `d8_exact` (first frame 0.0055, last 0.29), where `d8_camsh` is 0.129 (0.0046, 0.24) |
 | `d8_dd` | the cross-attention over the 128 first context rows, the identical padding rows weighted by their count (`LINGBOT_CROSS_DEDUP=128`) | 3.99 | 0.42 | 4.42 | 18.35 | latents 0.138 vs `d8_exact` (first frame 0.0052, last 0.29), 0.140 vs `d8_rs`; repeats 4.00 / 4.00 s GEN |
-| **`d8_fg4`** | the FiLM params of 4 chunks per graph, chunks 0-3 at the start and 4-6 when chunk 4 starts (`LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4`) | **3.98** | **0.42** | **4.40** | **18.41** | latents 0.113 vs `d8_dd` (first frame 0.0054, last 0.23), 0.156 vs `d8_exact` (0.0054, 0.32); repeat `d8_fg4r` 3.977 + 0.422 s, bitwise equal |
+| `d8_fg4` | the FiLM params of 4 chunks per graph, chunks 0-3 at the start and 4-6 when chunk 4 starts (`LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4`) | 3.98 | 0.42 | 4.40 | 18.41 | latents 0.113 vs `d8_dd` (first frame 0.0054, last 0.23), 0.156 vs `d8_exact` (0.0054, 0.32); repeat `d8_fg4r` 3.977 + 0.422 s, bitwise equal |
+| `d8_cqf` | commit forwards of the constant-offset layers project Q, and all-reduce its norm, before K and V, and their new-chunk call reads the gathered K / V (`LINGBOT_COMMIT_Q_FIRST=2 LINGBOT_COMMIT_FROM_GATHER=1`) | 3.93 | 0.42 | 4.36 | 18.60 | latents bitwise equal to `d8_fg4r`; `LINGBOT_COMMIT_Q_FIRST=2` alone 3.937 / 3.935 s (repeat) against 3.970 s for `d8_fg4` on the same tree |
+| **`d8_lean`** | rank 0 returns the host copy it saved; the other ranks skip `generate()`'s post-save barrier and their host copy of the latents, which the job never reads (`LINGBOT_POST_LEAN=1`) | **3.92** | **0.42** | **4.35** | **18.64** | latents bitwise equal to `d8_fg4r`; from the committed tree 3.925 / 3.923 s GEN (18.63 / 18.64 fps), on the experimental tree 3.923 / 3.922 s; the reused copy alone 3.929 s |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_fg4 NPROC=32 TP=4 CP=8 PFX=j8 \
+bash /work/repo/kiro/run_job16.sh /work/repo d8_lean NPROC=32 TP=4 CP=8 PFX=j8 \
   <the q33_a flags above, LINGBOT_START_OVERLAP=4 instead of 1> LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4 \
   LINGBOT_FILM_SHARD=1 LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1 LINGBOT_RS_BF16=1 \
-  LINGBOT_FILM_AR_BF16=1 LINGBOT_CROSS_DEDUP=128
+  LINGBOT_FILM_AR_BF16=1 LINGBOT_CROSS_DEDUP=128 LINGBOT_COMMIT_Q_FIRST=2 LINGBOT_COMMIT_FROM_GATHER=1 \
+  LINGBOT_POST_LEAN=1
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -364,7 +367,8 @@ end to end GEN 4.87 -> 4.44 s (`d8_fr640`, 16.68 fps).
 
 **VAE at 32 ranks.** 4 × 8 tiles of 15 × 12 latent; frames per step T = 2 / 3 / 4 / 5 / 6: 814 / 492 / 420 / 460 /
 500 ms. With T ≤ 5 the first decode after warmup takes 2.3-2.8 s, so T = 4 is used with the job's untimed warmup
-decode (the timed decode is the second). 2 × 16 tiles (`LINGBOT_VAE_PER_DEVICE=2`) fail collective setup
+decode (the timed decode is the second). The timed decode is device-bound: in a rank-0 system profile it keeps the
+core ~100% busy for its ~420 ms (graphs of 0.8-14.3 ms), so only faster convolution graphs would shorten it. 2 × 16 tiles (`LINGBOT_VAE_PER_DEVICE=2`) fail collective setup
 (`no_hier no_mesh`, replica group `[0, 2, …, 30]`).
 
 **The coalesced K + V gather and the start draws.** One coalesced K + V all-gather (`LINGBOT_KV_COALESCE=1`) takes
@@ -410,8 +414,32 @@ ms, busy unchanged at 3.86 s): GEN 3.97 / 3.98 s against 3.99 / 4.00 / 4.00 s. W
 waited 90 ms behind the queued 4-chunk graph (host trace); copying the noise before issuing that graph moved the first
 forward's issue from 144 to 58 ms but left GEN at 3.977 s (code not kept).
 
+**Commit blocks.** In the `d8_fg4` system profile a lead-3 commit block of the constant-offset layers takes 2943 µs
+against 2632 for the denoise step (102 executions; the chained exact layers 3191 against 3162). That is not the 22 MB
+slot write. In a device profile of the commit block (`block_bench.py KV_WRITE=1`, `kiro/prof_idle.py`) every engine of
+pcore 0 is idle from 591 to 846 µs and again from 849 to 900 µs, waiting for the Q norm's TP all-reduce: the commit
+graph projects K, V, then Q (the step graph Q, K, V), so that all-reduce queues behind the 22 MB K / V CP all-gather on
+the collective cores, and the cached-chunk attention, which needs only Q, starts ~350 µs late. The copy into the slot
+is 21.9 MB of extra DMA and stays hidden. `LINGBOT_COMMIT_Q_FIRST=2` gives K and V their input through a zero-valued
+term from the normed Q (exact for finite Q), so Q and its all-reduce go first: commit block 3.04 → 2.73 ms, bitwise
+equal on all 32 ranks. A term from the raw Q projection (`=1`) is not enough (3.11 ms). In the chained exact layers
+it is slower and not bitwise (layer 33: 3.31 / 3.26 ms against 3.26), so it applies to the constant-offset layers
+only. With the new-chunk call also reading the gathered K / V (`LINGBOT_COMMIT_FROM_GATHER=1`) the block is 2.71 ms.
+End to end GEN 3.970 → 3.937 / 3.935 s (repeat), 3.932 s with both, latents bitwise equal to `d8_fg4r` (`d8_cqf`).
+
+**The end of GEN.** With `LINGBOT_NO_SYNC` the host has issued the whole loop 661 ms into GEN and then waits for the
+device; the device finished ~20 ms before GEN did (`LINGBOT_HOST_TRACE=1` now also stamps the end): rank 0 copied the
+7.7 MB of latents to the host (1.2 ms) and saved them (6.7 ms), every rank met at `generate()`'s barrier, the other
+31 ranks then each copied the latents to the host for `generate()`'s return value (~8 ms, which `generate.py`'s
+barrier waited for), and rank 0 copied them a second time for its own return. Rank 0 now returns its saved copy
+(−2.6 ms), and `LINGBOT_POST_LEAN=1` (the job's mode: latents saved, not decoded in the process) drops the barrier
+inside `generate()` and the other ranks' copies; `generate.py`'s barrier still waits for the save: GEN 3.929 → 3.922 /
+3.922 s (`d8_lean`).
+
 Also measured at CP8, no gain: the commit forward's attention reading the gathered K / V instead of the cache slot it
-writes (commit blocks 3.01 / 3.24 ms either way; the ~0.3 ms over a denoise step is the 22 MB slot write itself);
+writes, on its own (commit blocks 3.01 / 3.24 ms either way: the stall above, not the write, is what costs);
+neuronx-cc scheduling options on the block (`--distribution-strategy=nemo|llm-training|fsdp`,
+`--enable-fast-context-switch`, `--model-type=transformer`): 2.70-2.77 ms against 2.70, outputs bitwise equal;
 K and V projected before Q (`LINGBOT_KV_FIRST=1`, 2.71 vs 2.70 ms); runtime collective algorithms
 (`NEURON_RT_CC_ALG_TYPES` with any one inter-device algorithm, `NEURON_RT_DBG_KANGARING_CC`,
 `NEURON_RT_DBG_HYBRID_RING_CC_EN`: 2.76-2.78 ms; a single intra-device algorithm leaves some collective unsupported).
@@ -426,6 +454,50 @@ FiLM graph's spill rings gone, the all-chunk FiLM graph (`LINGBOT_FILM_ALL`) sti
 Everything after the self-attention as two independent token streams (rows 0-63 and 64-135 of each TP rank's
 shard, so one stream's SP collectives could run under the other's matmuls; code removed): 3.02 ms against 2.89, the
 SP collectives being bandwidth-bound and the second cross-attention call and extra collectives adding ~0.13 ms.
+
+### Accuracy (8 devices)
+
+`kiro/acc8_validate.sh` runs the checks of `kiro/k8s_validate.sh` on devices 0-7 through the host queue, each run
+through `kiro/run_job16.sh` (the job's spec and env): the chunk-0 / step-0 noise prediction against an fp32 CPU forward
+of the original model (`kiro/ref_fp32_c0s0.py`: `robbyant/lingbot-world-v2` @ `1895d30`, `WanModelFast` with fp32
+attention, the weights of `transformers-bf16.pth` upcast) on the run's own chunk-0 inputs, the raw frames against an
+fp32 CPU decode of the run's latents, a repeat run, and `kiro/validate_cmp.py`'s verdict. `loop` = `d8_fg4`, whose
+latents are bitwise equal to `d8_fg4r`, `d8_cqf` and `d8_lean` (the c0s0 forward and the decode are unchanged by
+them), so the numbers hold for the current flags.
+
+`main`'s default `const_max_ag` kernel fails to trace on this host at 8 devices (`off` and `main_code` exit in
+prewarm), as it does at 16, so the verdict's baselines run with `ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte`, the way
+this host's 16-device baseline runs (exact attention where `main`'s default assumes a softmax bound). The owner's
+`q20` flags cannot run at CP8 here (the all-chunk FiLM graph does not load, `NRT_RESOURCE`).
+
+| Check (`kiro/validate_cmp.py`) | `loop`, 8 devices | `off` / `main_code`, same host and layout | Owner's references |
+|---|---|---|---|
+| steady time | **4.39 s** (repeat 4.41) | 14.94 / 15.12 s (GEN 12.37 / 12.33, VAE 2.58 / 2.78) | |
+| c0s0 vs fp32 CPU, rel. RMS | **0.01227** (repeat 0.01227) | 0.03041 / 0.03041 | `main` 0.0257, `q16` 0.0125, trn3 TP4 × CP8 0.0108 |
+| VAE frames vs fp32 CPU decode | **52.70 dB** (worst frame 50.56, max 27 levels) | 56.31 dB (worst frame 54.90, max 24) | `main` 43.5 dB, `q16` 52.7, trn3 TP4 × CP8 52.71 |
+| `main_code` == `off` | | latents and mp4 bytes identical | |
+| run twice | latents and frames identical | | |
+| `tests/smoke_test_video.py` | pass | pass / pass | |
+
+Verdict: **PASS** total time (3.44× against `main_code` on the same 8 devices), **PASS** c0s0 (0.0123 against a limit
+of 1.10 × 0.0304), **PASS** `main` == flags off, **PASS** deterministic, **WARN** VAE (52.70 dB against a limit of
+56.31 − 1). Against the owner's documented `main` (0.0257, 43.5 dB) both quality checks pass, and both match the
+owner's own validated loop numbers. The VAE warning is specific to 8 devices: `main`'s decoder runs in fp32 on Neuron
+(`Wan2_1_VAE`'s autocast is CUDA-only and the weights stay fp32) and at 32 ranks needs no width padding (96 / 32), so
+it lands 56.3 dB from the CPU decode, while at 64 ranks the padding put it at 43.5. The loop's fused bf16 decoder
+(the owner's `q3` / `q12` / `q14` VAE flags) is 52.7 dB in every layout measured. `loop` vs `off` video: 23.1 dB,
+latent rel. RMS per chunk 0.040 → 0.330, the rollout divergence of any two layouts (see Correctness).
+
+The 3.6 dB are the bf16 convolutions, which is what the original model's `torch.cuda.amp.autocast(bf16)` decode does
+on CUDA. Decode-only on the same latents against the same fp32 CPU decode (devices 8-15):
+
+| Fused 2-D decoder, -O1, T = 4 | VAE (ms) | PSNR | worst frame | max |
+|---|---|---|---|---|
+| bf16 convolutions, `LINGBOT_VAE_NORM=mm` (production) | 422 | 52.70 dB | 50.56 dB | 27 levels |
+| bf16 convolutions, default norm | 893 | 52.70 dB | 50.70 dB | 31 levels |
+| fp32 convolutions (no `LINGBOT_VAE_BF16`), `LINGBOT_VAE_NORM=mm` | 1085 | 56.34 dB | 54.91 dB | 13 levels |
+
+fp32 convolutions pass the VAE rule (56.34 ≥ 56.31 − 1) at +0.66 s per video (16.2 fps instead of 18.64).
 
 ## 2 devices (8 ranks, devices 14 + 15)
 
@@ -556,7 +628,7 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_CROSS_DEDUP=Kc` | cross-attention over the first Kc context rows, the identical padding rows weighted by their count, in the block graph (needs `LINGBOT_CROSS_NMAJOR`; off for prompts of Kc rows or more) |
 | `LINGBOT_SCHED_FUSE=1` | a denoise step's x0 and the re-noised next input in one compiled graph |
 | `LINGBOT_GC_OFF=1` | no cyclic garbage collection inside a generation (re-enabled after it) |
-| `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop, no syncs |
+| `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop and after it (statistics, concatenation, latents copy and save, barrier), no syncs |
 | `LINGBOT_EMBED_LOCAL=1`, `LINGBOT_CROSS_QPAD=32`, `LINGBOT_KV_REAL=1…4`, `LINGBOT_CMAX_DGE=hwdge_sync\|hwdge_act` | A/B only, no gain (see "Measured and not adopted") |
 | `LINGBOT_KV_COALESCE=1` | the new chunk's K and V CP all-gathers as one coalesced collective; adopted at CP8 (GEN −120 ms), within ±0.05 ms per block at CP16 |
 | `NEURON_RT_IO_RING_CACHE_SIZE=1024` | runtime setting, not a code flag: I/O descriptor cache entries (GEN −42 ms at 256 against the default, a further −19 ms at 1024) |
@@ -565,6 +637,9 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_FILM_GROUP=G` | with `LINGBOT_FILM_ALL`: the FiLM graph on G chunks per call (the last group padded), each later group when its first chunk needs it; G=4 adopted at CP8 (with `LINGBOT_FILM_ROWS=640`; G=3 did not load next to the 544-row per-chunk graph) |
 | `LINGBOT_V_GATHER_FIRST=1` | A/B only: the new chunk's V CP gather issued before its K gather (no change at CP8) |
 | `LINGBOT_DIAG_NOGATHER=1` | diagnostic, wrong output: step forwards attend the new chunk's cache slot instead of its gathered K / V (made the CP8 kernel failure deterministic) |
+| `LINGBOT_COMMIT_Q_FIRST=1\|2` | commit forwards of the constant-offset layers: K and V take their input through a zero term from the raw (1) or normed (2) Q, so Q and its norm's all-reduce go before the K / V gather; 2 adopted at CP8 (commit block 3.04 → 2.73 ms, GEN −33 ms, bitwise equal) |
+| `LINGBOT_COMMIT_FROM_GATHER=1` | commit forwards on the constant-offset path: the new chunk's call reads the gathered K / V instead of the slot written from them; with `LINGBOT_COMMIT_Q_FIRST=2` block 2.71 ms, GEN −4 ms (alone no gain) |
+| `LINGBOT_POST_LEAN=1` | when the latents are saved and not returned for a decode in the process (the job's mode): no barrier inside `generate()` after rank 0's save and no host copy of the latents on the other ranks (they return None); GEN −7 ms at 8 devices |
 
 ## Scripts (`kiro/`)
 
@@ -593,6 +668,9 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `prof_nodes.py`, `prof_op.py`, `prof_kernel.py`, `prof_cc.py`, `prof_dma.py` | neuron-explorer profile views: framework-node timeline, one op's instructions per engine, a kernel's engine busy in bins, collectives against compute, HBM traffic per op |
 | `prof_rings.py` | collective spans per CC core and all-engine idle intervals of one block execution |
 | `run_job16.sh … SYSPROF_DIR=<dir>`, `sysprof_rank0.sh`, `sysprof_gaps.py` | runtime system profile of `generate.py` on rank 0; per-NEFF device time and the idle gaps of the steady generation |
+| `acc8_validate.sh` | `k8s_validate.sh`'s accuracy checks on devices 0-7 through the host queue: `loop`, `loop_rep`, `off`, `main_code` via `run_job16.sh` (c0s0 dumps, raw frames, latents), the fp32 CPU c0s0 reference and VAE decodes, `validate_cmp.py`'s verdict |
+| `ref_fp32_c0s0.py`, `validate_cmp.py` | from `main`: the fp32 CPU forward of the original model (`robbyant/lingbot-world-v2` `WanModelFast`) on a run's chunk-0 inputs; the comparisons and verdict of a validation directory |
+| `prof_cmp_exec.py`, `prof_hlo_spans.py`, `prof_idle.py` | device profile: two executions side by side (framework nodes, DMA per queue, engine busy per bin); per-HLO-op spans and DMA per 100 µs; pcore 0's idle windows and the instructions around them |
 | `attn_chain_test.py` | `LINGBOT_CTE_CHAIN` on one core: chained calls vs the merged path and fp32, and their time |
 | `cmax_test.py`, `cmax_det.py` | the constant-offset kernels vs the chained `attention_cte` calls and fp32, one core; their run-to-run determinism |
 | `nkl_cte_cmp.py` | an nki-library `attention_cte` branch against `main` on one core: time per call and bitwise comparison of every output (`CASES=table` for the full table) |
