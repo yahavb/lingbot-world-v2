@@ -322,13 +322,14 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_cssp` | both (with the rank-0 system profile) | 4.28 | 0.42 | 4.71 | 17.22 | latents bitwise equal to `d8_coal` |
 | `d8_camsh` | the per-chunk camera embedding MLP on each CP rank's 540 tokens (`LINGBOT_FILM_SHARD=1`); the per-step draws copied from the draw worker (`LINGBOT_START_OVERLAP=4`, no gain alone: `d8_up4` 4.28 s) | 4.27 | 0.42 | 4.69 | 17.27 | latents bitwise equal to `d8_coal` |
 | `d8_rs` | the SP reduce-scatters and the FiLM graph's all-reduce on bf16 payloads (`LINGBOT_RS_BF16=1 LINGBOT_FILM_AR_BF16=1`) | 4.09 | 0.43 | 4.51 | 17.96 | latents 0.144 vs `d8_exact` (first frame 0.0055, last 0.29), where `d8_camsh` is 0.129 (0.0046, 0.24) |
-| **`d8_dd`** | the cross-attention over the 128 first context rows, the identical padding rows weighted by their count (`LINGBOT_CROSS_DEDUP=128`) | **3.99** | **0.42** | **4.42** | **18.35** | latents 0.138 vs `d8_exact` (first frame 0.0052, last 0.29), 0.140 vs `d8_rs` |
+| `d8_dd` | the cross-attention over the 128 first context rows, the identical padding rows weighted by their count (`LINGBOT_CROSS_DEDUP=128`) | 3.99 | 0.42 | 4.42 | 18.35 | latents 0.138 vs `d8_exact` (first frame 0.0052, last 0.29), 0.140 vs `d8_rs`; repeats 4.00 / 4.00 s GEN |
+| **`d8_fg4`** | the FiLM params of 4 chunks per graph, chunks 0-3 at the start and 4-6 when chunk 4 starts (`LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4`) | **3.98** | **0.42** | **4.40** | **18.41** | latents 0.113 vs `d8_dd` (first frame 0.0054, last 0.23), 0.156 vs `d8_exact` (0.0054, 0.32); repeat `d8_fg4r` 3.977 + 0.422 s, bitwise equal |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_dd NPROC=32 TP=4 CP=8 PFX=j8 \
-  <the q33_a flags above, LINGBOT_START_OVERLAP=4 instead of 1> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=1 \
-  LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1 LINGBOT_RS_BF16=1 LINGBOT_FILM_AR_BF16=1 \
-  LINGBOT_CROSS_DEDUP=128
+bash /work/repo/kiro/run_job16.sh /work/repo d8_fg4 NPROC=32 TP=4 CP=8 PFX=j8 \
+  <the q33_a flags above, LINGBOT_START_OVERLAP=4 instead of 1> LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4 \
+  LINGBOT_FILM_SHARD=1 LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1 LINGBOT_RS_BF16=1 \
+  LINGBOT_FILM_AR_BF16=1 LINGBOT_CROSS_DEDUP=128
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -401,6 +402,21 @@ rounding while the prompt has fewer than 128 rows, which the forward checks (the
 keeps the kernel). On the CPU against an fp64 softmax over all 512 rows: max \|d\| 1.1e-5. Block at lead 3 with 48
 prompt rows: 2.90 -> 2.81 ms; its output is 2.8e-3 from the kernel path, as is the same XLA path over all 512 keys
 (2.87 ms), so the difference is the kernel's own rounding. GEN −93 ms (`d8_dd`).
+
+**FiLM groups.** With the per-chunk FiLM graph's spill rings gone (`LINGBOT_FILM_ROWS=640`), a 4-chunk FiLM graph
+loads next to it (`LINGBOT_FILM_GROUP=4`; the 7-chunk one still does not). It is not cheaper per chunk: 2 × 74.7 ms
+for 8 chunk slots against 7 × 20.5 ms. The gain is 78 fewer graph executions and their gaps (device idle 126 -> 106
+ms, busy unchanged at 3.86 s): GEN 3.97 / 3.98 s against 3.99 / 4.00 / 4.00 s. With it, the 7.7 MB initial-noise copy
+waited 90 ms behind the queued 4-chunk graph (host trace); copying the noise before issuing that graph moved the first
+forward's issue from 144 to 58 ms but left GEN at 3.977 s (code not kept).
+
+Also measured at CP8, no gain: the commit forward's attention reading the gathered K / V instead of the cache slot it
+writes (commit blocks 3.01 / 3.24 ms either way; the ~0.3 ms over a denoise step is the 22 MB slot write itself);
+K and V projected before Q (`LINGBOT_KV_FIRST=1`, 2.71 vs 2.70 ms); runtime collective algorithms
+(`NEURON_RT_CC_ALG_TYPES` with any one inter-device algorithm, `NEURON_RT_DBG_KANGARING_CC`,
+`NEURON_RT_DBG_HYBRID_RING_CC_EN`: 2.76-2.78 ms; a single intra-device algorithm leaves some collective unsupported).
+For scale: every XLA matmul auto-cast to fp8 (`--auto-cast-type=fp8_e4m3`, no scales; diagnostic) takes the lead-3
+block from 2.70 to 2.45 ms at a 3.6e-2 output error, so scaled fp8 linear layers are worth ≤ ~0.3 s of GEN.
 
 Also measured at CP8 (block, lead 3), no gain: the V gather issued before K (`LINGBOT_V_GATHER_FIRST=1`) 2.93 ms; the
 kernel's copies on the Sync / Scalar DGE 3.01 / 3.17 ms; the cached-chunk call made to wait for the V projection
@@ -546,7 +562,7 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `NEURON_RT_IO_RING_CACHE_SIZE=1024` | runtime setting, not a code flag: I/O descriptor cache entries (GEN −42 ms at 256 against the default, a further −19 ms at 1024) |
 | `LINGBOT_CMAX_PSUM_PIN=0\|1` | constant-offset kernel: force compiler-placed / pinned PSUM tiles (default: pinned exactly when the queries take more than one pass, i.e. CP8) |
 | `LINGBOT_FILM_ROWS=N` | per-chunk FiLM graph on N camera rows per CP rank (each TP rank's block zero-padded, the pad sliced off after the all-to-all); 640 for CP8 |
-| `LINGBOT_FILM_GROUP=G` | with `LINGBOT_FILM_ALL`: the FiLM graph on G chunks per call (the last group padded), each later group when its first chunk needs it; did not load at CP8 next to the per-chunk graph |
+| `LINGBOT_FILM_GROUP=G` | with `LINGBOT_FILM_ALL`: the FiLM graph on G chunks per call (the last group padded), each later group when its first chunk needs it; G=4 adopted at CP8 (with `LINGBOT_FILM_ROWS=640`; G=3 did not load next to the 544-row per-chunk graph) |
 | `LINGBOT_V_GATHER_FIRST=1` | A/B only: the new chunk's V CP gather issued before its K gather (no change at CP8) |
 | `LINGBOT_DIAG_NOGATHER=1` | diagnostic, wrong output: step forwards attend the new chunk's cache slot instead of its gathered K / V (made the CP8 kernel failure deterministic) |
 
