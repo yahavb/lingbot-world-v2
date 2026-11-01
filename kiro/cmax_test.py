@@ -20,14 +20,19 @@ from wan.modules import attention as A  # noqa: E402
 
 REPS = int(os.environ.get("REPS", "50"))
 CMAX = [float(c) for c in os.environ.get("CMAX", "15,40").split(",")]
-n, d, L, LQ, LQP = 10, 128, 4320, 270, 288
+# LQ / LQP / NB: real and padded queries per rank and CP rank blocks (CP8: LQ=540 LQP=544 NB=8);
+# MODE1=0 skips the LINGBOT_CMAX=1 kernels (they take at most 512 queries).
+n, d, L = 10, 128, 4320
+LQ, LQP = int(os.environ.get("LQ", "270")), int(os.environ.get("LQP", "288"))
+MODE1 = os.environ.get("MODE1", "1") == "1"
+CHECK_ALL = int(os.environ.get("CHECK_ALL", "0"))  # validate this many further calls of each cmax2 variant
 dev = torch.device("neuron")
 g = torch.Generator().manual_seed(11)
 KERN = {1: wrap_nki(CM.attention_cmax_1), 2: wrap_nki(CM.attention_cmax_2), 4: wrap_nki(CM.attention_cmax_4)}
 from kernels import attention_cmax2_lb as C2  # noqa: E402
 K2 = {"full1": wrap_nki(C2.cmax2_full_1), "part1": wrap_nki(C2.cmax2_part_1), "part3": wrap_nki(C2.cmax2_part_3),
       "final1": wrap_nki(C2.cmax2_final_1)}
-NB = 16  # rank blocks of the CP all-gather (k_blocks)
+NB = int(os.environ.get("NB", "16"))  # rank blocks of the CP all-gather (k_blocks)
 
 
 def blocked(k):
@@ -113,7 +118,7 @@ def main():
             oc = fc(*args).float().cpu()
         tc = timed(fc, args)
         line = f"[cmax] chunks={m} chained {tc:.3f} ms rel(chained, fp32)={rel(oc, ref):.3e}"
-        for c in CMAX:
+        for c in (CMAX if MODE1 else []):
             torch._dynamo.reset()
             fm = torch.compile(lambda q_, *t, m=m, c=c: cmax(q_, list(t[:m]), list(t[m:]), c), backend="neuron",
                                fullgraph=True, dynamic=False)
@@ -133,6 +138,15 @@ def main():
                 t2 = timed(f2, a_)
                 line += (f" | cmax2 kb={kb} tm={int(tm)} {t2:.3f} ms rel(fp32)={rel(o2, ref):.3e} "
                          f"rel(chained)={rel(o2, oc):.3e} finite={bool(torch.isfinite(o2).all())}")
+                if CHECK_ALL:
+                    # every call's output, not only the first: a race shows up as some calls far off
+                    bad, worst = 0, 0.0
+                    with torch.no_grad():
+                        for _ in range(CHECK_ALL):
+                            r_ = rel(f2(*a_).float().cpu(), ref)
+                            worst = max(worst, r_ if math.isfinite(r_) else float("inf"))
+                            bad += int(not (r_ < 1e-2))
+                    line += f" calls={CHECK_ALL} bad={bad} worst_rel={worst:.3e}"
         print(line, flush=True)
 
 

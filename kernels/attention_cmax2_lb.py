@@ -4,7 +4,8 @@ Same math as attention_cmax_lb (softmax(Q K^T - c) V through P @ [V | 1], fp32 a
 reorganized: per (chunk, head) one copy brings the chunk's K into SBUF as [d, Sk], and two bring its V straight into
 the [128 keys, tiles, d + 1] layout MM2 multiplies (the ones column set once per buffer), so no per-tile copies. The
 copies read K in the CP all-gather's rank-block memory ([k_blocks, N, d, Sk / k_blocks], k_blocks > 1) and V in
-token-major memory ([Sk, N, d], v_token_major) directly.
+token-major memory ([Sk, N, d], v_token_major) directly. More than 384 queries (CP8: 544) run as several passes over
+each (chunk, head)'s SBUF-resident K and V, with the PSUM tiles pinned (see _PSUM_PIN_ENV).
 """
 import os
 
@@ -14,7 +15,7 @@ import nki.language as nl
 
 from kernels.attention_const_max_allgather import _EPS, _normalize, _prepare_softmax_max
 from nkilib.core.utils.kernel_assert import kernel_assert
-from nkilib.core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from nkilib.core.utils.kernel_helpers import PSUM_BANK_SIZE, div_ceil, get_verified_program_sharding_info
 from nkilib.experimental import neurotile as nt
 
 _P = 128
@@ -100,9 +101,35 @@ def _load_v(v_sb, v, head, n_heads, d, seq_k, n_tiles, token_major):
         )
 
 
-def _chunk_head(q_sb, k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max):
+_PASS_MAX = 384  # queries per pass over a chunk's keys: at most 3 output tiles (CP16 runs 288 in one pass)
+_MAX_Q = 640  # 5 output tiles, all on pinned banks 0-4
+# PSUM placement. With more than one pass (CP8: 544 queries) every PSUM tile is pinned to a fixed bank: the passes'
+# output tiles on banks 0-4, the MM1 scores alternating on banks 5 and 6, bank 7 unused. With compiler-managed
+# placement the 544-query kernel was exact on one core but wrote inf / NaN on random ranks of the 32-rank block,
+# deterministically for a given graph; pinned it is exact on all 32 ranks. One pass (CP16: 288) keeps compiler
+# placement, the configuration validated there. LINGBOT_CMAX_PSUM_PIN=0 / 1 forces either.
+_PSUM_PIN_ENV = os.environ.get("LINGBOT_CMAX_PSUM_PIN", "")
+assert _PSUM_PIN_ENV in ("", "0", "1"), f"LINGBOT_CMAX_PSUM_PIN={_PSUM_PIN_ENV!r}"
+_SCORE_BANKS = (5, 6)
+
+
+def _query_passes(seq_q):
+    """(first query, count) of each pass over a chunk's key tiles: one pass up to _PASS_MAX queries, else passes
+    of 256 (two whole output tiles) and a last one of at most _PASS_MAX, e.g. 544 (CP8) = 256 + 288. MM1 streams
+    a pass's queries as one moving operand (at most 512 columns, one fp32 PSUM bank)."""
+    if seq_q <= _PASS_MAX:
+        return [(0, seq_q)]
+    passes, r0 = [], 0
+    while seq_q - r0 > _PASS_MAX:
+        passes.append((r0, 2 * _O_TILE_SIZE))
+        r0 += 2 * _O_TILE_SIZE
+    passes.append((r0, seq_q - r0))
+    return passes
+
+
+def _chunk_head(q_sb, k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max, pin=False):
     """o_psums[q tile] = sum over the chunk's key tiles of exp(K^T Q - c)^T @ [V | 1], MM2 trailing MM1 + exp by
-    _PROLOGUE tiles so the Tensor engine always has ready probabilities."""
+    _PROLOGUE tiles so the Tensor engine always has ready probabilities. seq_q <= _PASS_MAX (see _query_passes)."""
     depth = min(_PROLOGUE, n_tiles)
     n_bufs = depth + 1
     probs = nl.ndarray(shape=(_P, n_bufs, seq_q), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -126,7 +153,11 @@ def _chunk_head(q_sb, k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max):
     with nl.no_reorder():
         for tile in range(n_tiles):
             ext = extent(tile)
-            scores = nl.ndarray(shape=(_P, seq_q), dtype=nl.float32, buffer=nl.psum)
+            if pin:
+                scores = nl.ndarray(shape=(_P, seq_q), dtype=nl.float32, buffer=nl.psum,
+                                    address=(0, _SCORE_BANKS[tile % 2] * PSUM_BANK_SIZE))
+            else:
+                scores = nl.ndarray(shape=(_P, seq_q), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_matmul(dst=scores[0:ext, :], stationary=k_sb[:, nl.ds(tile * _P, ext)], moving=q_sb)
             bias = neg_max if isinstance(neg_max, (int, float)) else neg_max[0:ext, :]
             nisa.activation(dst=probs[0:ext, tile % n_bufs, :], data=scores[0:ext, :], op=nl.exp, scale=1.0,
@@ -138,13 +169,17 @@ def _chunk_head(q_sb, k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max):
 
 
 def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, k_blocks=1, v_token_major=False):
-    """[N, d, Sq] pre-scaled queries (Sq <= 512) over every chunk's keys; heads split over the logical core's
-    programs. normalize: [N, Sq, d] in q's dtype, else the fp32 accumulator [N, Sq, d + 1]; acc_in continues one.
-    K chunks have the logical shape [N, d, Sk] and V chunks [N, Sk, d], whatever their memory (k_blocks,
-    v_token_major)."""
+    """[N, d, Sq] pre-scaled queries (Sq <= 640, in the passes of _query_passes) over every chunk's keys; heads
+    split over the logical core's programs. normalize: [N, Sq, d] in q's dtype, else the fp32 accumulator
+    [N, Sq, d + 1]; acc_in continues one. K chunks have the logical shape [N, d, Sk] and V chunks [N, Sk, d],
+    whatever their memory (k_blocks, v_token_major)."""
     n_heads, d, seq_q = q_hbm.shape
     kernel_assert(d == _P, f"d must be {_P}, got {d}")
-    kernel_assert(seq_q <= nl.tile_size.gemm_moving_fmax, f"seq_q={seq_q} must be <= {nl.tile_size.gemm_moving_fmax}")
+    kernel_assert(seq_q <= _MAX_Q, f"seq_q={seq_q} must be <= {_MAX_Q}")
+    passes = _query_passes(seq_q)
+    pin = len(passes) > 1 if _PSUM_PIN_ENV == "" else _PSUM_PIN_ENV == "1"
+    kernel_assert(not pin or div_ceil(seq_q, _O_TILE_SIZE) <= _SCORE_BANKS[0],
+                  f"pinned PSUM: {div_ceil(seq_q, _O_TILE_SIZE)} output tiles exceed banks 0-{_SCORE_BANKS[0] - 1}")
     if normalize:
         out = nl.ndarray(shape=(n_heads, seq_q, d), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
     else:
@@ -156,11 +191,16 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
     neg_max = _prepare_softmax_max(softmax_max)
     n_o_tiles = div_ceil(seq_q, _O_TILE_SIZE)
 
+    # q_sbs[head][pass]: each pass's queries in an SBUF tensor of their own, so MM1's moving operand is always a
+    # whole tensor (one pass up to _PASS_MAX queries: the whole [d, Sq], as before).
     q_sbs = []
     for head in range(per):
-        q_sb = nl.ndarray(shape=(d, seq_q), dtype=nl.bfloat16, buffer=nl.sbuf)
-        _dma(dst=q_sb, src=q_hbm[h0 + head, :, :])
-        q_sbs.append(q_sb)
+        per_pass = []
+        for r0, rows_p in passes:
+            q_sb = nl.ndarray(shape=(d, rows_p), dtype=nl.bfloat16, buffer=nl.sbuf)
+            _dma(dst=q_sb, src=q_hbm[h0 + head, :, :] if rows_p == seq_q else q_hbm[h0 + head, :, nl.ds(r0, rows_p)])
+            per_pass.append(q_sb)
+        q_sbs.append(per_pass)
 
     acc = nl.ndarray(shape=(_O_TILE_SIZE, per, n_o_tiles, d + 1), dtype=nl.float32, buffer=nl.sbuf)
     if acc_in is not None:
@@ -180,15 +220,22 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
             _memset(v_sb[:, :, d : d + 1], 1.0)
             _load_k(k_sb, k, h0 + head, n_heads, d, seq_k, k_blocks)
             _load_v(v_sb, v, h0 + head, n_heads, d, seq_k, n_tiles, v_token_major)
-            o_psums = nt.psum_pool(tile_size=(_O_TILE_SIZE, d + 1), element_shape=(seq_q, d + 1))
-            _chunk_head(q_sbs[head], k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max)
-            for ot in range(n_o_tiles):
-                rows = o_psums[ot].data.shape[0]
-                view = acc[:rows, head, ot, :]
-                if chunk_idx == 0 and acc_in is None:
-                    nisa.tensor_copy(dst=view, src=o_psums[ot].data, engine=nisa.engine.vector)
+            for pi, (r0, rows_p) in enumerate(passes):
+                # one pass of the chunk's key tiles per query range; K and V stay in SBUF across passes
+                if pin:
+                    b0 = r0 // _O_TILE_SIZE
+                    o_psums = nt.psum_pool(tile_size=(_O_TILE_SIZE, d + 1), element_shape=(rows_p, d + 1),
+                                           bank_ids=tuple(range(b0, b0 + div_ceil(rows_p, _O_TILE_SIZE))))
                 else:
-                    _add(view, o_psums[ot].data)
+                    o_psums = nt.psum_pool(tile_size=(_O_TILE_SIZE, d + 1), element_shape=(rows_p, d + 1))
+                _chunk_head(q_sbs[head][pi], k_sb, v_sb, seq_k, n_tiles, rows_p, o_psums, neg_max, pin=pin)
+                for j in range(div_ceil(rows_p, _O_TILE_SIZE)):
+                    rows = o_psums[j].data.shape[0]
+                    view = acc[:rows, head, r0 // _O_TILE_SIZE + j, :]
+                    if chunk_idx == 0 and acc_in is None:
+                        nisa.tensor_copy(dst=view, src=o_psums[j].data, engine=nisa.engine.vector)
+                    else:
+                        _add(view, o_psums[j].data)
 
     for head in range(per):
         for ot in range(n_o_tiles):

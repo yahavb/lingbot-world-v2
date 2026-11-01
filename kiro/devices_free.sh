@@ -5,29 +5,39 @@
 # with the processes present, so parsing it is not reliable.
 #   bash kiro/devices_free.sh            check once
 #   bash kiro/devices_free.sh wait N     poll every 30 s until free for N consecutive checks
+# DEVS=0-7 (or 0,1,2 / 8-15): check only those devices (default: all 16 must be present and free).
 set -u
 check() {
-  timeout 60 neuron-ls --json-output 2>/dev/null | python3 -c '
-import json, sys
+  timeout 60 neuron-ls --json-output 2>/dev/null | DEVS="${DEVS:-}" python3 -c '
+import json, os, sys
 try:
     d = json.load(sys.stdin)
 except Exception as e:
     print("neuron-ls unreadable:", e); sys.exit(1)
+want = None
+if os.environ.get("DEVS"):
+    want = set()
+    for part in os.environ["DEVS"].split(","):
+        a, _, b = part.partition("-")
+        want.update(range(int(a), int(b or a) + 1))
 busy = []
 for dev in d:
+    if want is not None and int(dev.get("neuron_device", -1)) not in want:
+        continue
     for p in dev.get("neuron_processes") or []:
         pid = p.get("pid") if isinstance(p, dict) else p
         busy.append("dev%s pid%s" % (dev.get("neuron_device"), pid))
 if busy:
     print(";".join(busy)); sys.exit(1)
-if len(d) != 16:
+seen = {int(dev.get("neuron_device", -1)) for dev in d}
+if (want is None and len(d) != 16) or (want is not None and not want <= seen):
     print(f"only {len(d)} devices"); sys.exit(1)
 '
 }
 if [ "${1:-}" = "wait" ]; then
   need=${2:-2}; ok=0
   while [ "$ok" -lt "$need" ]; do
-    if check > /tmp/devices_busy.txt; then ok=$((ok + 1)); else ok=0; fi
+    if check > "/tmp/devices_busy${DEVS:+_$DEVS}.txt"; then ok=$((ok + 1)); else ok=0; fi
     [ "$ok" -lt "$need" ] && sleep 30
   done
   echo "free x$need at $(date -Is)"

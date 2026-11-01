@@ -300,6 +300,64 @@ The job runs TP8 × CP8 with `ATTENTION_BACKEND=const_max_ag`. On this host:
    upstream T5-TP code over 64 ranks) and its output goes in through `--prompt_embeds_path`.
    T5 is outside GEN. The decode step uses the default core order, as the job's does.
 
+## 8 devices (32 ranks, LNC2, devices 0-7)
+
+The same job on half the host, TP4 × CP8: `kiro/run_job16.sh <repo> <name> NPROC=32 TP=4 CP=8 PFX=j8 …`.
+Each CP rank holds 540 tokens (544 with `LINGBOT_TOKEN_PAD=32`) instead of 270 (288). 16 fps is 5.06 s of
+GEN + VAE. Another workload held devices 8-15, so these runs went through a second queue restricted to devices
+0-7 (`Q=/mnt/wan/kiro/lbw/q8 DEVS=0-7 CPUS=0-47,96-143 kiro/queue_runner.sh`, see Scripts).
+
+| Run | Change | GEN (s) | VAE (s) | Total (s) | fps | Numerics |
+|---|---|---|---|---|---|---|
+| `d8_base` | the `q33_a` flags | | | | | fails in prewarm: the constant-offset kernel took at most 512 queries |
+| `d8_nocmax`, `d8_cmax` | no constant-offset kernel; the kernel at 544 queries | | | | | the all-chunk FiLM graph (`LINGBOT_FILM_ALL`) fails to load (`NRT_RESOURCE`) |
+| `d8_nofilmall` | per-chunk FiLM graph | 4.91 | 2.92 | 7.83 | 10.35 | blank video: the 544-query kernel corrupted random ranks (below); VAE at 6 frames per step |
+| `d8_exact` | exact chained attention in every layer; VAE 4 frames per step | 5.26 | 0.42 | 5.69 | 14.25 | the reference |
+| `d8_pin` | constant-offset kernel in two query passes, PSUM tiles pinned | 4.86 | 0.42 | 5.29 | 15.32 | latents 0.151 vs `d8_exact` (first frame 0.005, last 0.31); `q33_a` on 16 devices is 0.150 from `d8_exact` |
+| `d8_auto` | the same, the pin now automatic at more than one pass (committed code) | 4.87 | 0.42 | 5.29 | 15.30 | latents bitwise equal to `d8_pin` |
+
+```bash
+bash /work/repo/kiro/run_job16.sh /work/repo d8_auto NPROC=32 TP=4 CP=8 PFX=j8 \
+  <the q33_a flags above> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 LINGBOT_VAE_T=4
+```
+
+**The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
+bank of MM1 scores). It now runs more than 384 queries as passes over each (chunk, head)'s SBUF-resident K and V,
+256 + 288 at CP8, each pass the shape CP16 runs. On one core every variant was exact (40 of 40 calls checked
+against fp32, rel. RMS 2.0e-3), but in the 32-rank block, at lead 3 only, random ranks got inf or 1e25 where the
+exact chained calls give 0.52 RMS. Neither the inputs nor overflow: offset 60, other DMA engines, gathers before or
+after, one 4-chunk call, 2 + 1-chunk calls, queries split into two calls, a head-major loop and synchronous launches
+all stayed corrupt, while one core with graph-produced queries (and a graph scribbling over memory between calls)
+stayed exact. Attending the cache slot instead of the gathered chunk (`LINGBOT_DIAG_NOGATHER=1`) made it fail
+deterministically on rank 0; dumping that rank's kernel inputs and outputs from inside the block
+(`block_bench.py DUMP_CMAX=`) and replaying them on one core (`kiro/cmax_replay.py`) gave an exact result
+(2.3e-3 vs fp32) where the block's accumulator was non-finite for heads 0-2: the inputs were right and the kernel's
+execution inside the block graph was not. With every PSUM tile pinned (the passes' output tiles on banks 0-4, the
+MM1 scores alternating on banks 5 and 6, bank 7 unused) the block is exact on all 32 ranks at leads 0-3 (rel. RMS
+≤ 1.4e-3 against the exact calls, the same as at CP16) and in the deterministic reproducer. One pass (CP16) keeps
+compiler placement, the configuration validated there; `LINGBOT_CMAX_PSUM_PIN=0|1` forces either. Unpinned, two
+block variants (`LINGBOT_SP=0`, `LINGBOT_V_TOKEN_MAJOR=0`) also hit a neuronx-cc internal error at the kernel's MM1
+(`NCC_IBIR829`). Block at lead 3: 2.93 ms, against 3.28-3.63 ms for the exact chained calls.
+
+**The camera FiLM at CP8.** In a rank-0 system profile of `d8_pin` the device is busy 4.73 of 4.86 s; the 1360
+block executions take ~4.05 s (2.98 ms each, 1.92 at CP16) and the per-chunk FiLM graph 7 × 88 ms = 0.62 s. That
+graph also holds 5.2 GB of "DMA Rings Spill" per core (`kiro/sysprof_hbm.py`; every other graph together ~0.4 GB,
+and at CP16 all graphs together 0.09 GB), which is why no larger FiLM graph fits: the all-chunk graph and a
+3-chunk version (`LINGBOT_FILM_GROUP=3`, `d8_fg3`) both fail to load with `NRT_RESOURCE` while it is resident.
+One block's FiLM against its camera row count (`block_bench.py FILM_ROWS=`): 256 rows 0.46 ms, 288 0.49, 384 0.57,
+512 1.21, 528 2.28, **544 2.32**, 576 2.44, **640 0.78**, 768 0.87, 1024 0.99 ms; CP8's 544 rows sit in a slow window.
+Several chunks in one graph (`FILM_K=`) cost 1.34 ms for 2 chunks and 1.61 ms for 3 (each chunk's params within
+2.5e-4 of the per-chunk graph's on every rank). `LINGBOT_FILM_ROWS=640` pads the per-chunk FiLM input to 640 rows;
+its end-to-end run is the next measurement.
+
+**VAE at 32 ranks.** 4 × 8 tiles of 15 × 12 latent; frames per step T = 2 / 3 / 4 / 5 / 6: 814 / 492 / 420 / 460 /
+500 ms. With T ≤ 5 the first decode after warmup takes 2.3-2.8 s, so T = 4 is used with the job's untimed warmup
+decode (the timed decode is the second). 2 × 16 tiles (`LINGBOT_VAE_PER_DEVICE=2`) fail collective setup
+(`no_hier no_mesh`, replica group `[0, 2, …, 30]`).
+
+Also measured at CP8 (block, lead 3): the V gather issued before K (`LINGBOT_V_GATHER_FIRST=1`) 2.93 ms, unchanged;
+the kernel's copies on the Sync / Scalar DGE 3.01 / 3.17 ms; one coalesced K + V gather 2.89 ms.
+
 ## 2 devices (8 ranks, devices 14 + 15)
 
 | | Layout | GEN (s) | VAE (s) | Total (s) | fps |
@@ -429,6 +487,11 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop, no syncs |
 | `LINGBOT_EMBED_LOCAL=1`, `LINGBOT_CROSS_QPAD=32`, `LINGBOT_KV_REAL=1…4`, `LINGBOT_CMAX_DGE=hwdge_sync\|hwdge_act`, `LINGBOT_KV_COALESCE=1` | A/B only, no gain (see "Measured and not adopted") |
 | `NEURON_RT_IO_RING_CACHE_SIZE=1024` | runtime setting, not a code flag: I/O descriptor cache entries (GEN −42 ms at 256 against the default, a further −19 ms at 1024) |
+| `LINGBOT_CMAX_PSUM_PIN=0\|1` | constant-offset kernel: force compiler-placed / pinned PSUM tiles (default: pinned exactly when the queries take more than one pass, i.e. CP8) |
+| `LINGBOT_FILM_ROWS=N` | per-chunk FiLM graph on N camera rows per CP rank (each TP rank's block zero-padded, the pad sliced off after the all-to-all); 640 for CP8 |
+| `LINGBOT_FILM_GROUP=G` | with `LINGBOT_FILM_ALL`: the FiLM graph on G chunks per call (the last group padded), each later group when its first chunk needs it; did not load at CP8 next to the per-chunk graph |
+| `LINGBOT_V_GATHER_FIRST=1` | A/B only: the new chunk's V CP gather issued before its K gather (no change at CP8) |
+| `LINGBOT_DIAG_NOGATHER=1` | diagnostic, wrong output: step forwards attend the new chunk's cache slot instead of its gathered K / V (made the CP8 kernel failure deterministic) |
 
 ## Scripts (`kiro/`)
 
@@ -448,7 +511,7 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `run_vae.sh`, `vae_bench.py`, `vae_cmp.py` | VAE decode bench (any decoder mode, optional profile); slice-by-slice output comparison |
 | `prof_crit.py` | per-core op timeline and idle gaps of one execution from a neuron-explorer profile |
 | `perf_ledger.jsonl` | every experiment of the 4.8 s push, refuted ones included |
-| `devices_free.sh`, `queue_runner.sh` | host-side job queue that starts a job only when no process holds a Neuron device |
+| `devices_free.sh`, `queue_runner.sh` | host-side job queue that starts a job only when no process holds a Neuron device; `Q=<dir> DEVS=0-7 CPUS=0-47,96-143` runs a second queue that waits for devices 0-7 only and pins the job to their NUMA node |
 | `hash_bench.py`, `hash_bench64.py` | encode-cache key cost on the host, one process / N processes at once |
 | `block_bench.py` `SAVE_REFDIR=` / `REFDIR=` | every rank saves / compares its own block output (a rank-0 comparison misses errors that reach rank 0 only through the next block's gather) |
 | `attn_tile_bench.py` | `attention_cte` cost vs query tiles, key length and call count, one core, kernel only |
@@ -460,6 +523,13 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `attn_chain_test.py` | `LINGBOT_CTE_CHAIN` on one core: chained calls vs the merged path and fp32, and their time |
 | `cmax_test.py`, `cmax_det.py` | the constant-offset kernels vs the chained `attention_cte` calls and fp32, one core; their run-to-run determinism |
 | `nkl_cte_cmp.py` | an nki-library `attention_cte` branch against `main` on one core: time per call and bitwise comparison of every output (`CASES=table` for the full table) |
+| `cmax_test.py` `LQ= LQP= NB= MODE1=0 CHECK_ALL=n` | the constant-offset kernels at other query counts / rank blocks (CP8: 540 / 544 / 8), every one of n calls checked |
+| `cmax_race_test.py` | the constant-offset kernels behind graph-produced queries, every call checked against fp32; `SCRIBBLE=1` runs a graph with huge intermediates between calls |
+| `block_bench.py` `DUMP_CMAX=<dir>`, `cmax_replay.py` | every rank saves its constant-offset kernel inputs and outputs from inside the block; one rank replayed on one core against the dump and fp32 |
+| `block_bench.py` `FILM_ROWS=…`, `FILM_K=…`, `FILM_PADCHECK=N` | one block's FiLM cost against its camera row count / chunks per graph (each chunk checked); `LINGBOT_FILM_ROWS=N` checked against the unpadded params on every rank |
+| `block_bench.py` `KV_STATS=1`, `ORDER=i,j,…` | diagnostics: per cache slot max \|K\|, \|V\| before and after the timed calls; which cache slots are the cached chunks |
+| `sysprof_hbm.py`, `sysprof_neff.py` | runtime system profile: device memory by usage type (`DMA Rings Spill`, ...); one NEFF's executions with their collective time |
+| `prof_icount.py`, `prof_execs.py` | device profile: one execution's instruction count per core and engine; all executions, and engine / opcode busy time of one |
 
 Reproduce the 16-device table (`/work/repo_upstream` = upstream `main`, `/work/repo` = this branch):
 

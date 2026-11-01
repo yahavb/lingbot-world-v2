@@ -224,6 +224,20 @@ _ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
 # so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
 _CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
 _CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_FILM_GROUP=G (with LINGBOT_FILM_ALL): the FiLM graph on G chunks per call, later groups when first needed.
+_FILM_GROUP = int(os.environ.get("LINGBOT_FILM_GROUP", "0") or 0)
+# LINGBOT_FILM_ROWS=N: the per-chunk FiLM graph (cam_film_sp) on N camera token rows per CP rank (zero-padded). At CP8
+# its 544 rows fall in a window (513 .. 576 measured) where one block's FiLM takes 2.3 ms and the graph holds 5.2 GB of
+# spill DMA rings; on 640 rows it takes 0.78 ms (256: 0.46, 512: 1.21, 1024: 0.99).
+_FILM_ROWS = int(os.environ.get("LINGBOT_FILM_ROWS", "0") or 0)
+# LINGBOT_V_GATHER_FIRST=1: in the step forward, the new chunk's V CP all-gather issued before its K gather.
+_V_GATHER_FIRST = os.environ.get("LINGBOT_V_GATHER_FIRST", "0") == "1"
+# LINGBOT_DIAG_NOGATHER=1 (diagnostic, wrong output): the step forward attends the new chunk's cache slot instead of
+# its CP-gathered K / V (the gathers become dead code), in the constant-offset and the chained attention_cte paths.
+_DIAG_NOGATHER = os.environ.get("LINGBOT_DIAG_NOGATHER", "0") == "1"
+# Diagnostic: preallocated device buffers ("q_t", "acc", "o_n") the constant-offset path copies its kernel queries,
+# cached-chunk accumulator and output into (kiro/block_bench.py DUMP_CMAX=<dir>). Empty: nothing copied.
+_DIAG_BUFS = {}
 _CMAX_LAYERS = frozenset((
     0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 35, 36, 37))
 
@@ -1230,6 +1244,11 @@ class CausalWanSelfAttention(nn.Module):
                         # each output is the same contiguous tensor the two separate gathers return
                         kg, vg = fc.all_gather_into_tensor_coalesced([kin, vin], tp.mesh_submesh("cp"))
                         return kg.view(_n, _d, _cp * _l), vg     # K memory [cp, n, d, l]; V [cp * l, n, d]
+                    if _V_GATHER_FIRST and _k_ndl and _K_BLOCKED and _V_TM and _vg_early[0] is None:
+                        # LINGBOT_V_GATHER_FIRST=1: the V gather issued before the K gather (V needs no norm or RoPE)
+                        vg = tp.all_gather_fn(vin, 0, "cp")
+                        kg = tp.all_gather_fn(kin, 0, "cp").view(_n, _d, _cp * _l)
+                        return kg, vg
                     if _k_ndl and _K_BLOCKED:
                         kg = tp.all_gather_fn(kin, 0, "cp")
                         kg = kg.view(_n, _d, _cp * _l)          # memory: [cp, n, d, l]
@@ -1265,8 +1284,15 @@ class CausalWanSelfAttention(nn.Module):
                         kd.copy_(kg.reshape(kd.shape))
                         vd.copy_(vg.reshape(vd.shape))
                     else:
-                        kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                        if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                     o_n = cmax_final(q_t, kd, vd, acc, _c_off, _kb, _V_TM)      # [n, Lq_p, d]
+                    if _DIAG_BUFS:
+                        # diagnostic (kiro/block_bench.py DUMP_CMAX): the kernel's queries, accumulator and output
+                        _DIAG_BUFS["q_t"].copy_(q_t)
+                        if acc is not None and "acc" in _DIAG_BUFS:
+                            _DIAG_BUFS["acc"].copy_(acc)
+                        _DIAG_BUFS["o_n"].copy_(o_n)
                     x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)              # [1, Lq, n, d]
                     out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                     if return_cache and not getattr(self, 'tp_enabled', False):
@@ -1300,7 +1326,8 @@ class CausalWanSelfAttention(nn.Module):
                         kd.copy_(kg.reshape(kd.shape))
                         vd.copy_(vg.reshape(vd.shape))
                     else:
-                        kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                        if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                     if _ROWMAX_GRAPH and _k_ndl and getattr(self, "_rm_graph", None) is not None:
                         _rq = _REAL_TOKENS[0] if _REAL_TOKENS[0] is not None else lq
                         _rowmax_graph_update(self._rm_graph, q_c[:, :min(_rq, lq)],
@@ -1765,7 +1792,19 @@ class CausalWanAttentionBlock(nn.Module):
     def cam_film_sp(self, c2ws_plucker_emb):
         """cam_film() already in the sequence-parallel form the SP block consumes: this rank's
         token shard at full width, via one all-to-all per tensor inside the same graph
-        (LINGBOT_FILM_A2A=1) instead of an eager full-width all-gather + slice + clone."""
+        (LINGBOT_FILM_A2A=1) instead of an eager full-width all-gather + slice + clone.
+        LINGBOT_FILM_ROWS=N: the camera tokens padded to N rows first (zero rows at the end of every TP rank's
+        token block, so the all-to-all still hands each rank its own tokens, then sliced off). Every op is per
+        token, so the real rows' params are those of the unpadded graph; the row count only changes how the
+        compiler tiles the matmuls."""
+        _, L, C = c2ws_plucker_emb.shape
+        if _FILM_ROWS > L:
+            n = tp.mesh_submesh("tp").size()
+            assert L % n == 0 and _FILM_ROWS % n == 0, f"LINGBOT_FILM_ROWS={_FILM_ROWS}: {L} tokens, tp {n}"
+            x = torch_F.pad(c2ws_plucker_emb.view(n, L // n, C), (0, 0, 0, (_FILM_ROWS - L) // n))
+            scale, shift = self.cam_film(x.reshape(1, _FILM_ROWS, C))
+            return (tp.cols_to_token_shard(scale, "tp")[:, :L // n],
+                    tp.cols_to_token_shard(shift, "tp")[:, :L // n])
         scale, shift = self.cam_film(c2ws_plucker_emb)
         return tp.cols_to_token_shard(scale, "tp"), tp.cols_to_token_shard(shift, "tp")
 
@@ -2281,6 +2320,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
         _cam_in = None
         self._films_cur = None
         _film_chk = None
+        _lz = getattr(self, "_films_lazy", None)
+        if _lz is not None and dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+            # LINGBOT_FILM_GROUP: this chunk's group of FiLM params, if it has not been computed yet
+            _c = dit_cond_dict["c2ws_plucker_emb"]
+            _k = _lz["pos"].get(id(_c))
+            if _k is not None and _lz["tuples"][_k] is _c and id(_c) not in (getattr(self, "_films_pre", None) or {}):
+                self._film_group(_k - _k % _lz["G"])
         _pre = getattr(self, "_films_pre", None)
         if (_pre and dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict
                 and id(dit_cond_dict["c2ws_plucker_emb"]) in _pre
@@ -2916,14 +2962,38 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 return _films_multi(raw, c_cat, K_, P_)
             fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
                                                       dynamic=False)
-        res = fn(torch.cat(toks, dim=1), K, P)
         self._films_pre = {}
-        for k, t in enumerate(cam_tuples):
-            self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])
+        self._films_lazy = None
+        if 0 < _FILM_GROUP < K:
+            # LINGBOT_FILM_GROUP=G: the FiLM graph runs on G chunks per call, the first group now and each later one
+            # when its first chunk's forward needs it (forward -> _film_group), so at most one group's params are
+            # held. At CP8 one block's FiLM costs 2.33 ms for one chunk but 1.34 ms for two in one graph; the
+            # all-chunk graph (G = K) did not fit there.
+            self._films_lazy = {"tuples": list(cam_tuples), "toks": toks, "G": _FILM_GROUP, "P": P,
+                                "pos": {id(t): k for k, t in enumerate(cam_tuples)}}
+            self._film_group(0)
+        else:
+            res = fn(torch.cat(toks, dim=1), K, P)
+            for k, t in enumerate(cam_tuples):
+                self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])
         if os.environ.get("LINGBOT_FILM_CHECK", "") and not getattr(self, "_film_check_done", False):
             # First generation only, so a benchmark's timed pass is unaffected.
             self._film_check_ids = {id(t): k for k, t in enumerate(cam_tuples)}
             self._film_check_done = True
+
+    def _film_group(self, k0):
+        """LINGBOT_FILM_GROUP: the FiLM params of chunks k0 .. k0 + G - 1 in one call of the FiLM graph, replacing the
+        previous group's. A short last group is padded with copies of its last chunk, so one compiled graph (K = G)
+        serves every group."""
+        lz = self._films_lazy
+        G, P = lz["G"], lz["P"]
+        ts = lz["toks"][k0:k0 + G]
+        ts = ts + [ts[-1]] * (G - len(ts))
+        self._films_pre = {}
+        with torch.amp.autocast('neuron', dtype=torch.bfloat16), torch.no_grad():
+            res = self._films_multi_fn(torch.cat(ts, dim=1), G, P)
+        for j, t in enumerate(lz["tuples"][k0:k0 + G]):
+            self._films_pre[id(t)] = (t, [(sc[j:j + 1], sh[j:j + 1]) for sc, sh in res])
 
     def _cam_films(self, dit_cond_dict):
         """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).
