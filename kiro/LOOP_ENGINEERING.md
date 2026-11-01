@@ -2,7 +2,8 @@
 
 One 81-frame 480×768 video from `examples/03`, chunk 3, window 12, sink 1, 4 denoise steps,
 seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1` container
-(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0).
+(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0). On 8 devices the same video takes 4.86 s (16.68 fps, see
+"8 devices").
 
 ## 16 devices (64 ranks, LNC2)
 
@@ -314,11 +315,12 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_nofilmall` | per-chunk FiLM graph | 4.91 | 2.92 | 7.83 | 10.35 | blank video: the 544-query kernel corrupted random ranks (below); VAE at 6 frames per step |
 | `d8_exact` | exact chained attention in every layer; VAE 4 frames per step | 5.26 | 0.42 | 5.69 | 14.25 | the reference |
 | `d8_pin` | constant-offset kernel in two query passes, PSUM tiles pinned | 4.86 | 0.42 | 5.29 | 15.32 | latents 0.151 vs `d8_exact` (first frame 0.005, last 0.31); `q33_a` on 16 devices is 0.150 from `d8_exact` |
-| `d8_auto` | the same, the pin now automatic at more than one pass (committed code) | 4.87 | 0.42 | 5.29 | 15.30 | latents bitwise equal to `d8_pin` |
+| `d8_auto` | the same, the pin now automatic at more than one pass | 4.87 | 0.42 | 5.29 | 15.30 | latents bitwise equal to `d8_pin` |
+| **`d8_fr640`** | per-chunk FiLM graph on 640 camera rows (`LINGBOT_FILM_ROWS=640`) | **4.44** | **0.42** | **4.86** | **16.68** | latents 0.130 vs `d8_pin` (first frame 0.005, last 0.26); one block's FiLM params within one bf16 ulp (max \|d\| 7.8e-3) of the unpadded ones on every rank |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_auto NPROC=32 TP=4 CP=8 PFX=j8 \
-  <the q33_a flags above> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 LINGBOT_VAE_T=4
+bash /work/repo/kiro/run_job16.sh /work/repo d8_fr640 NPROC=32 TP=4 CP=8 PFX=j8 \
+  <the q33_a flags above> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -347,8 +349,9 @@ and at CP16 all graphs together 0.09 GB), which is why no larger FiLM graph fits
 One block's FiLM against its camera row count (`block_bench.py FILM_ROWS=`): 256 rows 0.46 ms, 288 0.49, 384 0.57,
 512 1.21, 528 2.28, **544 2.32**, 576 2.44, **640 0.78**, 768 0.87, 1024 0.99 ms; CP8's 544 rows sit in a slow window.
 Several chunks in one graph (`FILM_K=`) cost 1.34 ms for 2 chunks and 1.61 ms for 3 (each chunk's params within
-2.5e-4 of the per-chunk graph's on every rank). `LINGBOT_FILM_ROWS=640` pads the per-chunk FiLM input to 640 rows;
-its end-to-end run is the next measurement.
+2.5e-4 of the per-chunk graph's on every rank). `LINGBOT_FILM_ROWS=640` pads every TP rank's 136-row block of the
+per-chunk FiLM input to 160 rows and slices the pad off after the all-to-all: one block's FiLM 2.39 -> 0.83 ms, and
+end to end GEN 4.87 -> 4.44 s (`d8_fr640`, 16.68 fps).
 
 **VAE at 32 ranks.** 4 × 8 tiles of 15 × 12 latent; frames per step T = 2 / 3 / 4 / 5 / 6: 814 / 492 / 420 / 460 /
 500 ms. With T ≤ 5 the first decode after warmup takes 2.3-2.8 s, so T = 4 is used with the job's untimed warmup
