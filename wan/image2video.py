@@ -1120,9 +1120,13 @@ class WanI2VCausal:
         # LINGBOT_START_OVERLAP=3: as 1, with the draws split: the initial noise first (the first forward waits only
         # for it), then the per-step draws, resolved where the loop first re-noises (after the first forward was
         # issued). One worker thread draws both in order, so the generator's sequence is unchanged.
-        _overlap = (os.environ.get("LINGBOT_START_OVERLAP", "0") in ("1", "2", "3") and chunk_control is None
+        # LINGBOT_START_OVERLAP=4: as 3, with the per-step draws' host-to-device copy in the worker too. Under 3 the
+        # 23 MB copy ran on the issuing thread at the first re-noise, after the first forward, and the device idled
+        # through it (12.8 ms at 1.8 GB/s in the d8_cssp system profile).
+        _overlap = (os.environ.get("LINGBOT_START_OVERLAP", "0") in ("1", "2", "3", "4") and chunk_control is None
                     and max_chunks is None)
-        _split_draws = os.environ.get("LINGBOT_START_OVERLAP", "0") == "3"
+        _split_draws = os.environ.get("LINGBOT_START_OVERLAP", "0") in ("3", "4")
+        _steps_up = os.environ.get("LINGBOT_START_OVERLAP", "0") == "4"
         _bg = _draw_fut = _ek_fut = _steps_fut = None
         if _overlap:
             from concurrent.futures import ThreadPoolExecutor
@@ -1198,7 +1202,8 @@ class WanI2VCausal:
                 def _draw_steps():
                     d = [torch.randn(_shape_pre, generator=seed_g, device='cpu', dtype=torch.float32)
                          for _ in range(_n_pre)]
-                    return torch.stack(d) if d else None
+                    st = torch.stack(d) if d else None
+                    return st.to(self.device) if (_steps_up and st is not None) else st
                 _draw_fut = _dr.submit(_draw_n0)
                 _steps_fut = _dr.submit(_draw_steps)      # after _draw_n0 on the one worker: same order
                 _dr.shutdown(wait=False)
@@ -2201,6 +2206,15 @@ class WanI2VCausal:
                 'v': v,
                 'is_init': torch.tensor(0, dtype=torch.int32, device=device),
             })
+            _kc = int(os.environ.get("LINGBOT_CROSS_DEDUP", "0") or 0)
+            if _kc:
+                # LINGBOT_CROSS_DEDUP: the per-key log-multiplicity of the attended cache slice (written by the
+                # generation's first forward)
+                crossattn_cache[-1]['mult'] = torch.zeros(_kc, dtype=torch.float32, device=device)
+                try:
+                    torch._dynamo.mark_static_address(crossattn_cache[-1]['mult'])
+                except Exception:
+                    pass
         if _reuse:
             self._cross_kv_reuse = (_key, crossattn_cache)
         return crossattn_cache

@@ -319,12 +319,16 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_fr640` | per-chunk FiLM graph on 640 camera rows (`LINGBOT_FILM_ROWS=640`) | 4.44 | 0.42 | 4.86 | 16.68 | latents 0.130 vs `d8_pin` (first frame 0.005, last 0.26); one block's FiLM params within one bf16 ulp (max \|d\| 7.8e-3) of the unpadded ones on every rank |
 | `d8_coal` | the new chunk's K and V in one coalesced CP all-gather (`LINGBOT_KV_COALESCE=1`) | 4.32 | 0.44 | 4.76 | 17.03 | latents 0.156 vs `d8_fr640` (first frame 0.005, last 0.27): the compiled block changes (layer 33 output within 8.2e-5 rel. RMS of the separate gathers; layer 10 the same 1.3e-3 from the exact calls) |
 | `d8_split` | `d8_fr640` with the initial noise drawn before the per-step draws (`LINGBOT_START_OVERLAP=3`) | 4.40 | 0.42 | 4.82 | 16.81 | latents bitwise equal to `d8_fr640` |
-| **`d8_cssp`** | both (with the rank-0 system profile) | **4.28** | **0.42** | **4.71** | **17.22** | latents bitwise equal to `d8_coal` |
+| `d8_cssp` | both (with the rank-0 system profile) | 4.28 | 0.42 | 4.71 | 17.22 | latents bitwise equal to `d8_coal` |
+| `d8_camsh` | the per-chunk camera embedding MLP on each CP rank's 540 tokens (`LINGBOT_FILM_SHARD=1`); the per-step draws copied from the draw worker (`LINGBOT_START_OVERLAP=4`, no gain alone: `d8_up4` 4.28 s) | 4.27 | 0.42 | 4.69 | 17.27 | latents bitwise equal to `d8_coal` |
+| `d8_rs` | the SP reduce-scatters and the FiLM graph's all-reduce on bf16 payloads (`LINGBOT_RS_BF16=1 LINGBOT_FILM_AR_BF16=1`) | 4.09 | 0.43 | 4.51 | 17.96 | latents 0.144 vs `d8_exact` (first frame 0.0055, last 0.29), where `d8_camsh` is 0.129 (0.0046, 0.24) |
+| **`d8_dd`** | the cross-attention over the 128 first context rows, the identical padding rows weighted by their count (`LINGBOT_CROSS_DEDUP=128`) | **3.99** | **0.42** | **4.42** | **18.35** | latents 0.138 vs `d8_exact` (first frame 0.0052, last 0.29), 0.140 vs `d8_rs` |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_cssp NPROC=32 TP=4 CP=8 PFX=j8 \
-  <the q33_a flags above, LINGBOT_START_OVERLAP=3 instead of 1> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 \
-  LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1
+bash /work/repo/kiro/run_job16.sh /work/repo d8_dd NPROC=32 TP=4 CP=8 PFX=j8 \
+  <the q33_a flags above, LINGBOT_START_OVERLAP=4 instead of 1> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=1 \
+  LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1 LINGBOT_RS_BF16=1 LINGBOT_FILM_AR_BF16=1 \
+  LINGBOT_CROSS_DEDUP=128
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -370,11 +374,42 @@ layers, runs at 2.66 / 2.72 ms like its neighbours. In `d8_fr640sp` the device s
 waited for the background thread's 7.7 M seeded samples; `LINGBOT_START_OVERLAP=3` draws the initial noise first and
 the per-step draws after it on the same worker, resolved at the first re-noise: GEN −40 ms, device idle 153 -> 115 ms.
 
+**The per-chunk camera embedding.** Without `LINGBOT_FILM_ALL`, each chunk's first forward ran the camera embedding
+MLP (two 5120 × 5120 linears) on all 4320 tokens of the chunk on every rank and then kept the rank's 540: 14
+executions of 2.0 ms per generation. `LINGBOT_FILM_SHARD=1` now shards first on this path too: 0.35 ms each, latents
+bitwise equal, device busy −24.5 ms, GEN −8 ms (device idle +12 ms). The 23 MB of per-step draws are copied
+(`nrt_tensor_write`, 12.8-13.3 ms at ~1.8 GB/s) when the first forward ends, with the device idle, whether the
+issuing thread or the draw worker (`LINGBOT_START_OVERLAP=4`) makes the copy.
+
+**bf16 reductions.** The collective table of a lead-3 block profile (`CcOp.parquet`): the three SP reduce-scatters
+per block (self- and cross-attention o-projections, FFN down) moved 11.1 MB of fp32 each in ~57 µs on the critical
+path, the bf16 token all-gathers of the same rows 5.6 MB in ~26 µs. `LINGBOT_AR_BF16` never reached them: the
+row-parallel projections run under an fp32 autocast, so their outputs are fp32 before any promotion.
+`LINGBOT_RS_BF16=1` rounds each rank's partial sums to bf16 and reduce-scatters in bf16 (32-34 µs): the block at
+lead 3 2.89 -> 2.77 ms (layer 33 3.38 -> 3.28, lead 1 2.77 -> 2.69), its output 2.2e-3 (rel. RMS) from the fp32 sums,
+against 1.3e-3 between the constant-offset kernel and the exact calls. The per-chunk FiLM graph's row-parallel
+all-reduce (fp32 [640, 5120] per block) in bf16 (`LINGBOT_FILM_AR_BF16=1`): one block's FiLM 0.84 -> 0.72 ms, the
+params 2.1e-3 from the fp32 all-reduce. Together GEN −184 ms (`d8_rs`).
+
+**Cross-attention over the distinct context rows.** The context is the prompt's T5 rows zero-padded to 512 and run
+through the per-row text embedding MLP, so every padding row has the same K and V, and softmax over m identical keys
+is one key with log m added to its score. `LINGBOT_CROSS_DEDUP=128`: the generation's first forward (it fills the
+cross-attention cache) counts the rows equal to the last one in K and V and stores log(m / r) on the r such rows
+inside the first 128, 0 on the others (`cross_dedup_bias`); every forward attends those 128 rows with that bias as
+fp32 matmuls and softmax in the block graph instead of the kernel over 512 (`cross_attention_dedup`). Exact up to
+rounding while the prompt has fewer than 128 rows, which the forward checks (the job's prompt has 47; a longer one
+keeps the kernel). On the CPU against an fp64 softmax over all 512 rows: max \|d\| 1.1e-5. Block at lead 3 with 48
+prompt rows: 2.90 -> 2.81 ms; its output is 2.8e-3 from the kernel path, as is the same XLA path over all 512 keys
+(2.87 ms), so the difference is the kernel's own rounding. GEN −93 ms (`d8_dd`).
+
 Also measured at CP8 (block, lead 3), no gain: the V gather issued before K (`LINGBOT_V_GATHER_FIRST=1`) 2.93 ms; the
 kernel's copies on the Sync / Scalar DGE 3.01 / 3.17 ms; the cached-chunk call made to wait for the V projection
 (four variants, code removed) 2.93–2.94 ms; bf16 SP reductions (`LINGBOT_AR_BF16=1`) bitwise equal and the same
 time; the tokens padded to 640 instead of 544 (`LINGBOT_TOKEN_PAD=128`) 3.12 ms (layer 33: 3.48 vs 3.36). With the
 FiLM graph's spill rings gone, the all-chunk FiLM graph (`LINGBOT_FILM_ALL`) still fails to load (`NRT_RESOURCE`).
+Everything after the self-attention as two independent token streams (rows 0-63 and 64-135 of each TP rank's
+shard, so one stream's SP collectives could run under the other's matmuls; code removed): 3.02 ms against 2.89, the
+SP collectives being bandwidth-bound and the second cross-attention call and extra collectives adding ~0.13 ms.
 
 ## 2 devices (8 ranks, devices 14 + 15)
 
@@ -453,7 +488,7 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_CTE_MERGE_K=nld` | A/B only: K as [n, L, d] instead of pre-transposed (slower) |
 | `LINGBOT_FILM_A2A=1` | FiLM token shards via all-to-all (needs `LINGBOT_SP=1`) |
 | `LINGBOT_FILM_FULL=1` | full-width FiLM params once per chunk without SP |
-| `LINGBOT_AR_BF16=1` | row-parallel reductions in bf16 (no measured gain) |
+| `LINGBOT_AR_BF16=1` | in-graph reductions of bf16 tensors stay bf16 (no effect on the SP reduce-scatters, whose inputs are fp32: see `LINGBOT_RS_BF16`) |
 | `LINGBOT_PRE_ENCODE` (default 1) | VAE-encode the conditioning image before the DiT loads |
 | `LINGBOT_LOAD_CONCURRENCY=N` | N ranks load the DiT weights per turn (default 1); needs ~10–13 GB host RAM per loading rank |
 | `LINGBOT_DUMP_LATENTS=<path>`, `LINGBOT_MEMLOG=1` | diagnostics |
@@ -498,8 +533,11 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_CMAX=1\|2`, `LINGBOT_CMAX_OFFSET=c` | constant-offset self-attention softmax(QKᵀ − c)·V in the 34 layers of `_CMAX_LAYERS` (c = 30 by default); 2 = `kernels/attention_cmax2_lb.py`, whole-chunk loads in the production K/V layouts (adopted) |
 | `LINGBOT_ROWMAX_GRAPH=1` | diagnostic: every layer's per-head softmax row-max range over each generation, printed per rank (`[ROWMAX]`, `[ROWMAX_X]` for cross-attention) |
 | `LINGBOT_KV_REUSE=1` | keep the self- and cross-attention KV caches for the next generation instead of allocating and zero-filling new ones (every slot is written before it is read) |
-| `LINGBOT_START_OVERLAP=1\|2\|3` | seeded noise draws and the encode-cache key in background threads, the FiLM precompute right after the Plücker condition, no syncs before the chunk loop (2: the noise uploads in the thread too; 3: the initial noise drawn first and the per-step draws after it on one worker, resolved at the first re-noise); same draws, same order |
-| `LINGBOT_FILM_SHARD=1` | with `LINGBOT_FILM_ALL`: the camera embedding MLP on each CP rank's own tokens only |
+| `LINGBOT_START_OVERLAP=1…4` | seeded noise draws and the encode-cache key in background threads, the FiLM precompute right after the Plücker condition, no syncs before the chunk loop (2: the noise uploads in the thread too; 3: the initial noise drawn first and the per-step draws after it on one worker, resolved at the first re-noise; 4: as 3, the per-step draws copied to the device in the worker); same draws, same order; any other value turns all of it off |
+| `LINGBOT_FILM_SHARD=1` | the camera embedding MLP on each CP rank's own tokens only (with `LINGBOT_FILM_ALL` in its precompute, without it in the per-chunk camera branch) |
+| `LINGBOT_RS_BF16=1` | the SP reduce-scatters of fp32 tensors (the row-parallel o-projections and FFN down) on bf16 payloads |
+| `LINGBOT_FILM_AR_BF16=1` | the camera FiLM's row-parallel all-reduce (`cam_injector_layer2`) on bf16 partial sums |
+| `LINGBOT_CROSS_DEDUP=Kc` | cross-attention over the first Kc context rows, the identical padding rows weighted by their count, in the block graph (needs `LINGBOT_CROSS_NMAJOR`; off for prompts of Kc rows or more) |
 | `LINGBOT_SCHED_FUSE=1` | a denoise step's x0 and the re-noised next input in one compiled graph |
 | `LINGBOT_GC_OFF=1` | no cyclic garbage collection inside a generation (re-enabled after it) |
 | `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop, no syncs |
@@ -547,6 +585,7 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `block_bench.py` `DUMP_CMAX=<dir>`, `cmax_replay.py` | every rank saves its constant-offset kernel inputs and outputs from inside the block; one rank replayed on one core against the dump and fp32 |
 | `block_bench.py` `FILM_ROWS=…`, `FILM_K=…`, `FILM_PADCHECK=N` | one block's FiLM cost against its camera row count / chunks per graph (each chunk checked); `LINGBOT_FILM_ROWS=N` checked against the unpadded params on every rank |
 | `block_bench.py` `KV_STATS=1`, `ORDER=i,j,…` | diagnostics: per cache slot max \|K\|, \|V\| before and after the timed calls; which cache slots are the cached chunks |
+| `block_bench.py` `FILM_ARCHECK=N`, `CTX_REAL=N` | one block's FiLM on N rows with the fp32 and the bf16 all-reduce, compared on every rank and timed; a context of N distinct rows then identical padding rows (what `LINGBOT_CROSS_DEDUP` needs) |
 | `sysprof_hbm.py`, `sysprof_neff.py` | runtime system profile: device memory by usage type (`DMA Rings Spill`, ...); one NEFF's executions with their collective time |
 | `prof_icount.py`, `prof_execs.py` | device profile: one execution's instruction count per core and engine; all executions, and engine / opcode busy time of one |
 | `prof_vgather.py` | device profile: when the new chunk's K / V projections, norms, CP all-gathers and attention calls run in one block execution, and the CC cores' ring spans |

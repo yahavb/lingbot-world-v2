@@ -97,7 +97,13 @@ def main():
     x = torch.randn(1, L_loc, config["dim"], generator=g) * 0.5
     x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev).float()
     e0 = (torch.randn(1, 1, 6, config["dim"], generator=g) * 0.1).to(dev).float()
-    ctx = (torch.randn(1, 512, config["dim"], generator=g) * 0.5).to(dev).to(torch.bfloat16)
+    ctx = torch.randn(1, 512, config["dim"], generator=g) * 0.5
+    ctx_real = int(os.environ.get("CTX_REAL", "0") or 0)
+    if ctx_real:
+        # CTX_REAL=N: the pipeline's context, N prompt rows then 512 - N identical padding rows (its zero padding,
+        # embedded); what LINGBOT_CROSS_DEDUP relies on
+        ctx[:, ctx_real:] = ctx[:, ctx_real:ctx_real + 1]
+    ctx = ctx.to(dev).to(torch.bfloat16)
     c2ws = (torch.randn(1, L_loc, config["dim"], generator=g) * 0.5)
     c2ws = torch.nn.functional.pad(c2ws, (0, 0, 0, Lp - L_loc)).to(dev).to(torch.bfloat16)
     cos, sin = mf.causal_rope_grids(freqs, grid, dev, 2 * CHUNK, dtype=mf._rope_dtype(x), w_shard=w_shard)
@@ -165,6 +171,11 @@ def main():
              "is_init": torch.tensor(0, dtype=torch.int32, device=dev)}
     for t in (cross["k"], cross["v"]):
         torch._dynamo.mark_static_address(t)
+    if mf._CROSS_DEDUP:
+        # LINGBOT_CROSS_DEDUP: its per-key bias buffer, and the forward's prompt-length check (needs CTX_REAL)
+        cross["mult"] = torch.zeros(mf._CROSS_DEDUP, dtype=torch.float32, device=dev)
+        torch._dynamo.mark_static_address(cross["mult"])
+        mf._CROSS_DEDUP_ON[0] = 0 < ctx_real < mf._CROSS_DEDUP
 
     torch._dynamo.config.cache_size_limit = 256
     torch._dynamo.config.accumulated_cache_size_limit = 2048
@@ -261,6 +272,34 @@ def main():
             dist.barrier()
             log(f"[block_bench] film padded to {mf._FILM_ROWS} rows: {(time.perf_counter() - t0) / nr * 1e3:.2f} ms/block")
             mf._FILM_ROWS = 0
+        if os.environ.get("FILM_ARCHECK"):
+            # FILM_ARCHECK=N: the per-chunk FiLM on N rows (LINGBOT_FILM_ROWS=N) with cam_injector_layer2's all-reduce
+            # in fp32 and in bf16 (LINGBOT_FILM_AR_BF16): the params compared on every rank, both timed
+            mf._FILM_ROWS = int(os.environ["FILM_ARCHECK"])
+            outs, tms = [], []
+            for flag in (False, True):
+                mf._FILM_AR_BF16 = flag
+                fn_a = torch.compile(blk.cam_film_sp, backend="neuron", fullgraph=True, dynamic=False)
+                with torch.no_grad():
+                    outs.append([t.float().cpu() for t in fn_a(c2ws)])
+                for _ in range(2):
+                    fn_a(c2ws)
+                torch.neuron.synchronize()
+                dist.barrier()
+                nr = int(os.environ.get("FILM_REPS", "0") or 20)
+                t0 = time.perf_counter()
+                for _ in range(nr):
+                    fn_a(c2ws)
+                torch.neuron.synchronize()
+                dist.barrier()
+                tms.append((time.perf_counter() - t0) / nr * 1e3)
+            for nm, a_, r_ in zip(("scale", "shift"), outs[1], outs[0]):
+                print(f"[block_bench] rank {rank} FILM_ARCHECK {nm}: max|diff| {(a_ - r_).abs().max():.3e} rel "
+                      f"{((a_ - r_).pow(2).mean().sqrt() / r_.pow(2).mean().sqrt()).item():.3e} "
+                      f"rms {r_.pow(2).mean().sqrt():.3e}", flush=True)
+            log(f"[block_bench] film on {mf._FILM_ROWS} rows, all-reduce fp32 / bf16: {tms[0]:.2f} / {tms[1]:.2f} ms/block")
+            mf._FILM_ROWS = 0
+            mf._FILM_AR_BF16 = False
         for fk in [int(s) for s in os.environ.get("FILM_K", "").split(",") if s]:
             # FILM_K=1,2,4: this block's FiLM for K chunks in one graph (LINGBOT_FILM_ALL's _films_multi), so the
             # cost per chunk can be compared with the per-chunk graph's

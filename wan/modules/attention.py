@@ -510,6 +510,25 @@ _CROSS_TPOUT = os.environ.get("LINGBOT_CROSS_TPOUT", "0") == "1"
 _CROSS_QPAD = int(os.environ.get("LINGBOT_CROSS_QPAD", "128"))
 
 
+def cross_dedup_bias(k, v, kc):
+    """LINGBOT_CROSS_DEDUP: for the first kc rows of the cross-attention K / V ([L, n, d] each), log(m / r) on the r
+    rows inside the slice that equal the last row in both K and V (the context's zero padding, m such rows in all), 0
+    on the others. Rows with the same key and value can share one softmax term weighted by their count."""
+    same = (k == k[-1:]).flatten(1).all(dim=1) & (v == v[-1:]).flatten(1).all(dim=1)       # [L]
+    s = same[:kc]
+    m, r = same.sum().float(), s.sum().float()
+    return torch.where(s, torch.log(m / r), torch.zeros((), dtype=torch.float32, device=k.device))
+
+
+def cross_attention_dedup(q, k_ndl, v_nld, bias, kc, dtype=torch.bfloat16):
+    """LINGBOT_CROSS_DEDUP: [1, Lq, n, d] queries against the first kc keys of the N-major cross cache with the
+    per-key log-multiplicity bias (cross_dedup_bias), as fp32 matmuls and softmax in the block graph -> [1, Lq, n, d]."""
+    d = int(q.shape[-1])
+    qh = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2)                         # [n, Lq, d]
+    p_ = torch.softmax(torch.matmul(qh, k_ndl[:, :, :kc].float()) + bias, dim=-1)       # [n, Lq, kc]
+    return torch.matmul(p_, v_nld[:, :kc].float()).permute(1, 0, 2).unsqueeze(0).to(dtype)
+
+
 def cte_cross_attention_nmajor(q, k_ndl, v_nld, dtype=torch.bfloat16):
     """[1, Lq, n, d] queries against the N-major cross cache -> [1, Lq, n, d]. Same kernel call as
     _cte_attention (pre-scaled q padded to 128 rows, no bounds), with K already transposed

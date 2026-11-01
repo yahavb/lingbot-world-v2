@@ -1,4 +1,5 @@
 """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
+import logging
 import math
 import os
 import re
@@ -26,6 +27,8 @@ from wan.modules.attention import attention, flash_attention
 from wan.modules.attention import (
     const_max_ag_attention,
     const_max_ag_available,
+    cross_attention_dedup,
+    cross_dedup_bias,
     cte_cross_attention_nmajor,
     cmax_final,
     cmax_partial,
@@ -230,6 +233,17 @@ _FILM_GROUP = int(os.environ.get("LINGBOT_FILM_GROUP", "0") or 0)
 # its 544 rows fall in a window (513 .. 576 measured) where one block's FiLM takes 2.3 ms and the graph holds 5.2 GB of
 # spill DMA rings; on 640 rows it takes 0.78 ms (256: 0.46, 512: 1.21, 1024: 0.99).
 _FILM_ROWS = int(os.environ.get("LINGBOT_FILM_ROWS", "0") or 0)
+# LINGBOT_CROSS_DEDUP=Kc (LINGBOT_CROSS_NMAJOR): the cross-attention over the first Kc rows of its 512-row cache in
+# the block graph (fp32 matmuls + softmax) instead of the kernel over all 512. The context is the prompt's T5 rows
+# zero-padded to 512, so every padding row has the same K and V, and m identical keys are one softmax term weighted
+# by m. The first call (it fills the cache) stores per slice row log(m / r) for the r padding rows inside the slice
+# (cross_dedup_bias), 0 for the others. Exact up to rounding when the prompt has fewer than Kc rows, which the
+# forward checks (_CROSS_DEDUP_ON); a longer prompt takes the kernel path.
+_CROSS_DEDUP = int(os.environ.get("LINGBOT_CROSS_DEDUP", "0") or 0)
+_CROSS_DEDUP_ON = [False]
+# LINGBOT_FILM_AR_BF16=1: the camera FiLM's row-parallel all-reduce (cam_injector_layer2, [rows, 5120] per block) on
+# bf16 partial sums instead of fp32 (its result is rounded to bf16 right after either way); half the bytes.
+_FILM_AR_BF16 = os.environ.get("LINGBOT_FILM_AR_BF16", "0") == "1"
 # LINGBOT_V_GATHER_FIRST=1: in the step forward, the new chunk's V CP all-gather issued before its K gather.
 _V_GATHER_FIRST = os.environ.get("LINGBOT_V_GATHER_FIRST", "0") == "1"
 # LINGBOT_DIAG_NOGATHER=1 (diagnostic, wrong output): the step forward attends the new chunk's cache slot instead of
@@ -795,8 +809,9 @@ def set_bf16_rope_for_forward(seq_len):
         mark_bf16_rope()
 
 
-def _tp_row_parallel(linear, x, scatter=False):
-    """Row-parallel Linear + all-reduce.
+def _tp_row_parallel(linear, x, scatter=False, bf16_sum=False):
+    """Row-parallel Linear + all-reduce. bf16_sum (mesh all-reduce path): the partial sums rounded to bf16 and
+    all-reduced in bf16 (LINGBOT_FILM_AR_BF16).
 
     The matmul dtype is an A/B knob. Default (fp32, historical behaviour) wraps
     the Linear at the weight dtype rather than in an fp32 autocast (an A/B that ran it in the
@@ -845,7 +860,8 @@ def _tp_row_parallel(linear, x, scatter=False):
         # Traceable, OUT-OF-PLACE reduce over the DeviceMesh submesh, so this
         # Linear can sit inside a fullgraph=True compiled block. dist.all_reduce
         # below is in-place and untraceable, which is what forced the DiT eager.
-        y = tp.all_reduce_fn(y, "tp")
+        y = (tp.all_reduce_fn(y.to(torch.bfloat16), "tp", native=True) if bf16_sum
+             else tp.all_reduce_fn(y, "tp"))
     else:
         y = tp.all_reduce(y, _TP_GROUP)
     return y.to(orig_dtype)
@@ -1696,6 +1712,8 @@ class WanCrossAttention(WanSelfAttention):
                 if _nmaj:
                     crossattn_cache["k"].copy_(k[0].permute(1, 2, 0))
                     crossattn_cache["v"].copy_(v[0].permute(1, 0, 2))
+                    if _CROSS_DEDUP_ON[0]:
+                        crossattn_cache["mult"].copy_(cross_dedup_bias(k[0], v[0], _CROSS_DEDUP))
                 else:
                     crossattn_cache["k"].copy_(k)
                     crossattn_cache["v"].copy_(v)
@@ -1706,7 +1724,11 @@ class WanCrossAttention(WanSelfAttention):
                     _rq = _REAL_TOKENS[0] if _REAL_TOKENS[0] is not None else int(_qc.shape[1])
                     _rowmax_graph_update(self._rm_graph, _qc[:, :min(_rq, int(_qc.shape[1]))],
                                          [crossattn_cache["k"]], 1)
-                x = cte_cross_attention_nmajor(q, crossattn_cache["k"], crossattn_cache["v"])
+                if _CROSS_DEDUP_ON[0]:
+                    x = cross_attention_dedup(q, crossattn_cache["k"], crossattn_cache["v"],
+                                              crossattn_cache["mult"], _CROSS_DEDUP)
+                else:
+                    x = cte_cross_attention_nmajor(q, crossattn_cache["k"], crossattn_cache["v"])
                 x = x.flatten(2)
                 if getattr(self, 'tp_enabled', False):
                     return _tp_row_parallel(self.o, x, scatter=_sp_scatter)
@@ -1783,7 +1805,7 @@ class CausalWanAttentionBlock(nn.Module):
         camera condition and the weights only: no x, no timestep."""
         cam_hidden = torch_F.silu(self.cam_injector_layer1(c2ws_plucker_emb))
         if getattr(self, 'tp_enabled', False):
-            c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden)
+            c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden, bf16_sum=_FILM_AR_BF16)
         else:
             c2ws_hidden_states = self.cam_injector_layer2(cam_hidden)
         c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
@@ -2296,6 +2318,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 self._t_emb_cache = {}
             self._t_emb_cache[_tkey] = (e, e0)
 
+        # LINGBOT_CROSS_DEDUP: the deduplicated cross-attention only when the prompt's rows (before the zero padding to
+        # text_len) leave at least one padding row inside the attended slice
+        _CROSS_DEDUP_ON[0] = bool(_CROSS_DEDUP and len(context) == 1 and int(context[0].shape[0]) < _CROSS_DEDUP)
+        if _CROSS_DEDUP and getattr(self, "_cross_dedup_logged", None) != tuple(context[0].shape):
+            self._cross_dedup_logged = tuple(context[0].shape)
+            logging.info(f"LINGBOT_CROSS_DEDUP={_CROSS_DEDUP}: prompt rows {int(context[0].shape[0])}, "
+                         f"deduplicated cross-attention {'on' if _CROSS_DEDUP_ON[0] else 'off'}")
         # context: constant for the whole generation, so embed it once per context tensor.
         _ckey = (id(context[0]), tuple(context[0].shape)) if len(context) == 1 else None
         _chit = getattr(self, "_ctx_emb_cache", None)
@@ -2362,38 +2391,46 @@ class WanModelFast(ModelMixin, ConfigMixin):
             ]
             c2ws_plucker_emb = torch.cat(
                 c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+
+            def _cam_shard_cp(t):
+                # Shard the camera condition on the SAME axis as x (width),
+                # frame-major. Its spatial size is DERIVED, not assumed: the
+                # old code hardcoded rows = 2*H_patch and width = W_patch,
+                # which cannot both be right (that is 2x the rows against 1x
+                # the width). Deriving it from the actual token count keeps
+                # this correct whether patch_embedding_wancamctrl leaves the
+                # tokens on the image grid (2H x 2W) or the patch grid.
+                _g = grid_sizes[0].tolist()
+                _lc = t.shape[1] // _g[0]
+                assert _lc * _g[0] == t.shape[1], (
+                    f"c2ws tokens {t.shape[1]} not divisible by frames {_g[0]}")
+                _scale_sq = _lc // (_g[1] * _g[2])
+                assert _scale_sq in (1, 4) and _lc == _scale_sq * _g[1] * _g[2], (
+                    f"c2ws spatial {_lc} is neither the patch grid "
+                    f"{_g[1]}x{_g[2]} nor 2x it; cannot infer the width axis")
+                _sc = 1 if _scale_sq == 1 else 2
+                _h8, _w8 = _g[1] * _sc, _g[2] * _sc
+                if _CP_FLAT_SEQ:
+                    assert (_g[0] * _h8 * _w8) % sp_size == 0, (
+                        f"c2ws tokens {_g[0] * _h8 * _w8} not divisible by "
+                        f"cp {sp_size}")
+                else:
+                    assert _w8 % sp_size == 0, (
+                        f"c2ws width {_w8} not divisible by cp {sp_size}")
+                return _shard_w(t, _g[0], _h8, _w8, sp_size, _sp_local_r())
+            # LINGBOT_FILM_SHARD=1 (flat CP, the per-chunk FiLM path): this CP rank's tokens first, then the per-token
+            # camera embedding and its MLP on those rows only (8x fewer at CP8; 2 x ~2 ms per chunk on all of them)
+            _cam_early = _FILM_SHARD and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+            if _cam_early:
+                c2ws_plucker_emb = _cam_shard_cp(c2ws_plucker_emb)
             c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
             c2ws_hidden_states = self.c2ws_hidden_states_layer2(
                 torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
             c2ws_plucker_emb = c2ws_plucker_emb + c2ws_hidden_states
-            if sp_size > 1:
+            if sp_size > 1 and not _cam_early:
                 _g = grid_sizes[0].tolist()
                 if _SEQ_MODE == "cp":
-                    # Shard the camera condition on the SAME axis as x (width),
-                    # frame-major. Its spatial size is DERIVED, not assumed: the
-                    # old code hardcoded rows = 2*H_patch and width = W_patch,
-                    # which cannot both be right (that is 2x the rows against 1x
-                    # the width). Deriving it from the actual token count keeps
-                    # this correct whether patch_embedding_wancamctrl leaves the
-                    # tokens on the image grid (2H x 2W) or the patch grid.
-                    _lc = c2ws_plucker_emb.shape[1] // _g[0]
-                    assert _lc * _g[0] == c2ws_plucker_emb.shape[1], (
-                        f"c2ws tokens {c2ws_plucker_emb.shape[1]} not divisible by frames {_g[0]}")
-                    _scale_sq = _lc // (_g[1] * _g[2])
-                    assert _scale_sq in (1, 4) and _lc == _scale_sq * _g[1] * _g[2], (
-                        f"c2ws spatial {_lc} is neither the patch grid "
-                        f"{_g[1]}x{_g[2]} nor 2x it; cannot infer the width axis")
-                    _sc = 1 if _scale_sq == 1 else 2
-                    _h8, _w8 = _g[1] * _sc, _g[2] * _sc
-                    if _CP_FLAT_SEQ:
-                        assert (_g[0] * _h8 * _w8) % sp_size == 0, (
-                            f"c2ws tokens {_g[0] * _h8 * _w8} not divisible by "
-                            f"cp {sp_size}")
-                    else:
-                        assert _w8 % sp_size == 0, (
-                            f"c2ws width {_w8} not divisible by cp {sp_size}")
-                    c2ws_plucker_emb = _shard_w(
-                        c2ws_plucker_emb, _g[0], _h8, _w8, sp_size, _sp_local_r())
+                    c2ws_plucker_emb = _cam_shard_cp(c2ws_plucker_emb)
                 else:
                     # SP: take this rank's height-row block of the camera condition
                     # (c2ws is [1, F*(H/8)*(W/8), C]; same frame-major rows as x,
