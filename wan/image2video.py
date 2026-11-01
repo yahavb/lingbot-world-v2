@@ -57,6 +57,18 @@ from einops import rearrange
 _PRE_ENCODED = {}
 
 
+class _LazyDraws:
+    """LINGBOT_START_OVERLAP=3: the per-step noise draws, uploaded to the device when first indexed."""
+
+    def __init__(self, fut, device):
+        self._fut, self._device, self._t = fut, device, None
+
+    def __getitem__(self, i):
+        if self._t is None:
+            self._t = self._fut.result().to(self._device)
+        return self._t[i]
+
+
 def memlog(tag):
     """LINGBOT_MEMLOG=1: rank 0's device allocator usage at `tag`."""
     if os.environ.get("LINGBOT_MEMLOG", "0") != "1":
@@ -1105,9 +1117,13 @@ class WanI2VCausal:
         # camera FiLM precompute (LINGBOT_FILM_ALL) is issued right after the Plucker condition; and the pre-loop
         # timing syncs are skipped. In the q26 device timeline the first block started 248 ms into GEN, with ~90 ms
         # of it the device idle waiting for that host work. Same values (same draws, same graphs).
-        _overlap = (os.environ.get("LINGBOT_START_OVERLAP", "0") in ("1", "2") and chunk_control is None
+        # LINGBOT_START_OVERLAP=3: as 1, with the draws split: the initial noise first (the first forward waits only
+        # for it), then the per-step draws, resolved where the loop first re-noises (after the first forward was
+        # issued). One worker thread draws both in order, so the generator's sequence is unchanged.
+        _overlap = (os.environ.get("LINGBOT_START_OVERLAP", "0") in ("1", "2", "3") and chunk_control is None
                     and max_chunks is None)
-        _bg = _draw_fut = _ek_fut = None
+        _split_draws = os.environ.get("LINGBOT_START_OVERLAP", "0") == "3"
+        _bg = _draw_fut = _ek_fut = _steps_fut = None
         if _overlap:
             from concurrent.futures import ThreadPoolExecutor
             _bg = ThreadPoolExecutor(2)
@@ -1172,7 +1188,22 @@ class WanI2VCausal:
                     n0 = n0.to(self.device)
                     st = st.to(self.device) if st is not None else None
                 return n0, st
-            _draw_fut = _bg.submit(_draw_all)
+            if _split_draws:
+                from concurrent.futures import ThreadPoolExecutor as _TPE
+                _dr = _TPE(1)
+
+                def _draw_n0():
+                    return torch.randn(*_noise_shape, dtype=torch.float32, generator=seed_g, device='cpu'), None
+
+                def _draw_steps():
+                    d = [torch.randn(_shape_pre, generator=seed_g, device='cpu', dtype=torch.float32)
+                         for _ in range(_n_pre)]
+                    return torch.stack(d) if d else None
+                _draw_fut = _dr.submit(_draw_n0)
+                _steps_fut = _dr.submit(_draw_steps)      # after _draw_n0 on the one worker: same order
+                _dr.shutdown(wait=False)
+            else:
+                _draw_fut = _bg.submit(_draw_all)
 
         # preprocess
         # T5 cache: skip the encoder entirely if we've seen this exact prompt
@@ -1399,8 +1430,11 @@ class WanI2VCausal:
                     # LINGBOT_START_OVERLAP: drawn in the background thread, same order and shapes
                     assert _shape == _shape_pre and _n_pre == n_chunks * (len(timesteps) - 1), \
                         (_shape, _shape_pre, _n_pre)
-                    _pre_noise = (None if _pre_draws is None else
-                                  _pre_draws if _pre_draws.device.type != "cpu" else _pre_draws.to(self.device))
+                    if _steps_fut is not None:
+                        _pre_noise = _LazyDraws(_steps_fut, self.device)   # resolved at the first re-noise
+                    else:
+                        _pre_noise = (None if _pre_draws is None else
+                                      _pre_draws if _pre_draws.device.type != "cpu" else _pre_draws.to(self.device))
                     _sub("prenoise_up")
                 else:
                     _draws = [torch.randn(_shape, generator=seed_g, device='cpu', dtype=torch.float32)

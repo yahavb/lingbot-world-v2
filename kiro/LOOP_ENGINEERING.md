@@ -235,7 +235,7 @@ Measured and not adopted:
 - `LINGBOT_KV_REAL=1…4` (K/V of the real token rows only; 2–4 also put the V gather first in
   program order), `LINGBOT_CMAX_DGE=hwdge_sync` (the constant-offset kernel's copies on the Sync
   engine) and `LINGBOT_KV_COALESCE=1`: the block within ±0.05 ms of the base, inside its spread (see
-  the `q33` profile note). `LINGBOT_KV_COALESCE` needs the coalesced all-gather in torch-neuronx's
+  the `q33` profile note; `LINGBOT_KV_COALESCE` is adopted at CP8, see "8 devices"). `LINGBOT_KV_COALESCE` needs the coalesced all-gather in torch-neuronx's
   CollectiveLegalization table (added at import); without it its group falls back to the whole
   world and neuronx-cc rejects it (`NCC_IVRF100`).
 - The block executed on other buffers every call (`NBLK=4` or `8` copies with their own weights, KV
@@ -316,11 +316,15 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_exact` | exact chained attention in every layer; VAE 4 frames per step | 5.26 | 0.42 | 5.69 | 14.25 | the reference |
 | `d8_pin` | constant-offset kernel in two query passes, PSUM tiles pinned | 4.86 | 0.42 | 5.29 | 15.32 | latents 0.151 vs `d8_exact` (first frame 0.005, last 0.31); `q33_a` on 16 devices is 0.150 from `d8_exact` |
 | `d8_auto` | the same, the pin now automatic at more than one pass | 4.87 | 0.42 | 5.29 | 15.30 | latents bitwise equal to `d8_pin` |
-| **`d8_fr640`** | per-chunk FiLM graph on 640 camera rows (`LINGBOT_FILM_ROWS=640`) | **4.44** | **0.42** | **4.86** | **16.68** | latents 0.130 vs `d8_pin` (first frame 0.005, last 0.26); one block's FiLM params within one bf16 ulp (max \|d\| 7.8e-3) of the unpadded ones on every rank |
+| `d8_fr640` | per-chunk FiLM graph on 640 camera rows (`LINGBOT_FILM_ROWS=640`) | 4.44 | 0.42 | 4.86 | 16.68 | latents 0.130 vs `d8_pin` (first frame 0.005, last 0.26); one block's FiLM params within one bf16 ulp (max \|d\| 7.8e-3) of the unpadded ones on every rank |
+| `d8_coal` | the new chunk's K and V in one coalesced CP all-gather (`LINGBOT_KV_COALESCE=1`) | 4.32 | 0.44 | 4.76 | 17.03 | latents 0.156 vs `d8_fr640` (first frame 0.005, last 0.27): the compiled block changes (layer 33 output within 8.2e-5 rel. RMS of the separate gathers; layer 10 the same 1.3e-3 from the exact calls) |
+| `d8_split` | `d8_fr640` with the initial noise drawn before the per-step draws (`LINGBOT_START_OVERLAP=3`) | 4.40 | 0.42 | 4.82 | 16.81 | latents bitwise equal to `d8_fr640` |
+| **`d8_cssp`** | both (with the rank-0 system profile) | **4.28** | **0.42** | **4.71** | **17.22** | latents bitwise equal to `d8_coal` |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_fr640 NPROC=32 TP=4 CP=8 PFX=j8 \
-  <the q33_a flags above> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640
+bash /work/repo/kiro/run_job16.sh /work/repo d8_cssp NPROC=32 TP=4 CP=8 PFX=j8 \
+  <the q33_a flags above, LINGBOT_START_OVERLAP=3 instead of 1> LINGBOT_FILM_ALL=0 LINGBOT_FILM_SHARD=0 \
+  LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -358,8 +362,19 @@ end to end GEN 4.87 -> 4.44 s (`d8_fr640`, 16.68 fps).
 decode (the timed decode is the second). 2 × 16 tiles (`LINGBOT_VAE_PER_DEVICE=2`) fail collective setup
 (`no_hier no_mesh`, replica group `[0, 2, …, 30]`).
 
-Also measured at CP8 (block, lead 3): the V gather issued before K (`LINGBOT_V_GATHER_FIRST=1`) 2.93 ms, unchanged;
-the kernel's copies on the Sync / Scalar DGE 3.01 / 3.17 ms; one coalesced K + V gather 2.89 ms.
+**The coalesced K + V gather and the start draws.** One coalesced K + V all-gather (`LINGBOT_KV_COALESCE=1`) takes
+the lead-3 block from 2.93 to 2.89 ms on the bench, but end to end GEN drops 120 ms: in the rank-0 system profile
+(`d8_cssp` against `d8_fr640sp`) the lead-3 step block goes 2.87 -> 2.82 ms (544 executions), and one forward early in
+chunk 1 (generation window executions 240-279), whose own graphs took 4.28 ms per block and 7.44 ms in the six exact
+layers, runs at 2.66 / 2.72 ms like its neighbours. In `d8_fr640sp` the device sat idle ~87 ms before the first block while the issuing thread
+waited for the background thread's 7.7 M seeded samples; `LINGBOT_START_OVERLAP=3` draws the initial noise first and
+the per-step draws after it on the same worker, resolved at the first re-noise: GEN −40 ms, device idle 153 -> 115 ms.
+
+Also measured at CP8 (block, lead 3), no gain: the V gather issued before K (`LINGBOT_V_GATHER_FIRST=1`) 2.93 ms; the
+kernel's copies on the Sync / Scalar DGE 3.01 / 3.17 ms; the cached-chunk call made to wait for the V projection
+(four variants, code removed) 2.93–2.94 ms; bf16 SP reductions (`LINGBOT_AR_BF16=1`) bitwise equal and the same
+time; the tokens padded to 640 instead of 544 (`LINGBOT_TOKEN_PAD=128`) 3.12 ms (layer 33: 3.48 vs 3.36). With the
+FiLM graph's spill rings gone, the all-chunk FiLM graph (`LINGBOT_FILM_ALL`) still fails to load (`NRT_RESOURCE`).
 
 ## 2 devices (8 ranks, devices 14 + 15)
 
@@ -483,12 +498,13 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_CMAX=1\|2`, `LINGBOT_CMAX_OFFSET=c` | constant-offset self-attention softmax(QKᵀ − c)·V in the 34 layers of `_CMAX_LAYERS` (c = 30 by default); 2 = `kernels/attention_cmax2_lb.py`, whole-chunk loads in the production K/V layouts (adopted) |
 | `LINGBOT_ROWMAX_GRAPH=1` | diagnostic: every layer's per-head softmax row-max range over each generation, printed per rank (`[ROWMAX]`, `[ROWMAX_X]` for cross-attention) |
 | `LINGBOT_KV_REUSE=1` | keep the self- and cross-attention KV caches for the next generation instead of allocating and zero-filling new ones (every slot is written before it is read) |
-| `LINGBOT_START_OVERLAP=1\|2` | seeded noise draws and the encode-cache key in background threads, the FiLM precompute right after the Plücker condition, no syncs before the chunk loop (2: the noise uploads in the thread too); same draws, same order |
+| `LINGBOT_START_OVERLAP=1\|2\|3` | seeded noise draws and the encode-cache key in background threads, the FiLM precompute right after the Plücker condition, no syncs before the chunk loop (2: the noise uploads in the thread too; 3: the initial noise drawn first and the per-step draws after it on one worker, resolved at the first re-noise); same draws, same order |
 | `LINGBOT_FILM_SHARD=1` | with `LINGBOT_FILM_ALL`: the camera embedding MLP on each CP rank's own tokens only |
 | `LINGBOT_SCHED_FUSE=1` | a denoise step's x0 and the re-noised next input in one compiled graph |
 | `LINGBOT_GC_OFF=1` | no cyclic garbage collection inside a generation (re-enabled after it) |
 | `LINGBOT_HOST_TRACE=1` | diagnostic: host time of each step before the chunk loop, no syncs |
-| `LINGBOT_EMBED_LOCAL=1`, `LINGBOT_CROSS_QPAD=32`, `LINGBOT_KV_REAL=1…4`, `LINGBOT_CMAX_DGE=hwdge_sync\|hwdge_act`, `LINGBOT_KV_COALESCE=1` | A/B only, no gain (see "Measured and not adopted") |
+| `LINGBOT_EMBED_LOCAL=1`, `LINGBOT_CROSS_QPAD=32`, `LINGBOT_KV_REAL=1…4`, `LINGBOT_CMAX_DGE=hwdge_sync\|hwdge_act` | A/B only, no gain (see "Measured and not adopted") |
+| `LINGBOT_KV_COALESCE=1` | the new chunk's K and V CP all-gathers as one coalesced collective; adopted at CP8 (GEN −120 ms), within ±0.05 ms per block at CP16 |
 | `NEURON_RT_IO_RING_CACHE_SIZE=1024` | runtime setting, not a code flag: I/O descriptor cache entries (GEN −42 ms at 256 against the default, a further −19 ms at 1024) |
 | `LINGBOT_CMAX_PSUM_PIN=0\|1` | constant-offset kernel: force compiler-placed / pinned PSUM tiles (default: pinned exactly when the queries take more than one pass, i.e. CP8) |
 | `LINGBOT_FILM_ROWS=N` | per-chunk FiLM graph on N camera rows per CP rank (each TP rank's block zero-padded, the pad sliced off after the all-to-all); 640 for CP8 |
@@ -533,6 +549,7 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `block_bench.py` `KV_STATS=1`, `ORDER=i,j,…` | diagnostics: per cache slot max \|K\|, \|V\| before and after the timed calls; which cache slots are the cached chunks |
 | `sysprof_hbm.py`, `sysprof_neff.py` | runtime system profile: device memory by usage type (`DMA Rings Spill`, ...); one NEFF's executions with their collective time |
 | `prof_icount.py`, `prof_execs.py` | device profile: one execution's instruction count per core and engine; all executions, and engine / opcode busy time of one |
+| `prof_vgather.py` | device profile: when the new chunk's K / V projections, norms, CP all-gathers and attention calls run in one block execution, and the CC cores' ring spans |
 
 Reproduce the 16-device table (`/work/repo_upstream` = upstream `main`, `/work/repo` = this branch):
 
