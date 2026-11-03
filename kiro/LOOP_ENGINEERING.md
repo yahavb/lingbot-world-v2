@@ -2,8 +2,10 @@
 
 One 81-frame 480×768 video from `examples/03`, chunk 3, window 12, sink 1, 4 denoise steps,
 seed 42. Measured on one trn2.48xlarge (16 Trainium2 devices) in a `wan5b-env:1` container
-(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0). On 8 devices the same video takes 4.35 s (18.64 fps, see
-"8 devices"), validated against an fp32 CPU reference with the owner's checks (see "Accuracy (8 devices)").
+(torch 2.14.0, torch-neuronx 2.14.3, nki 0.7.0). On 8 devices the same video takes 4.40 s (18.40 fps, see
+"8 devices") with the constant-offset attention checking its own result (4.35 s, 18.64 fps without the check; see
+"The constant-offset guard"), validated against an fp32 CPU reference with the owner's checks (see "Accuracy (8
+devices)").
 
 ## 16 devices (64 ranks, LNC2)
 
@@ -325,14 +327,15 @@ GEN + VAE. Another workload held devices 8-15, so these runs went through a seco
 | `d8_dd` | the cross-attention over the 128 first context rows, the identical padding rows weighted by their count (`LINGBOT_CROSS_DEDUP=128`) | 3.99 | 0.42 | 4.42 | 18.35 | latents 0.138 vs `d8_exact` (first frame 0.0052, last 0.29), 0.140 vs `d8_rs`; repeats 4.00 / 4.00 s GEN |
 | `d8_fg4` | the FiLM params of 4 chunks per graph, chunks 0-3 at the start and 4-6 when chunk 4 starts (`LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4`) | 3.98 | 0.42 | 4.40 | 18.41 | latents 0.113 vs `d8_dd` (first frame 0.0054, last 0.23), 0.156 vs `d8_exact` (0.0054, 0.32); repeat `d8_fg4r` 3.977 + 0.422 s, bitwise equal |
 | `d8_cqf` | commit forwards of the constant-offset layers project Q, and all-reduce its norm, before K and V, and their new-chunk call reads the gathered K / V (`LINGBOT_COMMIT_Q_FIRST=2 LINGBOT_COMMIT_FROM_GATHER=1`) | 3.93 | 0.42 | 4.36 | 18.60 | latents bitwise equal to `d8_fg4r`; `LINGBOT_COMMIT_Q_FIRST=2` alone 3.937 / 3.935 s (repeat) against 3.970 s for `d8_fg4` on the same tree |
-| **`d8_lean`** | rank 0 returns the host copy it saved; the other ranks skip `generate()`'s post-save barrier and their host copy of the latents, which the job never reads (`LINGBOT_POST_LEAN=1`) | **3.92** | **0.42** | **4.35** | **18.64** | latents bitwise equal to `d8_fg4r`; from the committed tree 3.925 / 3.923 s GEN (18.63 / 18.64 fps), on the experimental tree 3.923 / 3.922 s; the reused copy alone 3.929 s |
+| `d8_lean` | rank 0 returns the host copy it saved; the other ranks skip `generate()`'s post-save barrier and their host copy of the latents, which the job never reads (`LINGBOT_POST_LEAN=1`) | 3.92 | 0.42 | 4.35 | 18.64 | latents bitwise equal to `d8_fg4r`; from the committed tree 3.925 / 3.923 s GEN (18.63 / 18.64 fps), on the experimental tree 3.923 / 3.922 s; the reused copy alone 3.929 s |
+| **`d8_guard`** | the constant-offset kernel checks its own result and recomputes out-of-band blocks (`LINGBOT_CMAX_GUARD=1`, see "The constant-offset guard") | **3.98** | **0.43** | **4.40** | **18.40** | latents bitwise equal to `d8_fg4r`; 1,849,600 blocks checked per generation, none redone; two runs 3.984 + 0.427 / 3.971 + 0.425 s (18.36 / 18.43 fps), without the guard on the same tree and in the same session 3.932 s GEN (18.60 fps); from the committed tree the same latents and counts (timed while another user's jobs kept ~170 host cores busy: GEN 4.44 s, not comparable) |
 
 ```bash
-bash /work/repo/kiro/run_job16.sh /work/repo d8_lean NPROC=32 TP=4 CP=8 PFX=j8 \
+bash /work/repo/kiro/run_job16.sh /work/repo d8_guard NPROC=32 TP=4 CP=8 PFX=j8 \
   <the q33_a flags above, LINGBOT_START_OVERLAP=4 instead of 1> LINGBOT_FILM_ALL=1 LINGBOT_FILM_GROUP=4 \
   LINGBOT_FILM_SHARD=1 LINGBOT_VAE_T=4 LINGBOT_FILM_ROWS=640 LINGBOT_KV_COALESCE=1 LINGBOT_RS_BF16=1 \
   LINGBOT_FILM_AR_BF16=1 LINGBOT_CROSS_DEDUP=128 LINGBOT_COMMIT_Q_FIRST=2 LINGBOT_COMMIT_FROM_GATHER=1 \
-  LINGBOT_POST_LEAN=1
+  LINGBOT_POST_LEAN=1 LINGBOT_CMAX_GUARD=1
 ```
 
 **The constant-offset kernel at 544 queries.** `attention_cmax2_lb` asserted at most 512 queries (one fp32 PSUM
@@ -436,8 +439,10 @@ barrier waited for), and rank 0 copied them a second time for its own return. Ra
 inside `generate()` and the other ranks' copies; `generate.py`'s barrier still waits for the save: GEN 3.929 → 3.922 /
 3.922 s (`d8_lean`).
 
-Also measured at CP8, no gain: the commit forward's attention reading the gathered K / V instead of the cache slot it
-writes, on its own (commit blocks 3.01 / 3.24 ms either way: the stall above, not the write, is what costs);
+Also measured at CP8, no gain: the patch embedding on each rank's own 540 rows (`LINGBOT_EMBED_LOCAL=1`, `d8_el`:
+GEN 3.931 s with the rank-0 system profile, latents bitwise equal to `d8_fg4r`); the commit forward's attention
+reading the gathered K / V instead of the cache slot it writes, on its own (commit blocks 3.01 / 3.24 ms either way:
+the stall above, not the write, is what costs);
 neuronx-cc scheduling options on the block (`--distribution-strategy=nemo|llm-training|fsdp`,
 `--enable-fast-context-switch`, `--model-type=transformer`): 2.70-2.77 ms against 2.70, outputs bitwise equal;
 K and V projected before Q (`LINGBOT_KV_FIRST=1`, 2.71 vs 2.70 ms); runtime collective algorithms
@@ -462,8 +467,8 @@ through `kiro/run_job16.sh` (the job's spec and env): the chunk-0 / step-0 noise
 of the original model (`kiro/ref_fp32_c0s0.py`: `robbyant/lingbot-world-v2` @ `1895d30`, `WanModelFast` with fp32
 attention, the weights of `transformers-bf16.pth` upcast) on the run's own chunk-0 inputs, the raw frames against an
 fp32 CPU decode of the run's latents, a repeat run, and `kiro/validate_cmp.py`'s verdict. `loop` = `d8_fg4`, whose
-latents are bitwise equal to `d8_fg4r`, `d8_cqf` and `d8_lean` (the c0s0 forward and the decode are unchanged by
-them), so the numbers hold for the current flags.
+latents are bitwise equal to `d8_fg4r`, `d8_cqf`, `d8_lean` and `d8_guard` (the c0s0 forward and the decode are
+unchanged by them), so the numbers hold for the current flags.
 
 `main`'s default `const_max_ag` kernel fails to trace on this host at 8 devices (`off` and `main_code` exit in
 prewarm), as it does at 16, so the verdict's baselines run with `ATTENTION_BACKEND=cte LINGBOT_HOT_ATTN=cte`, the way
@@ -498,6 +503,71 @@ on CUDA. Decode-only on the same latents against the same fp32 CPU decode (devic
 | fp32 convolutions (no `LINGBOT_VAE_BF16`), `LINGBOT_VAE_NORM=mm` | 1085 | 56.34 dB | 54.91 dB | 13 levels |
 
 fp32 convolutions pass the VAE rule (56.34 ≥ 56.31 − 1) at +0.66 s per video (16.2 fps instead of 18.64).
+
+### The constant-offset guard (`LINGBOT_CMAX_GUARD`)
+
+The constant-offset kernel computes softmax(QKᵀ − c)·V with c = 30 in the 34 layers of `_CMAX_LAYERS`. That is the
+softmax only while no query row's exponentials overflow and its largest one does not underflow, i.e. while every
+row's maximum score stays between about −55 and 108. On this clip the rows of those layers lie in [−8.3, 71.5]
+(`LINGBOT_ROWMAX_GRAPH`), but nothing guarantees that for another input, and outside the range the output is inf /
+NaN (overflow) or 0 / 0 (underflow). With `LINGBOT_CMAX_GUARD=1` the kernel checks its own result and recomputes what
+fails, so `_CMAX_LAYERS` decides speed only, not correctness.
+
+- **Check.** The final call of a row's attention (the new chunk, continuing the cached chunks' accumulator) has each
+  row's S = Σₖ exp(sₖ − c) in the accumulator's ones column. S in [e⁻⁶⁰, e⁷⁸] means no term or partial sum passed
+  e⁷⁸ (fp32 and bf16 overflow at e^88.7, which leaves room for \|V\| in the P·V sums) and the largest term is at least
+  e⁻⁶⁰ / 17280 keys, a normal float, so the terms lost to underflow are below 2·10⁻⁸ of S: the output is the exact
+  softmax up to rounding, whatever the input. NaN fails the check. Padding query rows (`LINGBOT_TOKEN_PAD`, rows
+  540-543 at CP8) are not checked: their outputs are dropped, and an out-of-band padding row would otherwise redo,
+  and so change, the real rows of its block.
+- **Redo.** A block (one head, 128 query rows) with a row out of band is recomputed inside the same kernel behind a
+  runtime branch (`nl.fori_loop` over a count loaded into a register: one branch taken if any block failed, one per
+  block inside it), so nothing goes back to the host. Pass 1 takes each row's maximum m over every chunk's keys (the
+  guarded call also gets the cached chunks), pass 2 accumulates exp(qKᵀ − m)·[V | 1] (−m added in PSUM by a one-row
+  matmul) into the block's accumulator, which the output loop then normalizes like the others.
+- **Both cores of a logical core.** With LNC2, a branch taken by one physical core only hangs the logical core
+  (`NRT_TIMEOUT` in `tpb_xu_step`, `kiro/nki_branch_test.py`). The two cores exchange their block flags
+  (`nisa.sendrecv`), and block slot (head i of each core, query tile t) is redone on both when either core's block
+  failed.
+- **Counts and demotion.** The kernel also returns one flag per block (2 out of band, 1 redone as the other core's
+  slot, 0). Each layer adds its [checked, out of band, redone] counts to a device tensor inside the compiled block,
+  so nothing syncs with the host. After each generation, outside GEN, `cmax_guard_report` sums them over all ranks,
+  logs them (`[CMAX_GUARD] run2 34 layers, 1849600 blocks checked, 0 out of band, 0 redone`) and moves a layer whose
+  redone blocks exceed `LINGBOT_CMAX_GUARD_DEMOTE` (0.05) of its checked ones to exact attention on every rank for the
+  following generations. A moved layer runs the exact layers' compiled graphs, so nothing recompiles.
+  `LINGBOT_CMAX_EXCLUDE=i,j,…` puts layers on exact attention from the start.
+
+Tests. Out of band means layer 10's queries scaled by s after RoPE (`LINGBOT_DIAG_QK_SCALE=10:s`), which pushes its
+rows past both ends of the band.
+
+| Test | Result |
+|---|---|
+| One core (`kiro/cmax_guard_test.py`), CP8 (540 of 544 queries) and CP16 (270 of 288), 1-4 chunks: scores as on the clip, or only the padding rows out of band | no block flagged; every output bitwise equal to the unguarded kernel's |
+| The same with rows above 108 (in the new chunk, or in a cached chunk only), rows below −55, a NaN row, the partial last tile | exactly those blocks and their partner slots redone (CP8 5 + 5, CP16 5 + 3), 2.1-2.4e-3 rel. RMS from fp32, where the unguarded kernel gives NaN, or 1.0 for the underflowing block; the other blocks bitwise equal to the unguarded kernel's |
+| 32-rank block, layer 10 (`block_bench.py`, every rank compared), step at leads 0-3, commit at lead 3 | bitwise equal to the unguarded block on all 32 ranks; 100,800 blocks checked, none out of band; at lead 3 both 3.13e-3 (rel. RMS, worst rank) from exact chained attention on the same inputs |
+| The same, s = 8, leads 0 and 3 | 0.9% of the blocks out of band, 1.9% redone with their partners; 3.57e-3 from exact attention, as is the unguarded block, still finite there (the band keeps a margin below fp32 overflow) |
+| The same, s = 32, step at leads 0 and 3, commit at lead 3 | every block redone; 3.44-3.46e-3 from exact attention, where the unguarded block is NaN |
+| End to end on the clip, twice | latents bitwise equal to `d8_fg4r`; per generation 1,849,600 blocks checked, none out of band |
+| End to end, s = 8 | pass 1: layer 10 out of band in 31,485 of its 54,400 blocks, 46,282 redone, moved to exact attention; pass 2: nothing redone, GEN 3.99 s |
+| End to end, s = 32 | pass 1: all of layer 10's blocks redone, layer moved; pass-2 latents bitwise equal to a run with layer 10 exact from the start (`d8_qs32x`); without the guard the latents are not finite and the smoke test fails |
+
+Cost. One core, ms per call, unguarded / guarded with no block redone / guarded with every block redone:
+
+| Chunks | CP8 | CP16 |
+|---|---|---|
+| 1 | 0.220 / 0.244 / 1.305 | 0.113 / 0.149 / 0.742 |
+| 2 | 0.378 / 0.431 / 2.090 | 0.218 / 0.252 / 1.152 |
+| 3 | 0.529 / 0.559 / 2.852 | 0.292 / 0.331 / 1.524 |
+| 4 | 0.699 / 0.703 / 3.562 | 0.327 / 0.391 / 1.903 |
+
+In the 32-rank block +0.03-0.06 ms (step at lead 0 / 1 / 2 / 3: 2.53 / 2.64 / 2.67 / 2.70 → 2.59 / 2.70 / 2.70 / 2.76
+ms; commit at lead 3 2.70 → 2.75). End to end GEN 3.984 / 3.971 s against 3.932 s without the guard on the same tree
+in the same session (+39-52 ms, ~40 µs per constant-offset block execution; 18.36 / 18.43 against 18.60 fps). The
+cost is the runtime branch: on one core, variants without the redo body, without the flag exchange, or with the outer
+branch only cost the same. Two placements cost more: the branches after the output loop (+62 against +52 µs per call
+at CP16 with 4 chunks), and each head checked, branched and written out while the next heads run (+0.12 against
++0.02 ms per call at CP8; code not kept). At CP16 the guard is validated on one core only; the 16-device runs above
+are without it.
 
 ## 2 devices (8 ranks, devices 14 + 15)
 
@@ -566,6 +636,10 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
   the first frame, 0.25–0.36 by the last). SP vs no-SP at the same layout, which differ only in
   reduction order, diverge just as much, so this is the autoregressive rollout amplifying
   rounding differences, not one layout being wrong. Frames from each stay sharp and coherent.
+- **Constant offset (`LINGBOT_CMAX`).** softmax(QKᵀ − c)·V with a fixed c = 30 is the softmax only while every
+  row's maximum score stays within about [−55, 108]; on this clip it does ([−8.3, 71.5]). With
+  `LINGBOT_CMAX_GUARD=1` (the 8-device flags) the kernel checks every row and recomputes out-of-range blocks with
+  their own maxima, so no input breaks it (see "The constant-offset guard"). The 16-device flags run without it.
 
 ## Flags added (all off by default unless noted)
 
@@ -640,6 +714,10 @@ TP4 × CP2 on 2 devices unless noted. "lead" is how many earlier KV chunks the w
 | `LINGBOT_COMMIT_Q_FIRST=1\|2` | commit forwards of the constant-offset layers: K and V take their input through a zero term from the raw (1) or normed (2) Q, so Q and its norm's all-reduce go before the K / V gather; 2 adopted at CP8 (commit block 3.04 → 2.73 ms, GEN −33 ms, bitwise equal) |
 | `LINGBOT_COMMIT_FROM_GATHER=1` | commit forwards on the constant-offset path: the new chunk's call reads the gathered K / V instead of the slot written from them; with `LINGBOT_COMMIT_Q_FIRST=2` block 2.71 ms, GEN −4 ms (alone no gain) |
 | `LINGBOT_POST_LEAN=1` | when the latents are saved and not returned for a decode in the process (the job's mode): no barrier inside `generate()` after rank 0's save and no host copy of the latents on the other ranks (they return None); GEN −7 ms at 8 devices |
+| `LINGBOT_CMAX_GUARD=1` | with `LINGBOT_CMAX=2`: the final constant-offset call checks every real query row's sum of exp(s − c) against [e⁻⁶⁰, e⁷⁸] (NaN fails) and recomputes each 128-row block with a row outside it in the same kernel, with the rows' own maxima; per-layer counts logged after each generation (`[CMAX_GUARD]`); adopted at CP8 (bitwise equal on the clip, GEN +39-52 ms) |
+| `LINGBOT_CMAX_GUARD_DEMOTE=f` | with the guard: a layer whose redone blocks exceed f (default 0.05) of its checked ones in a generation runs exact attention in the following ones |
+| `LINGBOT_CMAX_EXCLUDE=i,j` | these layers run exact attention although they are in `_CMAX_LAYERS` |
+| `LINGBOT_DIAG_QK_SCALE=layer:s` | diagnostic, changes the output: that layer's queries multiplied by s after RoPE in every attention path (drives its scores out of the constant offset's band) |
 
 ## Scripts (`kiro/`)
 
@@ -683,6 +761,10 @@ Paths assume the container layout used here (`/work/repo`, `/work/ckpt`, `/work/
 | `sysprof_hbm.py`, `sysprof_neff.py` | runtime system profile: device memory by usage type (`DMA Rings Spill`, ...); one NEFF's executions with their collective time |
 | `prof_icount.py`, `prof_execs.py` | device profile: one execution's instruction count per core and engine; all executions, and engine / opcode busy time of one |
 | `prof_vgather.py` | device profile: when the new chunk's K / V projections, norms, CP all-gathers and attention calls run in one block execution, and the CC cores' ring spans |
+| `cmax_guard_test.py` | the guarded constant-offset kernels on one core against the unguarded ones and fp32 (scores in band, only padding rows out of band, some blocks out of band), and their time per call with no block and with every block redone (`LQ=270 LQP=288 NB=16` for CP16) |
+| `nki_branch_test.py` | NKI runtime branches on one LNC2 logical core: taken by one physical core (hangs) or by both on exchanged flags |
+| `run_core.sh <core> <script> [KEY=VAL…]` | one single-core kernel test with the pipeline's compiler and runtime env (log `/work/logs/core_<script>_<core>.log`) |
+| `block_bench.py` with `LINGBOT_CMAX_GUARD=1` | the guard's counts over all ranks and calls in the result line |
 
 Reproduce the 16-device table (`/work/repo_upstream` = upstream `main`, `/work/repo` = this branch):
 

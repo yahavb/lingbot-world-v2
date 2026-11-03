@@ -668,6 +668,9 @@ class WanI2VCausal:
             # Before the first compiled block call, so the graphs take the statistics tensors.
             from wan.modules.model_fast import rowmax_graph_alloc
             rowmax_graph_alloc(self.model.blocks, local_num_heads, self.device)
+        # LINGBOT_CMAX_GUARD's per-layer counters (and LINGBOT_DIAG_QK_SCALE's scales), likewise before the first call
+        from wan.modules.model_fast import cmax_guard_alloc
+        cmax_guard_alloc(self.model.blocks, self.device)
 
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
@@ -792,7 +795,21 @@ class WanI2VCausal:
         gc.collect()
         torch.neuron.empty_cache()
         memlog("prewarm end, after free")
+        # LINGBOT_CMAX_GUARD: prewarm's dummy forwards are not counted
+        from wan.modules.model_fast import cmax_guard_reset
+        cmax_guard_reset(self.model.blocks)
         self._warmed = True
+
+    def cmax_guard_report(self, tag=""):
+        """LINGBOT_CMAX_GUARD: log the last generation's per-layer guard counts (summed over all ranks: a collective,
+        call it on every rank, outside the timed window) and move layers that redid too many blocks to exact
+        attention. generate.py calls it after every pass; a generation not followed by a call reports at the start
+        of the next one."""
+        self._cmax_guard_pending = False
+        from wan.modules.model_fast import _CMAX_GUARD, cmax_guard_report
+        if _CMAX_GUARD and getattr(self, "model", None) is not None:
+            return cmax_guard_report(self.model.blocks, tag)
+        return {}
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -1083,6 +1100,13 @@ class WanI2VCausal:
         # Reset per-generate state: cross-attn K/V cache will be freshly
         # initialized below; the first DiT forward must compute and store.
         self._cross_attn_initialized = False
+        if getattr(self, "_cmax_guard_pending", False):
+            # LINGBOT_CMAX_GUARD: the previous generation was not reported (a caller other than generate.py)
+            self.cmax_guard_report("previous generation")
+        from wan.modules.model_fast import _CMAX_GUARD, cmax_guard_alloc
+        if _CMAX_GUARD:
+            cmax_guard_alloc(self.model.blocks, self.device)    # no-op after prewarm
+            self._cmax_guard_pending = True
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device='cpu')

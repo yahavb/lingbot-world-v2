@@ -670,6 +670,11 @@ def _cmax_kernels():
                 "part2": wrap_nki(cm.cmax2_part_2),
                 "part3": wrap_nki(cm.cmax2_part_3),
                 "final1": wrap_nki(cm.cmax2_final_1),
+                # LINGBOT_CMAX_GUARD: the final call checks every row's sum and redoes out-of-band blocks
+                "full1g": wrap_nki(cm.cmax2_full_1g),
+                "final1g1": wrap_nki(cm.cmax2_final_1g1),
+                "final1g2": wrap_nki(cm.cmax2_final_1g2),
+                "final1g3": wrap_nki(cm.cmax2_final_1g3),
             }
         else:
             from kernels import attention_cmax_lb as cm
@@ -722,6 +727,23 @@ def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False):
     if acc is None:
         return k["full1"](q_t, kc, vc, _cmax_arg(offset), *lay)
     return k["final1"](q_t, kc, vc, acc, _cmax_arg(offset), *lay)
+
+
+def cmax_final_guarded(q_t, kc, vc, acc, lead_k, lead_v, offset, k_blocks=1, v_token_major=False, real_q=None):
+    """cmax_final with the guard (LINGBOT_CMAX=2, LINGBOT_CMAX_GUARD): the kernel checks every real query row's sum
+    of exp(score - offset) against [e^-60, e^78] and redoes each 128-row block with an out-of-band row with the rows'
+    own maxima, over the new chunk and the cached chunks lead_k / lead_v (the ones acc accumulated). real_q: the
+    real query rows (the rest are padding, not checked). Returns (normalized [n, Lq_p, d], flags [2, blocks]: 2 out
+    of band, 1 redone as the other physical core's partner slot, 0)."""
+    assert _CMAX_MODE == 2, "LINGBOT_CMAX_GUARD needs LINGBOT_CMAX=2"
+    k = _cmax_kernels()
+    lay = _cmax_layout(k_blocks, v_token_major)
+    rq = int(q_t.shape[2]) if real_q is None else int(real_q)
+    if acc is None:
+        assert not lead_k, "no accumulator, no cached chunks"
+        return k["full1g"](q_t, kc, vc, _cmax_arg(offset), *lay, rq)
+    assert 1 <= len(lead_k) <= 3 and len(lead_v) == len(lead_k), (len(lead_k), len(lead_v))
+    return k[f"final1g{len(lead_k)}"](q_t, kc, vc, acc, *lead_k, *lead_v, _cmax_arg(offset), *lay, rq)
 
 
 def xla_attention_rows(q, k_chunks, v_chunks, dtype=torch.bfloat16):

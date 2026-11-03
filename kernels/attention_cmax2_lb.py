@@ -6,7 +6,10 @@ the [128 keys, tiles, d + 1] layout MM2 multiplies (the ones column set once per
 copies read K in the CP all-gather's rank-block memory ([k_blocks, N, d, Sk / k_blocks], k_blocks > 1) and V in
 token-major memory ([Sk, N, d], v_token_major) directly. More than 384 queries (CP8: 544) run as several passes over
 each (chunk, head)'s SBUF-resident K and V, with the PSUM tiles pinned (see _PSUM_PIN_ENV).
+
+The guarded entry points (*_g*, LINGBOT_CMAX_GUARD) check their own result: see _guard_check and _redo_block.
 """
+import math
 import os
 
 import nki
@@ -168,11 +171,144 @@ def _chunk_head(q_sb, k_sb, v_sb, seq_k, n_tiles, seq_q, o_psums, neg_max, pin=F
             mm2(tile)
 
 
-def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, k_blocks=1, v_token_major=False):
+# THE GUARD (the *_g* entry points). The constant offset c makes softmax(Q K^T - c) V exact only while no row's
+# exponentials overflow and its largest one does not underflow; that was measured on one clip, not guaranteed. So the
+# final call checks every row's sum S = sum_k exp(s_k - c) (the ones column of the accumulator): S in [e^-60, e^78]
+# means nothing overflowed (every term and every partial sum <= e^78) and the largest term is >= e^-60 / 17280 keys,
+# a normal float, so the result is the exact softmax up to rounding, whatever the input; NaN fails the check. A block
+# (head, 128 query rows) with any row outside the band is recomputed in the same kernel, behind a runtime branch,
+# over every chunk's keys (the call gets the cached chunks too) with each row's own maximum as the offset: one pass
+# for the row maxima, one for exp(K^T q - m)^T @ [V | 1]. The two physical cores of a logical core must take every
+# runtime branch the same number of times (a branch taken on one core only hangs the logical core: NRT_TIMEOUT,
+# kiro/nki_branch_test.py), so they exchange their block flags (sendrecv) and redo block slot (head i of each core,
+# query tile t) on both when either core's block is out of band. The flags output gives per block 2 (out of band,
+# redone), 1 (redone as the other core's partner) or 0.
+_BAND_LO = math.exp(-60.0)
+_BAND_HI = math.exp(78.0)
+_GUARD_BANK = 7      # pinned placement: the check's count and the redo's row-max transpose (the fast path leaves it)
+_MAX_GROUP = 512     # keys per row-max matmul (one fp32 PSUM bank)
+
+
+def _psum(shape, bank, pin):
+    if pin:
+        return nl.ndarray(shape=shape, dtype=nl.float32, buffer=nl.psum, address=(0, bank * PSUM_BANK_SIZE))
+    return nl.ndarray(shape=shape, dtype=nl.float32, buffer=nl.psum)
+
+
+def _guard_check(acc, per, n_o_tiles, seq_q, real_q, d, n_prgs, prg_id, pin, flags):
+    """Band check of every row sum in the finished accumulator acc [128, per, n_o_tiles, d + 1] (block b = head *
+    n_o_tiles + query tile). Query rows real_q .. seq_q - 1 are padding (LINGBOT_TOKEN_PAD) and pass: their outputs
+    are dropped, so an out-of-band padding row must not redo the block's real rows. Writes this core's row of flags
+    [n_prgs, per * n_o_tiles] and returns (redo [1, B] int32 per block slot, any [1, 1] int32), identical on both
+    cores."""
+    n_b = per * n_o_tiles
+    # column d of every block, [128, n_b] (one free dim: the blocks are d + 1 apart). The last query tile's unused
+    # rows hold 1.0 (set when acc was allocated).
+    sums = acc.ap(pattern=[[n_b * (d + 1), _P], [d + 1, n_b]], offset=d)
+    le = nl.ndarray(shape=(_P, n_b), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=le, data=sums, op0=nl.less_equal, operand0=_BAND_HI)
+    ok = nl.ndarray(shape=(_P, n_b), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=ok, data=sums, op0=nl.greater_equal, operand0=_BAND_LO, op1=nl.multiply,
+                              operand1=le)
+    pidx = None
+    for t in range(n_o_tiles):
+        p0 = real_q - t * _O_TILE_SIZE              # first padding row of query tile t, in tile partitions
+        if p0 >= min(_O_TILE_SIZE, seq_q - t * _O_TILE_SIZE):
+            continue                                 # no padding rows in this tile
+        if pidx is None:
+            pidx = nl.ndarray(shape=(_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.iota(dst=pidx, pattern=[[0, 1]], offset=0, channel_multiplier=1)      # partition index
+        pad = nl.ndarray(shape=(_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=pad, data=pidx, op0=nl.greater_equal, operand0=float(max(p0, 0)))
+        tile_t = ok.ap(pattern=[[n_b, _P], [n_o_tiles, per]], offset=t)                 # tile t of every head
+        nisa.tensor_scalar(dst=tile_t, data=tile_t, op0=nl.maximum, operand0=pad)
+    ones = nl.ndarray(shape=(_P, 1), dtype=nl.bfloat16, buffer=nl.sbuf)
+    _memset(ones, 1.0)
+    n_ok = _psum((1, n_b), _GUARD_BANK, pin)
+    nisa.nc_matmul(dst=n_ok, stationary=ones, moving=ok)                 # rows in band, per block
+    bad = nl.ndarray(shape=(1, n_b), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=bad, data=n_ok, op0=nl.less, operand0=_P - 0.5)
+    sel = bad
+    if n_prgs > 1:
+        other = nl.ndarray(shape=(1, n_b), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.sendrecv(src=bad, dst=other, send_to_rank=1 - prg_id, recv_from_rank=1 - prg_id, pipe_id=0,
+                      dma_engine=nisa.dma_engine.gpsimd_dma)
+        sel = nl.ndarray(shape=(1, n_b), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=sel, data1=bad, data2=other, op=nl.maximum)
+    code = nl.ndarray(shape=(1, n_b), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=code, data1=bad, data2=sel, op=nl.add)
+    _dma(dst=flags[prg_id:prg_id + 1, :], src=code)
+    redo = nl.ndarray(shape=(1, n_b), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=redo, src=sel)
+    any_f = nl.ndarray(shape=(1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=any_f, data=sel, op=nl.maximum, axis=(1,))
+    any_i = nl.ndarray(shape=(1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=any_i, src=any_f)
+    return redo, any_i
+
+
+def _redo_block(q_hbm, chunks, acc_view, head, n_heads, d, r0, rows, k_blocks, v_token_major, pin):
+    """acc_view [rows, d + 1] <- exp(K^T q - m)^T @ [V | 1] for queries r0 .. r0 + rows of head over every chunk's
+    keys, each query row offset by its own maximum m (rounded to bf16: any offset near the maximum is exact): pass 1
+    the row maxima ([rows, 512] score groups), pass 2 the accumulation (the offset added in PSUM by a one-row
+    matmul). The output loop then normalizes it like any other block."""
+    q_sb = nl.ndarray(shape=(d, rows), dtype=nl.bfloat16, buffer=nl.sbuf)
+    _dma(dst=q_sb, src=q_hbm[head, :, nl.ds(r0, rows)])
+    m_run = nl.ndarray(shape=(rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    m_grp = nl.ndarray(shape=(rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    n_grp = 0
+    for k, _ in chunks:
+        seq_k = k.shape[2]
+        k_sb = nl.ndarray(shape=(d, seq_k), dtype=nl.bfloat16, buffer=nl.sbuf)
+        _load_k(k_sb, k, head, n_heads, d, seq_k, k_blocks)
+        for g in range(div_ceil(seq_k, _MAX_GROUP)):
+            w = min(_MAX_GROUP, seq_k - g * _MAX_GROUP)
+            sc = _psum((_P, _MAX_GROUP), _SCORE_BANKS[n_grp % 2], pin)
+            nisa.nc_matmul(dst=sc[0:rows, 0:w], stationary=q_sb, moving=k_sb[:, nl.ds(g * _MAX_GROUP, w)])
+            if n_grp == 0:
+                nisa.tensor_reduce(dst=m_run, data=sc[0:rows, 0:w], op=nl.maximum, axis=(1,))
+            else:
+                nisa.tensor_reduce(dst=m_grp, data=sc[0:rows, 0:w], op=nl.maximum, axis=(1,))
+                nisa.tensor_tensor(dst=m_run, data1=m_run, data2=m_grp, op=nl.maximum)
+            n_grp += 1
+    m_row = _psum((1, rows), _GUARD_BANK, pin)
+    nisa.nc_transpose(dst=m_row, data=m_run, engine=nisa.tensor_engine)
+    neg_m = nl.ndarray(shape=(1, rows), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=neg_m, data=m_row, op0=nl.multiply, operand0=-1.0)
+    ones = nl.ndarray(shape=(1, _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    _memset(ones, 1.0)
+    o_ps = _psum((rows, d + 1), 0, pin)
+    n_mm = 0
+    for k, v in chunks:
+        seq_k = k.shape[2]
+        n_tiles = div_ceil(seq_k, _P)
+        k_sb = nl.ndarray(shape=(d, seq_k), dtype=nl.bfloat16, buffer=nl.sbuf)
+        v_sb = nl.ndarray(shape=(_P, n_tiles, d + 1), dtype=nl.bfloat16, buffer=nl.sbuf)
+        _memset(v_sb[:, :, d:d + 1], 1.0)
+        _load_k(k_sb, k, head, n_heads, d, seq_k, k_blocks)
+        _load_v(v_sb, v, head, n_heads, d, seq_k, n_tiles, v_token_major)
+        probs = nl.ndarray(shape=(_P, 2, rows), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for tile in range(n_tiles):
+            ext = min(_P, seq_k - tile * _P)
+            sc = _psum((_P, rows), _SCORE_BANKS[tile % 2], pin)
+            nisa.nc_matmul(dst=sc[0:ext, :], stationary=k_sb[:, nl.ds(tile * _P, ext)], moving=q_sb,
+                           accumulate=False)
+            nisa.nc_matmul(dst=sc[0:ext, :], stationary=ones[0:1, 0:ext], moving=neg_m, accumulate=True)
+            nisa.activation(dst=probs[0:ext, tile % 2, :], data=sc[0:ext, :], op=nl.exp)
+            nisa.nc_matmul(dst=o_ps, stationary=probs[0:ext, tile % 2, :], moving=v_sb[0:ext, tile, :],
+                           accumulate=n_mm > 0)
+            n_mm += 1
+    nisa.tensor_copy(dst=acc_view, src=o_ps, engine=nisa.engine.vector)
+
+
+def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, k_blocks=1, v_token_major=False,
+           guard=None, real_q=None):
     """[N, d, Sq] pre-scaled queries (Sq <= 640, in the passes of _query_passes) over every chunk's keys; heads
     split over the logical core's programs. normalize: [N, Sq, d] in q's dtype, else the fp32 accumulator
     [N, Sq, d + 1]; acc_in continues one. K chunks have the logical shape [N, d, Sk] and V chunks [N, Sk, d],
-    whatever their memory (k_blocks, v_token_major)."""
+    whatever their memory (k_blocks, v_token_major). guard (normalize only): the (K, V) of every chunk the rows
+    attend, the cached ones first; returns (out, flags [n_prgs, per * n_o_tiles]) with the check of _guard_check
+    (rows real_q .. Sq - 1 are padding, not checked; None: none) and out-of-band blocks redone (_redo_block)."""
     n_heads, d, seq_q = q_hbm.shape
     kernel_assert(d == _P, f"d must be {_P}, got {d}")
     kernel_assert(seq_q <= _MAX_Q, f"seq_q={seq_q} must be <= {_MAX_Q}")
@@ -203,6 +339,9 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
         q_sbs.append(per_pass)
 
     acc = nl.ndarray(shape=(_O_TILE_SIZE, per, n_o_tiles, d + 1), dtype=nl.float32, buffer=nl.sbuf)
+    if guard is not None and seq_q < n_o_tiles * _O_TILE_SIZE:
+        # the guard checks all 128 rows of every query tile: the last tile's unused rows (never written) must pass
+        _memset(acc[:, :, n_o_tiles - 1, d:d + 1], 1.0)
     if acc_in is not None:
         for head in range(per):
             for ot in range(n_o_tiles):
@@ -237,6 +376,32 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
                     else:
                         _add(view, o_psums[j].data)
 
+    if guard is not None:
+        kernel_assert(normalize, "the guard checks the final call (normalize=True)")
+        real_q = seq_q if real_q is None else int(real_q)
+        kernel_assert(0 < real_q <= seq_q, f"real_q={real_q} must be in 1 .. seq_q={seq_q}")
+        flags = nl.ndarray(shape=(n_prgs, per * n_o_tiles), dtype=nl.float32, buffer=nl.shared_hbm)
+        redo, any_redo = _guard_check(acc, per, n_o_tiles, seq_q, real_q, d, n_prgs, prg_id, pin, flags)
+        # Runtime branches, skipped unless some block slot is out of band: any slot, then each slot. A redone block
+        # replaces its accumulator, which the output loop below normalizes like the others. Placed before the
+        # output loop: after it, the branch's engine reconvergence waited for the output copies (CP16, 4 chunks:
+        # +62 us per call against +52 here).
+        reg_any = nisa.register_alloc()
+        nisa.register_load(reg_any, any_redo)
+
+        def _redo_any(i):
+            for head in range(per):
+                for ot in range(n_o_tiles):
+                    reg_b = nisa.register_alloc()
+                    nisa.register_load(reg_b, redo[0:1, head * n_o_tiles + ot:head * n_o_tiles + ot + 1])
+
+                    def _redo_one(j, head=head, ot=ot):
+                        rows = min(_O_TILE_SIZE, seq_q - ot * _O_TILE_SIZE)
+                        _redo_block(q_hbm, guard, acc[:rows, head, ot, :], h0 + head, n_heads, d,
+                                    ot * _O_TILE_SIZE, rows, k_blocks, v_token_major, pin)
+                    nl.fori_loop(0, reg_b, _redo_one)
+        nl.fori_loop(0, reg_any, _redo_any)
+
     for head in range(per):
         for ot in range(n_o_tiles):
             rows = min(_O_TILE_SIZE, seq_q - ot * _O_TILE_SIZE)
@@ -245,7 +410,9 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
                 _dma(dst=dst, src=_normalize_acc(acc[:rows, head, ot, :]))
             else:
                 _dma(dst=dst, src=acc[:rows, head, ot, :])
-    return out
+    if guard is None:
+        return out
+    return out, flags
 
 
 # One fixed signature per chunk count and mode (lists cannot cross the torch -> NKI boundary); k_blocks and
@@ -280,3 +447,30 @@ def cmax2_part_3(q, k0, k1, k2, v0, v1, v2, softmax_max, k_blocks, v_token_major
 @nki.jit
 def cmax2_final_1(q, k0, v0, acc, softmax_max, k_blocks, v_token_major):
     return _cmax2(q, [k0], [v0], softmax_max, acc_in=acc, k_blocks=k_blocks, v_token_major=v_token_major)
+
+
+# Guarded (LINGBOT_CMAX_GUARD): the new chunk (k0, v0), the accumulator of the cached chunks, and those chunks
+# (lk*, lv*), which only a redo reads; real_q (compile-time) = the real query rows (the rest are padding). Return
+# (out, flags).
+@nki.jit
+def cmax2_full_1g(q, k0, v0, softmax_max, k_blocks, v_token_major, real_q):
+    return _cmax2(q, [k0], [v0], softmax_max, k_blocks=k_blocks, v_token_major=v_token_major, guard=[(k0, v0)],
+                  real_q=real_q)
+
+
+@nki.jit
+def cmax2_final_1g1(q, k0, v0, acc, lk0, lv0, softmax_max, k_blocks, v_token_major, real_q):
+    return _cmax2(q, [k0], [v0], softmax_max, acc_in=acc, k_blocks=k_blocks, v_token_major=v_token_major,
+                  guard=[(lk0, lv0), (k0, v0)], real_q=real_q)
+
+
+@nki.jit
+def cmax2_final_1g2(q, k0, v0, acc, lk0, lk1, lv0, lv1, softmax_max, k_blocks, v_token_major, real_q):
+    return _cmax2(q, [k0], [v0], softmax_max, acc_in=acc, k_blocks=k_blocks, v_token_major=v_token_major,
+                  guard=[(lk0, lv0), (lk1, lv1), (k0, v0)], real_q=real_q)
+
+
+@nki.jit
+def cmax2_final_1g3(q, k0, v0, acc, lk0, lk1, lk2, lv0, lv1, lv2, softmax_max, k_blocks, v_token_major, real_q):
+    return _cmax2(q, [k0], [v0], softmax_max, acc_in=acc, k_blocks=k_blocks, v_token_major=v_token_major,
+                  guard=[(lk0, lv0), (lk1, lv1), (lk2, lv2), (k0, v0)], real_q=real_q)

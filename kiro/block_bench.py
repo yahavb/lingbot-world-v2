@@ -78,6 +78,8 @@ def main():
     blk.self_attn.layer_index = K
     blk.self_attn.use_const_max = mf.layer_uses_const_max(K)
     blk.self_attn.use_cmax = mf.layer_uses_cmax(K)
+    # LINGBOT_CMAX_GUARD's counters and LINGBOT_DIAG_QK_SCALE's scale for this layer (before the first compiled call)
+    mf.cmax_guard_alloc([blk], dev)
     d = config["dim"] // config["num_heads"]
     freqs = torch.cat([rope_params(mf.MAX_LATENT_FRAMES, d - 4 * (d // 6)),
                        rope_params(mf.MAX_LATENT_FRAMES, 2 * (d // 6)),
@@ -469,10 +471,16 @@ def main():
               for i, (k_, v_) in enumerate(zip(kv["k"], kv["v"]))]
         print(f"[block_bench] rank {rank} KV_STATS after (slot, max|K|, max|V|, finite): {st}", flush=True)
     o = out.float().cpu()
+    guard = mf.cmax_guard_report([blk], "block_bench")      # all ranks: summed over the world
     msg = (f"[block_bench] tp={tpd} cp={cp} block={K} lead={LEAD} L_loc={L_loc}->{Lp} heads/rank={heads} "
            f"{ms:.2f} ms/block (host {t_host / REPS * 1e3:.2f} ms, first call {t_first:.1f}s) "
-           f"out_rms={o[0, :L_loc].pow(2).mean().sqrt():.4f} finite={bool(torch.isfinite(o).all())} "
+           f"out_rms={o[0, :L_loc].pow(2).mean().sqrt():.4f} finite={bool(torch.isfinite(o[0, :L_loc]).all())} "
            f"mem={torch.neuron.memory_allocated(dev) / 1e9:.2f}GB")
+    if Lp > L_loc and not bool(torch.isfinite(o[0, L_loc:]).all()):
+        msg += " (padding rows not finite)"
+    if mf._CMAX_GUARD:
+        n_, oob_, red_ = guard.get(K, (0, 0, 0))
+        msg += f" guard: {n_} blocks checked, {oob_} out of band, {red_} redone (all ranks, all calls)"
     ref, save = os.environ.get("REF"), os.environ.get("SAVE_REF")
     if rank == 0 and save:
         torch.save(o, save)

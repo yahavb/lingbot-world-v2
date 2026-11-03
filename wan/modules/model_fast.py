@@ -31,6 +31,7 @@ from wan.modules.attention import (
     cross_dedup_bias,
     cte_cross_attention_nmajor,
     cmax_final,
+    cmax_final_guarded,
     cmax_partial,
     cmax_prep_q,
     cte_call,
@@ -240,6 +241,24 @@ _ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
 # so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
 _CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
 _CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_CMAX_GUARD=1 (LINGBOT_CMAX=2): that range was measured on one clip, not guaranteed, and outside it the output
+# breaks (inf / NaN, or 0 / 0). The final constant-offset call then checks its own result: every real query row's sum
+# of exp(score - c) must lie in [e^-60, e^78] (NaN fails), which makes the output the exact softmax up to rounding for
+# any input; a 128-row block with a row outside the band is recomputed in the same kernel, behind a runtime branch,
+# with each row's own maximum (kernels/attention_cmax2_lb.py *_g*). Each layer counts its checked, out-of-band and
+# redone blocks in a device tensor (no host sync); cmax_guard_report() sums them over all ranks after a generation and
+# moves a layer whose redone blocks exceed LINGBOT_CMAX_GUARD_DEMOTE (default 0.05) of its checked ones to exact
+# attention. _CMAX_LAYERS then only decides speed, not correctness.
+_CMAX_GUARD = os.environ.get("LINGBOT_CMAX_GUARD", "0") == "1"
+assert not _CMAX_GUARD or os.environ.get("LINGBOT_CMAX", "0") == "2", "LINGBOT_CMAX_GUARD needs LINGBOT_CMAX=2"
+_CMAX_GUARD_DEMOTE = float(os.environ.get("LINGBOT_CMAX_GUARD_DEMOTE", "0.05"))
+# LINGBOT_CMAX_EXCLUDE=i,j,...: layers kept on exact attention although in _CMAX_LAYERS (e.g. ones a guard report moved)
+_CMAX_EXCLUDE = frozenset(int(t) for t in os.environ.get("LINGBOT_CMAX_EXCLUDE", "").split(",") if t.strip())
+# LINGBOT_DIAG_QK_SCALE=layer:s[,layer:s ...] (diagnostic, changes the output): those layers' queries multiplied by s
+# after RoPE, in every attention path, to drive their scores out of the constant offset's band (guard tests). A
+# per-layer tensor (1.0 elsewhere), so the 40 blocks keep sharing their compiled graphs.
+_DIAG_QK_SCALE = {int(a): float(b) for a, b in (t.split(":") for t in
+                  os.environ.get("LINGBOT_DIAG_QK_SCALE", "").split(",") if t.strip())}
 # LINGBOT_FILM_GROUP=G (with LINGBOT_FILM_ALL): the FiLM graph on G chunks per call, later groups when first needed.
 _FILM_GROUP = int(os.environ.get("LINGBOT_FILM_GROUP", "0") or 0)
 # LINGBOT_FILM_ROWS=N: the per-chunk FiLM graph (cam_film_sp) on N camera token rows per CP rank (zero-padded). At CP8
@@ -271,7 +290,64 @@ _CMAX_LAYERS = frozenset((
 
 def layer_uses_cmax(layer_index):
     """Does this layer's self-attention take the constant-offset path (LINGBOT_CMAX)?"""
-    return _CMAX and int(layer_index) in _CMAX_LAYERS
+    return _CMAX and int(layer_index) in _CMAX_LAYERS and int(layer_index) not in _CMAX_EXCLUDE
+
+
+def cmax_guard_alloc(blocks, device):
+    """LINGBOT_CMAX_GUARD: every layer's [checked, out-of-band, redone] block counters (zero), and
+    LINGBOT_DIAG_QK_SCALE's per-layer query scales. Before the first compiled block call, so the graphs take them;
+    idempotent."""
+    for i, blk in enumerate(blocks):
+        sa = getattr(blk, "self_attn", None)
+        if sa is None:
+            continue
+        layer = getattr(sa, "layer_index", None)
+        layer = i if layer is None else int(layer)
+        if _CMAX_GUARD and getattr(sa, "_cmax_guard_st", None) is None:
+            sa._cmax_guard_st = torch.zeros(3, dtype=torch.float32, device=device)
+        if _DIAG_QK_SCALE and getattr(sa, "_diag_qscale", None) is None:
+            sa._diag_qscale = torch.full((1,), _DIAG_QK_SCALE.get(layer, 1.0), dtype=torch.float32, device=device)
+
+
+def cmax_guard_reset(blocks):
+    for blk in blocks:
+        st = getattr(getattr(blk, "self_attn", None), "_cmax_guard_st", None)
+        if st is not None:
+            st.zero_()
+
+
+def cmax_guard_report(blocks, tag=""):
+    """LINGBOT_CMAX_GUARD, after a generation (outside its timed window; a collective, so on every rank): the per-layer
+    block counters summed over all ranks, logged by rank 0, then zeroed. A constant-offset layer whose redone blocks
+    exceed LINGBOT_CMAX_GUARD_DEMOTE of its checked ones moves to exact attention on every rank (the counts are the
+    same everywhere, so is the decision). Returns {layer: (checked, out of band, redone)} of the layers checked."""
+    sas = [getattr(b, "self_attn", None) for b in blocks]
+    sts = [(j, sa) for j, sa in enumerate(sas) if getattr(sa, "_cmax_guard_st", None) is not None]
+    if not sts:
+        return {}
+    a = torch.stack([sa._cmax_guard_st for _, sa in sts])
+    if dist.is_initialized():
+        dist.all_reduce(a)
+    a = a.cpu()
+    for _, sa in sts:
+        sa._cmax_guard_st.zero_()
+    layer_of = {j: (j if getattr(sa, "layer_index", None) is None else int(sa.layer_index)) for j, sa in sts}
+    res = {layer_of[j]: tuple(int(v) for v in a[r].tolist()) for r, (j, _) in enumerate(sts) if a[r, 0] > 0}
+    demoted = []
+    for j, sa in sts:
+        n, _, r = res.get(layer_of[j], (0, 0, 0))
+        if n > 0 and r > _CMAX_GUARD_DEMOTE * n and getattr(sa, "use_cmax", False):
+            sa.use_cmax = False
+            demoted.append(layer_of[j])
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        n_all = sum(v[0] for v in res.values())
+        hit = {i: v for i, v in res.items() if v[1] or v[2]}
+        logging.info(f"[CMAX_GUARD]{(' ' + tag) if tag else ''} {len(res)} layers, {n_all} blocks checked, "
+                     f"{sum(v[1] for v in res.values())} out of band, {sum(v[2] for v in res.values())} redone"
+                     + ("".join(f" | layer {i}: {o} out of band, {r} redone of {n}" for i, (n, o, r) in hit.items()))
+                     + (f" | moved to exact attention: {demoted} (LINGBOT_CMAX_EXCLUDE="
+                        f"{','.join(str(i) for i in sorted(_CMAX_EXCLUDE | set(demoted)))})" if demoted else ""))
+    return res
 
 
 def rowmax_graph_reset(blocks):
@@ -1111,6 +1187,9 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(k, rope_grid, freqs, start_frame=_csf,
                                           w_shard=cp_w_shard).type_as(v)
 
+        if _DIAG_QK_SCALE and getattr(self, "_diag_qscale", None) is not None:
+            # LINGBOT_DIAG_QK_SCALE (diagnostic): this layer's scores scaled, in every attention path
+            roped_query = (roped_query.float() * self._diag_qscale).to(roped_query.dtype)
         if _REAL_TOKENS[0] is not None and roped_key.shape[1] > _REAL_TOKENS[0]:
             roped_key = roped_key[:, :_REAL_TOKENS[0]]
             v = v[:, :_REAL_TOKENS[0]]
@@ -1328,7 +1407,19 @@ class CausalWanSelfAttention(nn.Module):
                     else:
                         if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
                             kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
-                    o_n = cmax_final(q_t, kd, vd, acc, _c_off, _kb, _V_TM)      # [n, Lq_p, d]
+                    if _CMAX_GUARD:
+                        # LINGBOT_CMAX_GUARD: the kernel checks every real row's sum and redoes out-of-band blocks
+                        _rq = lq if _REAL_TOKENS[0] is None else min(int(_REAL_TOKENS[0]), lq)
+                        o_n, _gfl = cmax_final_guarded(q_t, kd, vd, acc, lead_k, lead_v, _c_off, _kb, _V_TM,
+                                                       real_q=_rq)
+                        _gst = getattr(self, "_cmax_guard_st", None)
+                        if _gst is not None:
+                            # [checked, out of band (flag 2), redone (flag >= 1)] blocks of this rank
+                            _gst.add_(torch.stack([_gfl.new_tensor(float(_gfl.numel())),
+                                                   torch.clamp(_gfl - 1.0, min=0.0).sum(),
+                                                   torch.clamp(_gfl, max=1.0).sum()]))
+                    else:
+                        o_n = cmax_final(q_t, kd, vd, acc, _c_off, _kb, _V_TM)  # [n, Lq_p, d]
                     if _DIAG_BUFS:
                         # diagnostic (kiro/block_bench.py DUMP_CMAX): the kernel's queries, accumulator and output
                         _DIAG_BUFS["q_t"].copy_(q_t)
