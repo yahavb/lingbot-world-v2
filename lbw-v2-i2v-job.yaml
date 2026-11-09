@@ -20,6 +20,7 @@ spec:
             - /bin/bash
             - "-c"
             - |
+              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched (preview)" || true   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
@@ -70,6 +71,7 @@ spec:
             limits:
               ephemeral-storage: 600Gi
           volumeMounts:
+            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}   # neuron-top-patch
             - name: dshm
               mountPath: /dev/shm
           env:
@@ -140,6 +142,8 @@ spec:
                   key: HF_TOKEN
                   optional: true
       volumes:
+        - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
+          configMap: {name: neuron-top-patch, optional: true}
         - name: dshm
           emptyDir:
             medium: Memory
