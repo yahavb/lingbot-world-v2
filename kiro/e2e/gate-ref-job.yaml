@@ -35,7 +35,7 @@ spec:
               cp "$NODE/e2e/$SRC/dump/rollout_inputs.pt" "$R/" 2>/dev/null || true
               echo "src: $SRC" > "$R/SOURCE"
               if [ ! -s "$R/latents.pt" ]; then
-                TORCH_DEVICE_BACKEND_AUTOLOAD=0 THREADS=$THREADS python3 kiro/ref_fp32_rollout.py \
+                CONTEXT_PT="${CONTEXT_PT:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0 THREADS=$THREADS python3 kiro/ref_fp32_rollout.py \
                   "$R/rollout_inputs.pt" "$CKPT" /tmp/lbw-upstream "$R" 2>&1 | tee "$R/ref.log"
               fi
               if [ ! -s "$R/frames.pt" ]; then
@@ -57,6 +57,8 @@ spec:
             - name: SRC
               value: ""
             - name: R_TAG
+              value: ""
+            - name: CONTEXT_PT
               value: ""
             - name: THREADS
               value: "30"

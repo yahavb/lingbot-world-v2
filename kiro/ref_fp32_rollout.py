@@ -68,6 +68,12 @@ assert torch.allclose(sch.sigmas.double(), inp["sigmas"], atol=1e-6), "scheduler
 timesteps = inp["timesteps"]
 
 noise, y, cam, ctx = inp["noise"], inp["y"], inp["cam"], inp["context"]
+if os.environ.get("CONTEXT_PT"):  # e.g. the fp32 CPU T5 context (kiro/e2e/t5_ref.py): R covers T5 too
+    _c = torch.load(os.environ["CONTEXT_PT"], map_location="cpu").float()
+    assert _c.shape == ctx.shape, (_c.shape, ctx.shape)
+    print(f"[ref] context from {os.environ['CONTEXT_PT']}: rel-RMS vs run's "
+          f"{float((ctx - _c).pow(2).mean().sqrt() / _c.pow(2).mean().sqrt()):.4f}", flush=True)
+    ctx = _c
 cs, seq_len, fsl = int(inp["chunk_size"]), int(inp["seq_len"]), int(inp["frame_seqlen"])
 kv_size, mas, n_chunks = int(inp["kv_size"]), int(inp["max_attention_size"]), int(inp["n_chunks"])
 draws = list(inp["step_noise"])
