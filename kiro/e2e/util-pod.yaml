@@ -1,0 +1,28 @@
+# CPU utility pod for gate computations (scripts/validate_gate.py, input checks) on the node cache.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-e2e-util
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
+      containers:
+        - name: util
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command: ["/bin/bash", "-c", "pip install -q duckdb pyarrow numpy pillow 2>/dev/null; git clone -q -b e2e-4dev https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot; sleep 43200"]
+          env:
+            - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+              value: "0"
+          resources:
+            requests: {cpu: "16", memory: 64Gi}
+            limits: {cpu: "32", memory: 128Gi}
+          volumeMounts:
+            - {name: node-cache, mountPath: /node-cache}
+      volumes:
+        - name: node-cache
+          hostPath: {path: /opt/lingbot-world-v2, type: DirectoryOrCreate}
