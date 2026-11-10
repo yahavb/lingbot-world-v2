@@ -77,6 +77,8 @@ spec:
             - name: dshm
               mountPath: /dev/shm
           env:
+            - name: LINGBOT_VAE_GATHER1
+              value: "1"
             - name: LINGBOT_FILM_ALL_CHUNKS
               value: "3"
             - name: LINGBOT_FILM_ALL_BLOCKS

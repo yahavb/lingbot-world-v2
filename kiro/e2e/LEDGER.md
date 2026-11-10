@@ -29,6 +29,7 @@ TP2 x CP8 on 4 devices: 6.74 s GEN (+10%), rejected.
 | `LINGBOT_BLOCK_GROUP=2` | 2 DiT blocks per compiled graph (cross-block overlap) | -1.2% | within the approved base's error |
 | `LINGBOT_FILM_ALL_BLOCKS=10 LINGBOT_FILM_ALL_CHUNKS=3` | all-chunk camera FiLM in graphs of 10 blocks x 3 chunks | -0.6% | within the approved base's error |
 | `LINGBOT_T5_FP32=1` | fp32 T5 encode (once per prompt, before GEN) | 0 | context 3.5% -> fp32; first-9-frame PSNR +2.6 dB |
+| `LINGBOT_VAE_GATHER1=1` | one all-gather + one host copy of the decoded tiles (was per frame) | 0 (outside the VAE timer): frames on host 0.32 s sooner (651 -> 330 ms) | bit-identical frames |
 
 Stack of the last four on top of EXP_SPLIT: 5.765 / 5.765 s vs 5.863 / 5.860 s.
 
@@ -48,6 +49,7 @@ Stack of the last four on top of EXP_SPLIT: 5.765 / 5.765 s vs 5.863 / 5.860 s.
 | `LINGBOT_ATTN_SPLIT`, `LINGBOT_ATTN_REM` | assert: incompatible with `LINGBOT_K_BLOCKED` |
 | EXP_SPLIT 3 / 4 | 3: -1.0%, 4: -0.8% (2 is best) |
 | BLOCK_GROUP 4 | same speed as 2 |
+| "VAE is host-bound" | wrong window: the steady decode is 97% device-busy; the host-bound part was the frame gather after the timer (fixed by VAE_GATHER1) |
 
 ## Where the time goes now (`BOTTLENECKS.md`)
 
