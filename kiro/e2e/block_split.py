@@ -30,3 +30,8 @@ tot = t1 - t0
 for g, v in own.most_common(20): print(f"{g:40s} {v / 1e6:6.3f} ms {100 * v / tot:5.1f}%")
 print(f"{'(no instruction)':40s} {idle / 1e6:6.3f} ms {100 * idle / tot:5.1f}%")
 print("spill save / reload MB", sum(r[5] for r in rows) / 1e6, sum(r[6] for r in rows) / 1e6)
+sp = collections.Counter()
+for a, b, e, src, op, ss, sr in rows:
+    if ss or sr: sp[(grp(src, op), e)] += ss + sr
+print("spill bytes by source group / engine (MB):")
+for (g, e), v in sp.most_common(12): print(f"  {g:40s} {str(e):10s} {v / 1e6:8.1f}")
