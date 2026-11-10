@@ -86,6 +86,16 @@ def gather_video_2d(video_local):
     gather_video_width does); returns a CPU tensor on rank 0, None elsewhere."""
     P, D = _PD
     n = P * D
+    if os.environ.get("LINGBOT_VAE_GATHER1", "0") == "1":
+        # One all-gather of the whole tile and one host copy (the per-frame loop below spent
+        # ~5 ms of host time per frame, 0.45 s for 81 frames at 16 ranks). Same bytes.
+        f = video_local.contiguous()
+        out = torch.empty((n,) + tuple(f.shape), dtype=f.dtype, device=f.device)
+        dist.all_gather_into_tensor(out, f)
+        if dist.get_rank() != 0:
+            return None
+        C, T, h, w = f.shape
+        return out.view(D, P, C, T, h, w).permute(2, 3, 1, 4, 0, 5).reshape(C, T, P * h, D * w).cpu()
     frames = []
     for i in range(video_local.shape[1]):
         f = video_local.narrow(1, i, 1).contiguous()

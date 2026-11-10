@@ -214,12 +214,16 @@ def main():
     else:
         video_local = _decode(latent_local)
 
+    _tg = time.perf_counter()
     if _two_d:
         from wan.modules.vae2_1_fused import gather_video_2d
         video_full = gather_video_2d(video_local)
     else:
         video_full = gather_video_width(video_local)
 
+    if args.timing:
+        logging.info(f"[TIMING] gather to rank 0 (outside the decode timer): "
+                     f"{(time.perf_counter() - _tg) * 1000:.0f} ms")
     if rank == 0 and _pad_w != _lat_w:
 
         video_full = video_full[..., :_lat_w * cfg.vae_stride[2]].contiguous()

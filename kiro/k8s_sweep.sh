@@ -111,7 +111,8 @@ if [ -n "${VAE_CFGS:-}" ]; then
       fi
     )
     v=$(cat "$vd"/dec*.log | grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" | grep -oE "[0-9.]+$" | sort -n | head -1)
-    echo "VAERESULT $vn ${vkv} VAE_ms=${v:-NA}" | tee -a "$OUT/results.txt"
+    gt=$(grep -ohE "gather to rank 0 \(outside the decode timer\): [0-9]+" "$vd"/dec*.log | grep -oE "[0-9]+$" | sort -n | head -1)
+    echo "VAERESULT $vn ${vkv} VAE_ms=${v:-NA} gather_ms=${gt:-NA}" | tee -a "$OUT/results.txt"
   done
 fi
 [ "${QUALITY:-1}" = 0 ] && { echo "QUALITY=0: skipping CPU checks"; exit 0; }
