@@ -2633,18 +2633,39 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # failed to load ("Failed to load model with collectives, Failed to allocate resource").
         # Same ops per block, so the result is identical.
         _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0)
-        c_cat = torch.cat(toks, dim=1)
+        # LINGBOT_FILM_ALL_CHUNKS=k: precompute k chunks per call (smaller all-to-alls).
+        _kc = int(os.environ.get("LINGBOT_FILM_ALL_CHUNKS", "0") or 0) or K
+        if _kc < K:
+            per_chunk = []
+            for k0 in range(0, K, _kc):
+                part = self._films_run(torch.cat(toks[k0:k0 + _kc], dim=1), len(toks[k0:k0 + _kc]), P, _nb)
+                per_chunk += [[(sc[j:j + 1], sh[j:j + 1]) for sc, sh in part]
+                              for j in range(len(toks[k0:k0 + _kc]))]
+        else:
+            res = self._films_run(torch.cat(toks, dim=1), K, P, _nb)
+            per_chunk = [[(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res] for k in range(K)]
+        self._films_pre = {}
+        for k, t in enumerate(cam_tuples):
+            self._films_pre[id(t)] = (t, per_chunk[k])
+        if os.environ.get("LINGBOT_FILM_CHECK", "") and not getattr(self, "_film_check_done", False):
+            # First generation only, so a benchmark's timed pass is unaffected.
+            self._film_check_ids = {id(t): k for k, t in enumerate(cam_tuples)}
+            self._film_check_done = True
+
+    def _films_run(self, c_cat, K, P, _nb):
+        """_films_multi of all blocks on c_cat ([1, K * P, C]), per LINGBOT_FILM_ALL_BLOCKS."""
         if _nb and _nb < len(self.blocks):
-            # One _FilmGroup module per n blocks (weights are graph inputs of the module), so the
-            # groups share one compiled graph. A first version compiled closures over block lists
-            # passed as default arguments and produced wrong FiLM params (c0s0 rel-RMS 0.45 vs R).
+            # One _FilmGroup module per n blocks (weights are graph inputs of the module). Correct
+            # at TP4 x CP8 (c0s0 vs fp32 0.0111, all 40 at once 0.0108); at TP4 x CP4 the
+            # all-chunk FiLM params are wrong (c0s0 0.45) -- LINGBOT_FILM_ALL_CHUNKS tests
+            # whether the all-to-all size (7 chunks: ~19.5 MB per tensor at CP4) is the cause.
             grps = getattr(self, "_film_groups", None)
             if grps is None:
                 raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
                 grps = self._film_groups = [
                     torch.compile(_FilmGroup(raw[g0:g0 + _nb]), backend="neuron", fullgraph=True,
                                   dynamic=False) for g0 in range(0, len(raw), _nb)]
-            res = [r_ for g in grps for r_ in g(c_cat, K, P)]
+            return [r_ for g in grps for r_ in g(c_cat, K, P)]
         else:
             fn = getattr(self, "_films_multi_fn", None)
             if fn is None:
@@ -2655,13 +2676,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
                                                           dynamic=False)
             res = fn(c_cat, K, P)
-        self._films_pre = {}
-        for k, t in enumerate(cam_tuples):
-            self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])
-        if os.environ.get("LINGBOT_FILM_CHECK", "") and not getattr(self, "_film_check_done", False):
-            # First generation only, so a benchmark's timed pass is unaffected.
-            self._film_check_ids = {id(t): k for k, t in enumerate(cam_tuples)}
-            self._film_check_done = True
+        return res
 
     def _cam_films(self, dit_cond_dict):
         """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).
