@@ -87,6 +87,26 @@ run() {  # <name> <tp> <cp>
 for L in $LAYOUTS; do _l="${L%%_*}"; run "lnc${LNC}_${L}" "${_l%x*}" "${_l#*x}"; done
 _l="${REPEAT%%_*}"; [ -n "$REPEAT" ] && run "lnc${LNC}_${REPEAT}_rep" "${_l%x*}" "${_l#*x}"
 
+# VAE_CFGS="name:K=V,K=V name2:...": decode-only A/B on the first config's latents (decode twice,
+# VAE = the faster), same env as the sweep plus the overrides. The first entry should be a control.
+if [ -n "${VAE_CFGS:-}" ]; then
+  _L0="${LAYOUTS%% *}"; _lat="$OUT/lnc${LNC}_${_L0}/latents.pt"
+  for vc in $VAE_CFGS; do
+    vn="${vc%%:*}"; vkv="${vc#*:}"; vd="$OUT/vae_$vn"; mkdir -p "$vd"
+    (
+      for kv in "${LOOP_ENV[@]}"; do export "$kv"; done
+      export NEURON_LOGICAL_NC_CONFIG="$LNC" LINGBOT_SAVE_FRAMES="$vd/frames.pt"
+      IFS=',' read -r -a _kvs <<< "$vkv"; for kv in "${_kvs[@]}"; do [ -n "$kv" ] && export "$kv"; done
+      for i in 1 2; do
+        torchrun --nproc_per_node="$NPROC" --master_port=29740 decode_latents_width_sharded.py \
+          --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$_lat" --save_file "$vd/out.mp4" \
+          --timing --warmup > "$vd/dec$i.log" 2>&1
+      done
+    )
+    v=$(cat "$vd"/dec*.log | grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" | grep -oE "[0-9.]+$" | sort -n | head -1)
+    echo "VAERESULT $vn ${vkv} VAE_ms=${v:-NA}" | tee -a "$OUT/results.txt"
+  done
+fi
 [ "${QUALITY:-1}" = 0 ] && { echo "QUALITY=0: skipping CPU checks"; exit 0; }
 echo "=== quality ==="
 FIRST=""
