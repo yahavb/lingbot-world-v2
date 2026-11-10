@@ -28,6 +28,7 @@ from wan.modules.attention import (
     const_max_ag_available,
     cte_cross_attention_nmajor,
     cte_merge,
+    cte_merge_fmaj,
     cte_merge_rows,
     cte_rows,
     xla_attention_rows,
@@ -746,6 +747,9 @@ _QKV_XT = os.environ.get("LINGBOT_QKV_XT", "0") == "1"
 # transpose turns back into [S, C]. Same bias (row-parallel bias on rank 0 only) and fp32 reduction
 # as _tp_row_parallel(scatter=True).
 _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
+# LINGBOT_ATTN_FMAJ=1: merged self-attention returns d-major output (kernel tp_out) into a
+# d-major o-projection (_out_proj_fmaj), the attention-side twin of LINGBOT_FFN_FMAJ.
+_ATTN_FMAJ = os.environ.get("LINGBOT_ATTN_FMAJ", "0") == "1"
 
 
 def _ffn_feature_major(ffn, h):
@@ -1170,6 +1174,8 @@ class CausalWanSelfAttention(nn.Module):
                 if _KV_CLONE:
                     lead = [(kc_ * 1, vc_ * 1) for kc_, vc_ in lead]
                 last = lead.pop() if (_ATTN_PAIR and lead) else None
+                _fm = (_ATTN_FMAJ and _sp_scatter and getattr(self, 'tp_enabled', False)
+                       and not _split and _lq_main == _lq_all and not return_cache)
                 parts = []
                 _kb = _cp if (_K_BLOCKED and _k_ndl) else 1
                 q_lead = q_c
@@ -1179,8 +1185,8 @@ class CausalWanSelfAttention(nn.Module):
                     q_lead = q_c + _z.to(q_c.dtype)
                 while _ATTN_PAIR and len(lead) >= 2:
                     (ka, va), (kb, vb) = lead.pop(0), lead.pop(0)
-                    parts.append(cte_partial(q_lead, kb, vb, ka, va, k_blocks=_kb))
-                parts += [cte_partial(q_lead, kc, vc, k_blocks=_kb) for kc, vc in lead]
+                    parts.append(cte_partial(q_lead, kb, vb, ka, va, k_blocks=_kb, tp_out=_fm))
+                parts += [cte_partial(q_lead, kc, vc, k_blocks=_kb, tp_out=_fm) for kc, vc in lead]
                 if _split:
                     # This rank's own shard of the new chunk (the pre-gather K/V, cache layout)
                     # into its own-shard slot; the remainder attends it straight from the graph.
@@ -1201,7 +1207,10 @@ class CausalWanSelfAttention(nn.Module):
                     # LINGBOT_STEP_NOWRITE: dead write skipped, attend the gathered chunk itself
                     kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                 parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ()),
-                                         k_blocks=_kb))
+                                         k_blocks=_kb, tp_out=_fm))
+                if _fm:
+                    # LINGBOT_ATTN_FMAJ: d-major attention output straight into the o-projection
+                    return self._out_proj_fmaj(cte_merge_fmaj(parts, lq))
                 x = cte_merge(parts, lq)
                 if _split:
                     x = torch.cat([x, x_rem] + ([x.new_zeros(1, _lq_all - _l, _n, _d)]
@@ -1435,6 +1444,27 @@ class CausalWanSelfAttention(nn.Module):
             # the compiled graph may drop or re-allocate the write.
             return out, kv_cache["k"], kv_cache["v"]
         return out
+
+    def _out_proj_fmaj(self, xt):
+        """LINGBOT_ATTN_FMAJ: o-projection of the d-major attention output xt [n, d, L] (L = the
+        TP group's gathered tokens): per TP token block W_o @ x (contraction on the partition axis),
+        reduce-scatter on the block dim, one small transpose of this rank's [C, S] back to [1, S, C].
+        Same bias and fp32 reduction as _out_proj(scatter=True)."""
+        m = tp.mesh_submesh("tp")
+        nt = m.size()
+        nd, L = int(xt.shape[0]) * int(xt.shape[1]), int(xt.shape[2])
+        S = L // nt
+        x3 = xt.reshape(nd, nt, S).permute(1, 0, 2)                       # [nt, nd, S] view
+        y = torch.matmul(self.o.weight, x3)                                # [nt, C, S]
+        if self.o.bias is not None:
+            y = y + self.o.bias.view(-1, 1)
+        yd = y.dtype
+        C = int(y.shape[1])
+        y2 = y.reshape(nt * C, S)
+        if y2.dtype in (torch.bfloat16, torch.float16) and not tp._AR_NATIVE_DTYPE:
+            y2 = y2.float()
+        r = fc.reduce_scatter_tensor(y2, "sum", 0, m)                      # [C, S]
+        return r.to(yd).t().unsqueeze(0)
 
     def _out_proj(self, x, _async_out=False, scatter=False):
         """Shared o-projection tail for the flat- and chunked-cache paths.

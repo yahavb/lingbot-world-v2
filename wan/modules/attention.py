@@ -522,7 +522,7 @@ def cte_prep_q(q, dtype=torch.bfloat16):
     return q_c, lq
 
 
-def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1):
+def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, tp_out=False):
     """Unnormalized attention (out, row max, row sum) of one KV chunk -- or of two, with the
     second given as the kernel's prefix-caching prior (k_prior/v_prior, all of it used) -- for
     cte_merge. Two chunks in one call is the same softmax over their union, computed by the
@@ -538,7 +538,7 @@ def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1):
         kw.update(k_prior=k_prior, v_prior=v_prior,
                   prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
     o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
-                                   tp_q=True, tp_k=tp_k, tp_out=False,
+                                   tp_q=True, tp_k=tp_k, tp_out=tp_out,
                                    cache_softmax=True, skip_output_normalization=True, **kw)
     return o, -neg_max.float(), s.float()
 
@@ -600,6 +600,32 @@ def cte_merge_rows(parts, dtype=torch.bfloat16):
     for l_, o in zip(lam[1:], outs[1:]):
         out = out + l_.unsqueeze(-1) * o.float()
     return out.permute(1, 0, 2).unsqueeze(0).to(dtype)
+
+
+def cte_merge_fmaj(parts, lq, dtype=torch.bfloat16):
+    """cte_merge of tp_out=True partials ([n, d, Lq_p]): the same fp32 ops, the output kept
+    d-major, [n, d, lq] (LINGBOT_ATTN_FMAJ)."""
+    outs = [p[0] for p in parts]
+    maxs = [p[1] for p in parts]
+    sums = [p[2] for p in parts]
+    n, lq_p = int(outs[0].shape[0]), int(outs[0].shape[-1])
+    if len(outs) == 1:
+        lam = [1.0 / sums[0]]
+    else:
+        m_all = maxs[0]
+        for m in maxs[1:]:
+            m_all = torch.maximum(m_all, m)
+        w = [torch.exp(m - m_all) for m in maxs]
+        den = w[0] * sums[0]
+        for wc, sc in zip(w[1:], sums[1:]):
+            den = den + wc * sc
+        inv = 1.0 / den
+        lam = [wc * inv for wc in w]
+    lam = [l_.transpose(1, 2).reshape(n, 1, lq_p) for l_ in lam]
+    out = lam[0] * outs[0].float()
+    for l_, o in zip(lam[1:], outs[1:]):
+        out = out + l_ * o.float()
+    return out[:, :, :lq].to(dtype)
 
 
 def cte_merge(parts, lq, dtype=torch.bfloat16):
