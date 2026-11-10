@@ -10,7 +10,7 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
-        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
+        # kubernetes.io/hostname: <node with the e2e outputs>
       containers:
         - name: util
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
