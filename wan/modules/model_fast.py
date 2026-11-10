@@ -2597,15 +2597,23 @@ class WanModelFast(ModelMixin, ConfigMixin):
             ck = c[:, min(k, n_avail - 1) * L:(min(k, n_avail - 1) + 1) * L]
             ck = _shard_w(ck, f, h, w, sp_size, r)
             toks.append(torch_F.pad(ck, (0, 0, 0, P - R)))
-        fn = getattr(self, "_films_multi_fn", None)
-        if fn is None:
+        # LINGBOT_FILM_ALL_BLOCKS=n: one compiled graph per n consecutive blocks instead of one for
+        # all 40. The single graph unrolls K chunks x 40 blocks x 4 matmuls; at 16 ranks (TP4 x CP4,
+        # twice the tokens per rank of CP8) its NEFF carried ~150 MB of PE instructions per core and
+        # failed to load ("Failed to load model with collectives, Failed to allocate resource").
+        # Same ops per block, so the result is identical.
+        _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0) or len(self.blocks)
+        fns = getattr(self, "_films_multi_fns", None)
+        if fns is None:
             raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
-
-            def _all(c_cat, K_, P_):
-                return _films_multi(raw, c_cat, K_, P_)
-            fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
-                                                      dynamic=False)
-        res = fn(torch.cat(toks, dim=1), K, P)
+            fns = []
+            for g0 in range(0, len(raw), _nb):
+                def _all(c_cat, K_, P_, _blk=raw[g0:g0 + _nb]):
+                    return _films_multi(_blk, c_cat, K_, P_)
+                fns.append(torch.compile(_all, backend="neuron", fullgraph=True, dynamic=False))
+            self._films_multi_fns = fns
+        c_cat = torch.cat(toks, dim=1)
+        res = [r_ for fn in fns for r_ in fn(c_cat, K, P)]
         self._films_pre = {}
         for k, t in enumerate(cam_tuples):
             self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])

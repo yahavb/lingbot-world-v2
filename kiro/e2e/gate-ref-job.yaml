@@ -29,6 +29,7 @@ spec:
               git clone -q https://github.com/robbyant/lingbot-world-v2.git /tmp/lbw-upstream
               cd /tmp/lingbot; echo "commit: $(git log --oneline -1); upstream: $(git -C /tmp/lbw-upstream log --oneline -1)"
               pip install -q -r requirements_neuron.txt
+              python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
               NODE=/node-cache; CKPT=$NODE/lingbot-world-v2-14b-causal-fast
               R=$NODE/e2e/gate/$R_TAG; mkdir -p "$R"
               cp "$NODE/e2e/$SRC/dump/rollout_inputs.pt" "$R/" 2>/dev/null || true
@@ -49,6 +50,8 @@ spec:
           volumeMounts:
             - {name: node-cache, mountPath: /node-cache}
           env:
+            - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+              value: "0"
             - name: BRANCH
               value: "e2e-4dev"
             - name: SRC
