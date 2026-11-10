@@ -738,6 +738,7 @@ _QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
 # weights become views into it, no extra memory). The block profile charged ~0.3 ms of compiler
 # transposes to EACH of the three projections of the same all-gathered input.
 _QKV_FUSED = os.environ.get("LINGBOT_QKV_FUSED", "0") == "1"
+_QKV_XT = os.environ.get("LINGBOT_QKV_XT", "0") == "1"
 
 
 def _fuse_qkv_weights(blocks):
@@ -870,6 +871,17 @@ class CausalWanSelfAttention(nn.Module):
                 k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
                 v = self.v(xk).view(b, s, n, d)
                 return q, k, v
+            if getattr(self, 'tp_enabled', False) and self.qk_norm and _QKV_XT:
+                # LINGBOT_QKV_XT=1: transpose the shared input ONCE to [C, s] and let Q, K and V
+                # contract over its leading dim (the compiler otherwise transposes x per matmul).
+                xt = x[0].t().contiguous()                               # [C, s]
+
+                def _lin(lin):
+                    y = torch.matmul(xt.t(), lin.weight.t())
+                    return (y + lin.bias if lin.bias is not None else y).unsqueeze(0)
+                q = _tp_rms_norm(_lin(self.q), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                k = _tp_rms_norm(_lin(self.k), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                return q, k, _lin(self.v).view(b, s, n, d)
             if (getattr(self, 'tp_enabled', False) and self.qk_norm
                     and getattr(self, "_wqkv", None) is not None):
                 qkv = torch_F.linear(x, self._wqkv, self._bqkv)
