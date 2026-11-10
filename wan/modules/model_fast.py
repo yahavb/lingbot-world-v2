@@ -206,6 +206,17 @@ def _films_multi(raw_blocks, c_cat, K, P):
     return out
 
 
+class _FilmGroup(nn.Module):
+    """LINGBOT_FILM_ALL_BLOCKS: _films_multi over a slice of the blocks, as a module."""
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, c_cat, K, P):
+        return _films_multi(list(self.blocks), c_cat, K, P)
+
+
 def _split_remainder(qrg, own_kv, cp, rr, n, d):
     """LINGBOT_ATTN_SPLIT: exact attention of every CP rank's remainder query rows, computed
     across the CP group. qrg [cp * rr, n, d] holds the rr remainder rows of each rank in rank
@@ -2602,18 +2613,29 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # twice the tokens per rank of CP8) its NEFF carried ~150 MB of PE instructions per core and
         # failed to load ("Failed to load model with collectives, Failed to allocate resource").
         # Same ops per block, so the result is identical.
-        _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0) or len(self.blocks)
-        fns = getattr(self, "_films_multi_fns", None)
-        if fns is None:
-            raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
-            fns = []
-            for g0 in range(0, len(raw), _nb):
-                def _all(c_cat, K_, P_, _blk=raw[g0:g0 + _nb]):
-                    return _films_multi(_blk, c_cat, K_, P_)
-                fns.append(torch.compile(_all, backend="neuron", fullgraph=True, dynamic=False))
-            self._films_multi_fns = fns
+        _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0)
         c_cat = torch.cat(toks, dim=1)
-        res = [r_ for fn in fns for r_ in fn(c_cat, K, P)]
+        if _nb and _nb < len(self.blocks):
+            # One _FilmGroup module per n blocks (weights are graph inputs of the module), so the
+            # groups share one compiled graph. A first version compiled closures over block lists
+            # passed as default arguments and produced wrong FiLM params (c0s0 rel-RMS 0.45 vs R).
+            grps = getattr(self, "_film_groups", None)
+            if grps is None:
+                raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+                grps = self._film_groups = [
+                    torch.compile(_FilmGroup(raw[g0:g0 + _nb]), backend="neuron", fullgraph=True,
+                                  dynamic=False) for g0 in range(0, len(raw), _nb)]
+            res = [r_ for g in grps for r_ in g(c_cat, K, P)]
+        else:
+            fn = getattr(self, "_films_multi_fn", None)
+            if fn is None:
+                raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+
+                def _all(c_cat, K_, P_):
+                    return _films_multi(raw, c_cat, K_, P_)
+                fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
+                                                          dynamic=False)
+            res = fn(c_cat, K, P)
         self._films_pre = {}
         for k, t in enumerate(cam_tuples):
             self._films_pre[id(t)] = (t, [(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res])
