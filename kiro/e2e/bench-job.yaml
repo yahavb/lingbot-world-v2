@@ -59,6 +59,10 @@ spec:
               echo "FLASH_ATTN_LAYERS=$FLASH_ATTN_LAYERS"
 
               neuron-ls 2>/dev/null | head -20 || true
+              if [ -n "${PAIRS_MANIFEST:-}" ]; then   # device-profile capture only (kiro/e2e/pairs.sh)
+                bash kiro/e2e/pairs.sh "$NODE/e2e/$PAIRS_MANIFEST" "$NODE/e2e/$PAIRS_NEFFS" "$OUT/pairs" "$NPROC" 2>&1 | tee "$OUT/pairs.txt"
+                exit 0
+              fi
               OUT=$OUT bash kiro/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
               echo "SWEEP COMPLETE"
           resources:
