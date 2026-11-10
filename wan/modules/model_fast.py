@@ -739,6 +739,33 @@ _QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
 # transposes to EACH of the three projections of the same all-gathered input.
 _QKV_FUSED = os.environ.get("LINGBOT_QKV_FUSED", "0") == "1"
 _QKV_XT = os.environ.get("LINGBOT_QKV_XT", "0") == "1"
+# LINGBOT_FFN_FMAJ=1: SP FFN in feature-major layout. Each rank transposes only its own token shard
+# [S, C] -> [C, S], the TP group gathers [n, C, S] (dim 0, no reorder), up / GELU / down run as
+# W @ x with the contraction on the partition axis (no compiler transposes of the gathered
+# input), and the reduce-scatter on dim 0 hands rank r the sums of its own block, which one small
+# transpose turns back into [S, C]. Same bias (row-parallel bias on rank 0 only) and fp32 reduction
+# as _tp_row_parallel(scatter=True).
+_FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
+
+
+def _ffn_feature_major(ffn, h):
+    m = tp.mesh_submesh("tp")
+    n = m.size()
+    S, C = int(h.shape[1]), int(h.shape[2])
+    g = fc.all_gather_tensor(h[0].t().contiguous(), 0, m).view(n, C, S)     # [n, C, S]
+    u = torch.matmul(ffn[0].weight, g)
+    if ffn[0].bias is not None:
+        u = u + ffn[0].bias.view(-1, 1)
+    u = ffn[1](u)
+    y = torch.matmul(ffn[2].weight, u)                                         # [n, C, S] partial
+    if ffn[2].bias is not None:
+        y = y + ffn[2].bias.view(-1, 1)
+    yd = y.dtype
+    y2 = y.reshape(n * C, S)
+    if y2.dtype in (torch.bfloat16, torch.float16) and not tp._AR_NATIVE_DTYPE:
+        y2 = y2.float()
+    r = fc.reduce_scatter_tensor(y2, "sum", 0, m)                              # [C, S] own tokens
+    return r.to(yd).t().unsqueeze(0)
 
 
 def _fuse_qkv_weights(blocks):
@@ -1662,8 +1689,11 @@ class CausalWanAttentionBlock(nn.Module):
                                       _sp_scatter=True)
             h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
                 self.ffn[0].weight.dtype)
-            hf = tp.all_gather_tokens(h, "tp")
-            y = _tp_row_parallel(self.ffn[2], self.ffn[1](self.ffn[0](hf)), scatter=True)
+            if _FFN_FMAJ:
+                y = _ffn_feature_major(self.ffn, h)
+            else:
+                hf = tp.all_gather_tokens(h, "tp")
+                y = _tp_row_parallel(self.ffn[2], self.ffn[1](self.ffn[0](hf)), scatter=True)
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 xs = (xs + y * e[5].squeeze(2)).to(_rdt)
             return xs
