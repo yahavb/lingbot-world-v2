@@ -327,9 +327,13 @@ def _encode_prompt_tp(args, cfg, device, rank, world_size):
     there's no cross-rank handoff to do; no disk round-trip needed since
     encode and consume happen in this same process."""
     init_t5_parallel_group(world_size)
+    # LINGBOT_T5_FP32=1: run the encoder in fp32 (output rounded to cfg.t5_dtype once). The bf16
+    # TP encoder's context was 2.8% (32 ranks) / 3.5% (16 ranks) rel-RMS from an fp32 CPU T5
+    # (kiro/e2e/t5_ref.py). The encode runs once per prompt, before GEN.
+    _t5_fp32 = os.environ.get("LINGBOT_T5_FP32", "0") == "1"
     text_encoder = T5EncoderModel(
         text_len=cfg.text_len,
-        dtype=cfg.t5_dtype,
+        dtype=torch.float32 if _t5_fp32 else cfg.t5_dtype,
         device=torch.device('cpu'),
         checkpoint_path=os.path.join(args.ckpt_dir, cfg.t5_checkpoint),
         tokenizer_path=os.path.join(args.ckpt_dir, cfg.t5_tokenizer),
@@ -338,7 +342,7 @@ def _encode_prompt_tp(args, cfg, device, rank, world_size):
 
     with torch.no_grad():
         prompt_embeds = text_encoder([args.prompt], device)
-    prompt_embeds = [t.cpu() for t in prompt_embeds]
+    prompt_embeds = [(t.to(cfg.t5_dtype) if _t5_fp32 else t).cpu() for t in prompt_embeds]
     del text_encoder
     destroy_t5_parallel_group()
     torch.neuron.empty_cache()
