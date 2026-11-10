@@ -216,6 +216,27 @@ def _films_multi(raw_blocks, c_cat, K, P):
     return out
 
 
+_BLOCK_GROUP = int(os.environ.get("LINGBOT_BLOCK_GROUP", "1") or 1)
+
+
+class _BlockGroup(nn.Module):
+    """LINGBOT_BLOCK_GROUP: consecutive DiT blocks as one compiled graph (same per-block calls as
+    the block loop in WanModelFast.forward)."""
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x, kvcs, crosses, films, kw):
+        for j, blk in enumerate(self.blocks):
+            kwj = dict(kw)
+            if films is not None:
+                kwj["dit_cond_dict"] = {"cam_film": films[j]}
+            x = blk(x, kv_cache=None, kv_chunks=kvcs[j], crossattn_cache=crosses[j],
+                    current_start=0, **kwj)
+        return x
+
+
 class _FilmGroup(nn.Module):
     """LINGBOT_FILM_ALL_BLOCKS: _films_multi over a slice of the blocks, as a module."""
 
@@ -2363,7 +2384,26 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 if _sp:
                     assert _films is not None, "LINGBOT_SP needs the hoisted camera FiLM (LINGBOT_CAM_HOIST=1)"
                     x = sp_token_shard(x, _tpd, tp.tp_rank(_TP_GROUP))
-                for block_index, block in enumerate(self.blocks):
+                _bg = _BLOCK_GROUP if (_BLOCK_GROUP > 1 and not _DUMP_BLOCKS and _own is None) else 1
+                if _bg > 1:
+                    # LINGBOT_BLOCK_GROUP=g: g consecutive blocks per compiled graph (_BlockGroup).
+                    grps = getattr(self, "_block_groups", None)
+                    if grps is None:
+                        raw = [getattr(b_, "_orig_mod", b_) for b_ in self.blocks]
+                        grps = self._block_groups = [
+                            torch.compile(_BlockGroup(raw[g0:g0 + _bg]), backend="neuron",
+                                          fullgraph=True, dynamic=False)
+                            for g0 in range(0, len(raw), _bg)]
+                    _kw = dict(kwargs)
+                    _kw.pop("dit_cond_dict", None)
+                    if kv_commit is False and _STEP_NOWRITE:
+                        _kw["kv_write"] = False
+                    for gi, grp in enumerate(grps):
+                        idx = range(gi * _bg, min((gi + 1) * _bg, len(self.blocks)))
+                        x = grp(x, [(list(_ks[i]), list(_vs[i])) for i in idx],
+                                [crossattn_cache[i] for i in idx],
+                                [_films[i] for i in idx] if _films is not None else None, _kw)
+                for block_index, block in (() if _bg > 1 else enumerate(self.blocks)):
                     _kw = kwargs
                     if _films is not None:
                         _kw = dict(kwargs)
