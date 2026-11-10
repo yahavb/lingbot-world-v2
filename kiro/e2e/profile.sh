@@ -34,7 +34,10 @@ for d in $(cat "$P/rankdirs.txt"); do
      f="$P/pq/r$i/system_profile/SystemProfileEvents.parquet"; [ -f "$f" ] && { F="$F $f"; N="$N,r$i"; };; esac
   i=$((i+1))
 done
-python3 "$T/neuron_attribution.py" $F --names "${N#,}" --run-gap-s 0.5 --min-share 0.005 \
+GEN_MS=$(grep -oE "GEN run2 time: [0-9.]+" "$P/gen_systrace.log" | grep -oE "[0-9.]+$")
+FW=""; for f in $F; do w="${f%.parquet}_gen.parquet"; python3 "$REPO/kiro/e2e/trace_window.py" "$f" "$GEN_MS" "$w"; FW="$FW $w"; done
+F="$FW"
+python3 "$T/neuron_attribution.py" $F --names "${N#,}" --run-gap-s 5 --min-share 0.005 \
   --roles 'dit=model_fast|block|attention|cte|stack;vae=vae|decoder;t5=t5|umt5' \
   --json-out "$P/manifest.json" > "$P/attr.txt" 2>&1
 cat "$P/attr.txt" | head -60
