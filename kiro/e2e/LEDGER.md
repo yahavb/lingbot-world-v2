@@ -72,14 +72,15 @@ R = the whole rollout on CPU in fp32 with the upstream (CUDA) `WanModelFast`, re
 dumped inputs (`LINGBOT_DUMP_ROLLOUT`, `kiro/ref_fp32_rollout.py`), T5 context from an fp32 CPU T5
 (`t5_ref.py` -> `CONTEXT_PT`), decoded by the fp32 CPU VAE. `gate.sh` runs `tools/validate_gate.py`.
 
-Calibration (`calib.py`). **No user-labelled lingbot videos exist yet**, so the labels are provisional:
+Calibration (`calib.py`). Labels: the user reviewed the videos by eye on 2026-11-10 (best 4-device, 4-device base, 8-device deploy and the CPU fp32 reference: approved; FILM_ALL 4-chunk at CP4: rejected, "noise"). The blurred copies are synthetic:
 
 | Output | first 9 frames vs R | sharpness / R | c0s0 rel-RMS | label |
 |---|---|---|---|---|
-| deployed 8-device config | 40.1-41.4 dB | 1.03 | 0.011-0.013 | approved (deployed) |
-| 4-device base | 36.4-38.4 dB | 1.03 | 0.015-0.018 | approved (same code) |
+| deployed 8-device config | 40.1-41.4 dB | 1.03 | 0.011-0.013 | approved by the user |
+| 4-device base | 36.4-38.4 dB | 1.03 | 0.015-0.018 | approved by the user |
+| best 4-device stack | 39.4 dB | 1.02 | 0.0136 | approved by the user |
 | base blurred, sigma 1 / 2 px (synthetic) | 31.1 / 28.2 dB | 0.06 / 0.01 | - | rejected (synthetic) |
-| FILM_ALL at CP4, 7 or 4 chunks | 2.6 / 11.1 dB | 0.00 / 0.28 | 0.45 / 0.68 | rejected |
+| FILM_ALL at CP4, 7 or 4 chunks | 2.6 / 11.1 dB | 0.00 / 0.28 | 0.45 / 0.68 | rejected by the user (4 chunks: "noise") |
 
 G0: `--floor-early-db 35 --min-sharpness 0.9 --max-early-rel 0.03`. G3 (x1.3) is taken against the
 approved base, not the best-so-far: equivalent exact-attention configs span chunk-0 latent rel-RMS
