@@ -49,6 +49,8 @@ Stack of the last four on top of EXP_SPLIT: 5.765 / 5.765 s vs 5.863 / 5.860 s.
 | `LINGBOT_ATTN_SPLIT`, `LINGBOT_ATTN_REM` | assert: incompatible with `LINGBOT_K_BLOCKED` |
 | EXP_SPLIT 3 / 4 | 3: -1.0%, 4: -0.8% (2 is best) |
 | BLOCK_GROUP 4 | same speed as 2 |
+| one explicit transpose of the QKV input (`LINGBOT_QKV_XT`) | +0.5% |
+| `LINGBOT_TOKEN_PAD` 128 / 512 | +2.5% / +9% (32 stays) |
 | "VAE is host-bound" | wrong window: the steady decode is 97% device-busy; the host-bound part was the frame gather after the timer (fixed by VAE_GATHER1) |
 
 ## Where the time goes now (`BOTTLENECKS.md`)
@@ -58,6 +60,11 @@ DiT blocks are ~93% of GEN (4.3 ms per block execution, 38% MFU). Inside a block
 (the token-major all-gathered input is transposed once per consumer matmul and not CSE'd), other 11%.
 The remaining large lever is a feature-major activation layout (removes the transposes); the attention
 kernel has ~0.3-0.6 s of headroom left from engine balance.
+
+Untested, ranked: (1) feature-major activations in the block (removes most of the 17% transposes; a
+rewrite of the SP block, norms and RoPE); (2) attention kernel: exp read straight from PSUM and fewer
+Vector copies (~0.3 s); (3) skip the last block's attention/FFN on the 6 cache-commit forwards (exact,
+~0.35%); (4) fp32 T5 in `serve.py` (not wired; the streaming server builds its own T5).
 
 ## Accuracy gate
 
