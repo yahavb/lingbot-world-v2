@@ -175,6 +175,13 @@ _KV_ENGINE = {"hwdge_sync": nisa.engine.sync, "hwdge_act": nisa.engine.scalar}.g
 # GpSimd time regardless of its size (profiled), and the per-tile copies were ~800 per call.
 _KGROUP = int(_os.environ.get("LINGBOT_CTE_KGROUP", "1"))
 _EXP_SPLIT = int(_os.environ.get("LINGBOT_CTE_EXP_SPLIT", "1"))  # lingbot: see _exp_impl
+# lingbot: LINGBOT_CTE_PRIOR_FULL=1 -- the caller always uses ALL of k_prior (cte_partial passes
+# prior_used_len = v_prior.shape[1]), so prior tiles need no runtime mask: they take the unmasked
+# evict (tensor_scalar_reduce / activate2) instead of the Vector-only range_select. Same values.
+_PRIOR_FULL = _os.environ.get("LINGBOT_CTE_PRIOR_FULL", "0") == "1"
+# lingbot: LINGBOT_CTE_SCALAR_ROWMAX=1 -- unmasked MM1 evicts (scale + row max) on the Scalar Engine
+# (activate2), the rest on Vector, each engine with its own reduce chain (upstream gates this off).
+_SCALAR_ROWMAX = _os.environ.get("LINGBOT_CTE_SCALAR_ROWMAX", "0") == "1"
 _VGROUP = int(_os.environ.get("LINGBOT_CTE_VGROUP", "1"))
 # lingbot: diagnostic limits on which calls group their V loads, by V tiles (128 keys) per section:
 # e.g. MIN_TILES=8 groups only the self-attention calls (4320+ keys), MAX_TILES=7 only the
@@ -4153,7 +4160,7 @@ def _row_max_on_scalar(kvp_tile_fully_visible, diagonal_sel_mask, tile, atp: Att
     if diagonal_sel_mask:
         # The range_select form of the diagonal mask is Vector-only, like the dynamic one below.
         return not atp.static_causal_range_sel
-    if (atp.dynamic_sel_mask or tile.is_prior) and not kvp_tile_fully_visible:
+    if (atp.dynamic_sel_mask or (tile.is_prior and not _PRIOR_FULL)) and not kvp_tile_fully_visible:
         return False
     return True  # no masking
 
@@ -4271,7 +4278,7 @@ def _qk_and_max_large_tile_impl(
     # element than nisa.tensor_scalar_reduce for a PSUM read + scale + fused max, so moving the evict
     # to Scalar is slower even where Scalar is otherwise free. The placement logic is retained in
     # _row_max_on_scalar and the chaining below is engine-independent; only the engine choice is off.
-    use_scalar_row_max = False
+    use_scalar_row_max = _SCALAR_ROWMAX  # lingbot: was False
     row_max_chains = _row_max_chain_endpoints(k_tile_selections, ac, atp, qkmax_grp, use_scalar_row_max)
     for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
         tile, should_process = k_tile_selections[k_tile_idx]
@@ -4413,7 +4420,7 @@ def _qk_and_max_large_tile_impl(
             )
 
         elif (
-            atp.dynamic_sel_mask or tile.is_prior
+            atp.dynamic_sel_mask or (tile.is_prior and not _PRIOR_FULL)
         ) and not kvp_tile_fully_visible:  # dynamic (compile-time unknown) mask
             if ac.kvp_group_size > 0 and not tile.is_prior and bufs.k_threshold_sb is not None:
                 # Static mask path for interleaved KV (3 instructions)
