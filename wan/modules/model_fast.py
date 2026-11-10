@@ -186,6 +186,9 @@ assert not (_K_BLOCKED and (_KV_GATHER1 or _ATTN_SPLIT or _ATTN_REM)), \
     "LINGBOT_K_BLOCKED: the KV_GATHER1 / ATTN_SPLIT / ATTN_REM paths read K in the plain layout"
 
 
+_FILM_A2A_K = int(os.environ.get("LINGBOT_FILM_A2A_CHUNKS", "0") or 0)
+
+
 def _films_multi(raw_blocks, c_cat, K, P):
     """Every block's camera FiLM (scale, shift) for K chunks at once. c_cat is [1, K * P, C]: each
     chunk's P (padded) CP-local camera tokens in a row. One all-to-all per tensor gives every TP rank
@@ -198,10 +201,17 @@ def _films_multi(raw_blocks, c_cat, K, P):
         pair = []
         for t in b.cam_film(c_cat):                                # [1, K * P, C / n]
             c = int(t.shape[-1])
-            x = t[0].view(K, n, P // n, c).permute(1, 0, 2, 3).reshape(n * K * (P // n), c)
-            y = fc.all_to_all_single(x.contiguous(), None, None, m)    # [n * K * P/n, c]
-            y = y.view(n, K, P // n, c).permute(1, 2, 0, 3).reshape(K, P // n, n * c)
-            pair.append(y)
+            ys = []
+            # LINGBOT_FILM_A2A_CHUNKS=k: one all-to-all per k chunks. At TP4 x CP4 an all-to-all of
+            # >= 4 chunks (11.1 MB per tensor) returned wrong data while 3 (8.4 MB) and CP8's 7
+            # (9.7 MB) were right; splitting keeps every message under that size.
+            for k0 in range(0, K, _FILM_A2A_K or K):
+                kk = min(_FILM_A2A_K or K, K - k0)
+                tk = t[0, k0 * P:(k0 + kk) * P]
+                x = tk.reshape(kk, n, P // n, c).permute(1, 0, 2, 3).reshape(n * kk * (P // n), c)
+                y = fc.all_to_all_single(x.contiguous(), None, None, m)    # [n * kk * P/n, c]
+                ys.append(y.view(n, kk, P // n, c).permute(1, 2, 0, 3).reshape(kk, P // n, n * c))
+            pair.append(ys[0] if len(ys) == 1 else torch.cat(ys, 0))
         out.append(tuple(pair))
     return out
 
