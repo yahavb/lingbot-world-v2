@@ -17,7 +17,7 @@ full-window block agrees). Every number: `perf_ledger.jsonl` (read it with `tool
 
 -4.9% e2e at 4 devices against the same-layout baseline; -29% device time per video against the
 8-device deployment. Accuracy (CPU fp32 reference that also covers T5): first 9 frames 36.4 -> 39.4 dB,
-chunk-0 noise prediction rel-RMS 0.0176 -> 0.0136; gate PASS (`gate/verdict_stack.json` on the node).
+chunk-0 noise prediction rel-RMS 0.0176 -> 0.0136; gate PASS, all new flags off == `main` bit for bit (`gate/verdict_stack.json` on the node).
 TP2 x CP8 on 4 devices: 6.74 s GEN (+10%), rejected.
 
 ## Wins (all opt-in flags; same-pod A/B/A/B, noise 0.1-0.3%)
