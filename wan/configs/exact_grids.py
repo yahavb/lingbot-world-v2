@@ -31,4 +31,10 @@ EXACT_GRID_SIZES = {
     # flat but fails at cp8 on a width-derived length, and at cp4 the aspect-fitted
     # 29x52 grid, L = 1508, is the one that was measured.)
     '480*768': (480, 768),
+    # Smaller 4-device presets (TP4 x CP4): patch grids 24x40 / 26x44 / 28x44, so the per-chunk
+    # token count and the patch width both divide by 4, and the latent (48x80, 52x88, 56x88)
+    # tiles 4 x 4 for LINGBOT_VAE_2D.
+    '384*640': (384, 640),
+    '416*704': (416, 704),
+    '448*704': (448, 704),
 }

@@ -12,7 +12,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 OUT="${OUT:-/tmp/sweep}"; mkdir -p "$OUT"
 CKPT="${CKPT:?CKPT}"; NPROC="${NPROC:?NPROC}"; LNC="${LNC:?LNC}"; LAYOUTS="${LAYOUTS:?LAYOUTS}"
 REPEAT="${REPEAT:-}"
-FRAME_NUM=81; SIZE="480*768"
+FRAME_NUM=81; SIZE="${SIZE:-480*768}"
 PROMPT="gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
 
 BASE_ENV=(LINGBOT_BENCH_RUNS=${BENCH_RUNS:-2} LINGBOT_CHUNKED_KV=1 LINGBOT_COMPILE_DIT=1 COMPILE_SCOPE=blocks

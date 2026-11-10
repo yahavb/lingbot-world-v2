@@ -25,6 +25,9 @@ SIZE_CONFIGS = {
     # 480*768 exists for cp8: its forced grid is 30h x 48w, where L = 1440 and gw = 48
     # BOTH divide by 8, so flat and width sharding agree. See exact_grids.py.
     '480*768': (480, 768),
+    '384*640': (384, 640),
+    '416*704': (416, 704),
+    '448*704': (448, 704),
 }
 
 MAX_AREA_CONFIGS = {
@@ -39,6 +42,9 @@ MAX_AREA_CONFIGS = {
     '960*1664': 960 * 1664,
     '768*1152': 768 * 1152,
     '480*768': 480 * 768,
+    '384*640': 384 * 640,
+    '416*704': 416 * 704,
+    '448*704': 448 * 704,
 }
 
 SUPPORTED_SIZES = {

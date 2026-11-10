@@ -18,7 +18,7 @@ echo "=== [prof 1] system trace run ($NPROC ranks) ==="
   export NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 NEURON_RT_INSPECT_DEVICE_PROFILE=0
   export NEURON_RT_INSPECT_OUTPUT_DIR="$P/systrace"
   torchrun --nproc_per_node="$NPROC" --master_port=29742 generate.py --task i2v-A14B --infer_mode causal_fast \
-    --ckpt_dir "$CKPT" --size "480*768" --frame_num 81 --chunk_size 3 --image examples/03/image.jpg \
+    --ckpt_dir "$CKPT" --size "${SIZE:-480*768}" --frame_num 81 --chunk_size 3 --image examples/03/image.jpg \
     --action_path examples/03 --prompt "$PROMPT" --tp_degree "$TP" --cp_size "$CP" --denoise_steps 4 \
     --local_attn_size 12 --sink_size 1 --base_seed 42 --save_file "$P/out.mp4" \
     --save_latents_path "$P/latents.pt" > "$P/gen_systrace.log" 2>&1
