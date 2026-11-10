@@ -4,6 +4,8 @@ import os
 import re
 from einops import rearrange
 
+import types
+
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as fc
@@ -755,16 +757,27 @@ _ATTN_FMAJ = os.environ.get("LINGBOT_ATTN_FMAJ", "0") == "1"
 # LINGBOT_WT_PRE=1: each block's FFN and self-attn o weights also kept transposed ([in, out],
 # contiguous, made once before compile) and the feature-major matmuls take W as Wt.t(): the shared
 # block graph gets its weights as inputs, so the compiler cannot pre-transpose them as constants.
-_WT_PRE = os.environ.get("LINGBOT_WT_PRE", "0") == "1"
+_WT_PRE = os.environ.get("LINGBOT_WT_PRE", "0") in ("1", "all")
+
+
+def _linear_wt_forward(self, x):
+    """nn.Linear forward on the pre-transposed weight (LINGBOT_WT_PRE=all): x @ Wt (+ b)."""
+    y = torch.matmul(x, self._wt)
+    return y + self.bias if self.bias is not None else y
 
 
 def _pretranspose_weights(blocks):
+    _all = os.environ.get("LINGBOT_WT_PRE", "0") == "all"
     for blk in blocks:
         b_ = getattr(blk, "_orig_mod", blk)
         with torch.no_grad():
-            for lin in (b_.ffn[0], b_.ffn[2], b_.self_attn.o):
+            lins = ([m for m in b_.modules() if isinstance(m, nn.Linear)] if _all
+                    else (b_.ffn[0], b_.ffn[2], b_.self_attn.o))
+            for lin in lins:
                 if getattr(lin, "_wt", None) is None:
                     lin.register_buffer("_wt", lin.weight.t().contiguous(), persistent=False)
+                if _all:
+                    lin.forward = types.MethodType(_linear_wt_forward, lin)
 
 
 def _w(lin):
