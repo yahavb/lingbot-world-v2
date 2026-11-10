@@ -1328,6 +1328,15 @@ class WanI2VCausal:
             _dump = os.environ.get("LINGBOT_DUMP_PRED", "")
             _dump_dir, _dump_tags = (_dump.split(":", 1) + [""])[:2] if _dump else ("", "")
             _dump_tags = set(filter(None, _dump_tags.split(",")))
+            # LINGBOT_DUMP_ROLLOUT=<dir> (gate): rank 0 of the FIRST generation in the process saves
+            # every input of the rollout (initial noise, condition y, camera embedding, text context,
+            # timesteps, each per-step noise draw in use order) and each chunk's x0, so the CPU fp32
+            # reference (kiro/ref_fp32_rollout.py) replays the identical rollout. The draws are kept
+            # as device references (no sync in the loop) and copied to the host after it.
+            _roll_dir = os.environ.get("LINGBOT_DUMP_ROLLOUT", "")
+            _roll = ([] if _roll_dir and chunk_control is None and max_chunks is None
+                     and (not dist.is_initialized() or dist.get_rank() == 0)
+                     and not os.path.exists(os.path.join(_roll_dir, "rollout_inputs.pt")) else None)
 
             def _maybe_dump(tag, t_):
                 # Written once per process (the first generation): with LINGBOT_BENCH_RUNS > 1
@@ -1500,6 +1509,8 @@ class WanI2VCausal:
                         else:
                             _noise = torch.randn(x0.shape, generator=seed_g, device='cpu',
                                                  dtype=x0.dtype).to(x0.device)
+                        if _roll is not None:
+                            _roll.append(_noise)
                         _sync()
                         self._gen_phase["randn"] += time.perf_counter() - _n0
                         _a0 = time.perf_counter()
@@ -1608,6 +1619,24 @@ class WanI2VCausal:
             torch.neuron.synchronize()
             self._gen_phase["cat"] += time.perf_counter() - _t0
             memlog("generate, after chunk loop")
+            if _roll is not None:
+                os.makedirs(_roll_dir, exist_ok=True)
+                torch.save({
+                    "noise": latent.detach().float().cpu(), "y": y.detach().float().cpu(),
+                    "cam": c2ws_plucker_emb.detach().float().cpu(),
+                    "context": context[0].detach().float().cpu(),
+                    "timesteps": torch.stack([torch.as_tensor(t_).float().cpu() for t_ in timesteps]),
+                    "sigmas": self.scheduler.sigmas.detach().double().cpu(),
+                    "sched_timesteps": self.scheduler.timesteps.detach().double().cpu(),
+                    "step_noise": [n_.detach().float().cpu() for n_ in _roll],
+                    "x0": pred_latent_chunks.detach().float().cpu(),
+                    "chunk_size": chunk_size, "seq_len": max_seq_len, "frame_seqlen": frame_seqlen,
+                    "kv_size": kv_size, "max_attention_size": (kv_size if max_attention_size is None
+                                                               else max_attention_size),
+                    "n_chunks": n_chunks, "local_attn_size": self.local_attn_size,
+                    "sink_size": getattr(self, "sink_size", None),
+                }, os.path.join(_roll_dir, "rollout_inputs.pt"))
+                logging.info(f"[GATE] rollout dump -> {_roll_dir} ({len(_roll)} step draws)")
             # The last chunk's camera embedding / FiLM params cannot be hit again (the next
             # generation has new camera tensors); free them before the VAE decode needs the room.
             for _attr in ("_cam_film_cache", "_cam_emb_cache"):

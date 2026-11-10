@@ -15,7 +15,7 @@ REPEAT="${REPEAT:-}"
 FRAME_NUM=81; SIZE="480*768"
 PROMPT="gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
 
-BASE_ENV=(LINGBOT_BENCH_RUNS=2 LINGBOT_CHUNKED_KV=1 LINGBOT_COMPILE_DIT=1 COMPILE_SCOPE=blocks
+BASE_ENV=(LINGBOT_BENCH_RUNS=${BENCH_RUNS:-2} LINGBOT_CHUNKED_KV=1 LINGBOT_COMPILE_DIT=1 COMPILE_SCOPE=blocks
   LINGBOT_CP_FLAT_SEQ=1
   "NEURON_CC_FLAGS=--internal-backend-options=--disable-cb-before-global-cc"
   NKI_COMPILER_FRONTEND=tracer NEURON_FALLBACK_ENABLED=1 TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION=1
@@ -40,6 +40,9 @@ run() {  # <name> <tp> <cp>
   (
     for kv in "${LOOP_ENV[@]}"; do export "$kv"; done
     export NEURON_LOGICAL_NC_CONFIG="$LNC" LINGBOT_DUMP_PRED="$d/dump:c0s0" LINGBOT_SAVE_FRAMES="$d/frames.pt"
+    export LINGBOT_DUMP_ROLLOUT="$d/dump"   # gate inputs for kiro/ref_fp32_rollout.py (first pass only)
+    # per-config env overrides: CFG_<name>="K=V K=V" (A/B pairs in one pod)
+    _cv="CFG_${name//[^A-Za-z0-9_]/_}"; for kv in ${!_cv:-}; do export "$kv"; done
     ARGS=(--task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT" --size "$SIZE" --frame_num "$FRAME_NUM"
           --chunk_size 3 --image examples/03/image.jpg --action_path examples/03 --prompt "$PROMPT"
           --tp_degree "$tp" --cp_size "$cp" --denoise_steps 4 --local_attn_size 12 --sink_size 1 --base_seed 42)
@@ -58,13 +61,20 @@ run() {  # <name> <tp> <cp>
   vae=$(cat "$d/dec1.log" "$d/dec2.log" | grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" \
         | grep -oE "[0-9.]+$" | sort -n | head -1)
   local fps; fps=$(python3 -c "print(round($FRAME_NUM / ((${gen:-nan} + ${vae:-nan}) / 1000), 2))" 2>/dev/null)
-  echo "RESULT $name TP$tp CP$cp LNC$LNC GEN_ms=${gen:-NA} VAE_ms=${vae:-NA} fps=${fps:-NA}" | tee -a "$OUT/results.txt"
+  local runs; runs=$(grep -oE "\[BENCH\] GEN run[0-9]+ time: [0-9.]+" "$d/gen.log" | grep -oE "[0-9.]+$" | paste -sd, -)
+  echo "RESULT $name TP$tp CP$cp LNC$LNC GEN_ms=${gen:-NA} VAE_ms=${vae:-NA} fps=${fps:-NA} runs=${runs:-NA}" | tee -a "$OUT/results.txt"
+  # gate dir (scripts/validate_gate.py --mode pixels): frames + early forwards
+  mkdir -p "$d/gate"; ln -sf ../frames.pt "$d/gate/frames.pt"
+  [ -s "$d/dump/c0s0.pt" ] && ln -sf ../dump/c0s0.pt "$d/gate/forward_c0s0.pt"
+  [ -s "$d/dump/rollout_inputs.pt" ] && python3 -c "import torch,sys; r=torch.load(sys.argv[1]); torch.save(r['x0'][:, :r['chunk_size']].contiguous(), sys.argv[2])" "$d/dump/rollout_inputs.pt" "$d/gate/forward_x0c0.pt"
   grep -m3 -hE "Traceback|Error|error:" "$d/gen.log" "$d/dec1.log" | cut -c1-220
 }
 
-for L in $LAYOUTS; do run "lnc${LNC}_${L}" "${L%x*}" "${L#*x}"; done
-[ -n "$REPEAT" ] && run "lnc${LNC}_${REPEAT}_rep" "${REPEAT%x*}" "${REPEAT#*x}"
+# an entry is TPxCP or TPxCP_tag (same layout, different env via CFG_lnc<LNC>_<TPxCP>_<tag>)
+for L in $LAYOUTS; do _l="${L%%_*}"; run "lnc${LNC}_${L}" "${_l%x*}" "${_l#*x}"; done
+_l="${REPEAT%%_*}"; [ -n "$REPEAT" ] && run "lnc${LNC}_${REPEAT}_rep" "${_l%x*}" "${_l#*x}"
 
+[ "${QUALITY:-1}" = 0 ] && { echo "QUALITY=0: skipping CPU checks"; exit 0; }
 echo "=== quality ==="
 FIRST=""
 for L in $LAYOUTS; do [ -s "$OUT/lnc${LNC}_${L}/dump/c0s0_inputs.pt" ] && { FIRST="lnc${LNC}_${L}"; break; }; done
