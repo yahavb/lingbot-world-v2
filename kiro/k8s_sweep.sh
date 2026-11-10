@@ -34,6 +34,15 @@ LOOP_ENV=("${BASE_ENV[@]}"
   LINGBOT_CTE_LOCAL=1 LINGBOT_CTE_VGROUP=8 NKI_ENABLE_TRACE_CACHE=0 LINGBOT_K_BLOCKED=1
   LINGBOT_STEP_NOWRITE=1 ${EXTRA_FLAGS:-})
 
+# R_DIRS="<dir> ...": fp32 CPU decode of each gate reference's latents.pt (the CPU-only gate-ref pod
+# cannot import the Neuron-side modules), in the background while the configs run.
+for _r in ${R_DIRS:-}; do
+  [ -s "$_r/latents.pt" ] && [ ! -s "$_r/frames.pt" ] && (LINGBOT_SAVE_FRAMES="$_r/frames.pt" \
+    torchrun --nproc_per_node=1 --master_port=29749 decode_latents_width_sharded.py --task i2v-A14B \
+    --ckpt_dir "$CKPT" --latents_path "$_r/latents.pt" --save_file "$_r/out.mp4" --device cpu \
+    > "$_r/dec.log" 2>&1; echo "R decode $_r exit=$?") &
+done
+
 run() {  # <name> <tp> <cp>
   local name="$1" tp="$2" cp="$3" d="$OUT/$1"; mkdir -p "$d"
   echo "=== run $name (TP$tp x CP$cp, LNC$LNC, $NPROC ranks) ==="
