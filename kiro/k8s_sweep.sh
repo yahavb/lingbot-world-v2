@@ -55,6 +55,10 @@ run() {  # <name> <tp> <cp>
         --timing --warmup > "$d/dec$i.log" 2>&1
       echo "  dec$i exit=$?"
     done
+    # PROFILE_CFG=<entry>: system trace + NEFF/NTFF pairs of this config (kiro/e2e/profile.sh)
+    if [ -n "${PROFILE_CFG:-}" ] && [ "$name" = "lnc${LNC}_${PROFILE_CFG}" ]; then
+      CFG_DIR="$d" TP="$tp" CP="$cp" bash kiro/e2e/profile.sh 2>&1 | tee "$d/profile.txt"
+    fi
   )
   local gen vae
   gen=$(grep -oE "\[BENCH\] GEN time: [0-9.]+" "$d/gen.log" | grep -oE "[0-9.]+$" | tail -1)

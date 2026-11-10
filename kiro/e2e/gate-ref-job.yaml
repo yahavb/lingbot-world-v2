@@ -1,0 +1,64 @@
+# CPU fp32 reference R of the whole rollout for the accuracy gate (no Neuron devices):
+# kiro/ref_fp32_rollout.py on a run's LINGBOT_DUMP_ROLLOUT dump, then an fp32 CPU decode of R's
+# latents. Pin to the node that holds the dump (k8s_mkjob.py ... SRC=<e2e/<job>/<cfg>>).
+# Output: /opt/lingbot-world-v2/e2e/gate/<R_TAG>/{latents.pt, frames.pt, forward_c0s0.pt, forward_x0c0.pt}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-e2e-gate-ref
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app: lbw-e2e-gate-ref
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      containers:
+        - name: ref
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              git clone -q https://github.com/robbyant/lingbot-world-v2.git /tmp/lbw-upstream
+              cd /tmp/lingbot; echo "commit: $(git log --oneline -1); upstream: $(git -C /tmp/lbw-upstream log --oneline -1)"
+              pip install -q -r requirements_neuron.txt
+              NODE=/node-cache; CKPT=$NODE/lingbot-world-v2-14b-causal-fast
+              R=$NODE/e2e/gate/$R_TAG; mkdir -p "$R"
+              cp "$NODE/e2e/$SRC/dump/rollout_inputs.pt" "$R/" 2>/dev/null || true
+              echo "src: $SRC" > "$R/SOURCE"
+              if [ ! -s "$R/latents.pt" ]; then
+                TORCH_DEVICE_BACKEND_AUTOLOAD=0 THREADS=$THREADS python3 kiro/ref_fp32_rollout.py \
+                  "$R/rollout_inputs.pt" "$CKPT" /tmp/lbw-upstream "$R" 2>&1 | tee "$R/ref.log"
+              fi
+              if [ ! -s "$R/frames.pt" ]; then
+                LINGBOT_SAVE_FRAMES="$R/frames.pt" torchrun --nproc_per_node=1 --master_port=29751 \
+                  decode_latents_width_sharded.py --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$R/latents.pt" \
+                  --save_file "$R/out.mp4" --device cpu 2>&1 | tail -5 | tee "$R/dec.log"
+              fi
+              ls -la "$R"; echo "GATE REF DONE"
+          resources:
+            requests: {cpu: "30", memory: 200Gi}
+            limits: {cpu: "60", memory: 400Gi}
+          volumeMounts:
+            - {name: node-cache, mountPath: /node-cache}
+          env:
+            - name: BRANCH
+              value: "e2e-4dev"
+            - name: SRC
+              value: ""
+            - name: R_TAG
+              value: ""
+            - name: THREADS
+              value: "30"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+      volumes:
+        - name: node-cache
+          hostPath: {path: /opt/lingbot-world-v2, type: DirectoryOrCreate}
