@@ -174,6 +174,7 @@ _KV_ENGINE = {"hwdge_sync": nisa.engine.sync, "hwdge_act": nisa.engine.scalar}.g
 # already occupy, instead of one dma_copy per tile. Each software-DGE dma_copy costs ~0.75 us of
 # GpSimd time regardless of its size (profiled), and the per-tile copies were ~800 per call.
 _KGROUP = int(_os.environ.get("LINGBOT_CTE_KGROUP", "1"))
+_EXP_SPLIT = int(_os.environ.get("LINGBOT_CTE_EXP_SPLIT", "1"))  # lingbot: see _exp_impl
 _VGROUP = int(_os.environ.get("LINGBOT_CTE_VGROUP", "1"))
 # lingbot: diagnostic limits on which calls group their V loads, by V tiles (128 keys) per section:
 # e.g. MIN_TILES=8 groups only the self-attention calls (4320+ keys), MAX_TILES=7 only the
@@ -3514,6 +3515,11 @@ def _exp_impl(
     # The matching Scalar-Engine row-max evict in _qk_and_max_large_tile_impl is gated off
     # (use_scalar_row_max is False), so only the Vector exp side is live.
     use_vector_exp = bufs.mm1_running_max_pos is not None
+    # lingbot: LINGBOT_CTE_EXP_SPLIT=N > 1 sends every N-th Q group's exp to the Scalar Engine (the
+    # nisa.activation path below, as used when a tile count is odd). In the TP4 x CP4 DiT block the
+    # kernel is Vector-bound (exp + row max + range_select ~1.2 of 1.68 ms) while Scalar is 27% busy.
+    if use_vector_exp and _EXP_SPLIT > 1 and grp_i % _EXP_SPLIT == _EXP_SPLIT - 1:
+        use_vector_exp = False
     if use_vector_exp:
         # Per Q group, not per tile: mm1_running_max[:, grp_i] is settled before this group's exp runs.
         exp_max_tile = bufs.mm1_running_max_pos[:num_p, grp_i : grp_i + 1]
