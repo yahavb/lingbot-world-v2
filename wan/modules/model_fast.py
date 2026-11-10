@@ -752,16 +752,36 @@ _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
 _ATTN_FMAJ = os.environ.get("LINGBOT_ATTN_FMAJ", "0") == "1"
 
 
+# LINGBOT_WT_PRE=1: each block's FFN and self-attn o weights also kept transposed ([in, out],
+# contiguous, made once before compile) and the feature-major matmuls take W as Wt.t(): the shared
+# block graph gets its weights as inputs, so the compiler cannot pre-transpose them as constants.
+_WT_PRE = os.environ.get("LINGBOT_WT_PRE", "0") == "1"
+
+
+def _pretranspose_weights(blocks):
+    for blk in blocks:
+        b_ = getattr(blk, "_orig_mod", blk)
+        with torch.no_grad():
+            for lin in (b_.ffn[0], b_.ffn[2], b_.self_attn.o):
+                if getattr(lin, "_wt", None) is None:
+                    lin.register_buffer("_wt", lin.weight.t().contiguous(), persistent=False)
+
+
+def _w(lin):
+    wt = getattr(lin, "_wt", None)
+    return wt.t() if wt is not None else lin.weight
+
+
 def _ffn_feature_major(ffn, h):
     m = tp.mesh_submesh("tp")
     n = m.size()
     S, C = int(h.shape[1]), int(h.shape[2])
     g = fc.all_gather_tensor(h[0].t().contiguous(), 0, m).view(n, C, S)     # [n, C, S]
-    u = torch.matmul(ffn[0].weight, g)
+    u = torch.matmul(_w(ffn[0]), g)
     if ffn[0].bias is not None:
         u = u + ffn[0].bias.view(-1, 1)
     u = ffn[1](u)
-    y = torch.matmul(ffn[2].weight, u)                                         # [n, C, S] partial
+    y = torch.matmul(_w(ffn[2]), u)                                            # [n, C, S] partial
     if ffn[2].bias is not None:
         y = y + ffn[2].bias.view(-1, 1)
     yd = y.dtype
@@ -1455,7 +1475,7 @@ class CausalWanSelfAttention(nn.Module):
         nd, L = int(xt.shape[0]) * int(xt.shape[1]), int(xt.shape[2])
         S = L // nt
         x3 = xt.reshape(nd, nt, S).permute(1, 0, 2)                       # [nt, nd, S] view
-        y = torch.matmul(self.o.weight, x3)                                # [nt, C, S]
+        y = torch.matmul(_w(self.o), x3)                                   # [nt, C, S]
         if self.o.bias is not None:
             y = y + self.o.bias.view(-1, 1)
         yd = y.dtype
@@ -2947,6 +2967,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # previous behaviour.
         if _QKV_FUSED:
             _fuse_qkv_weights(self.blocks)
+        if _WT_PRE:
+            _pretranspose_weights(self.blocks)
         _scope = os.environ.get("COMPILE_SCOPE", "blocks").strip().lower()
         if _scope in ("block", "blocks"):
             _n = _PROFILE_BLOCK_CAP or len(self.blocks)
