@@ -8,7 +8,7 @@ c = duckdb.connect()
 rows = c.execute(f"""select start_ts, end_ts, engine,
   coalesce(nki_source_location, bir_debug_info_source_location, '') src, opcode,
   coalesce(spill_save_bytes,0), coalesce(spill_reload_bytes,0)
-  from read_parquet('{d}/pq/BirInstruction_*.parquet') where pcore_idx = 0""").fetchall()
+  from read_parquet('{d}/pq/Instruction.parquet') where coalesce(pcore_idx, 0) = 0""").fetchall()
 t0 = min(r[0] for r in rows); t1 = max(r[1] for r in rows)
 print(f"pcore0 window {(t1 - t0) / 1e6:.3f} ms, {len(rows)} instructions")
 def grp(src, op):
