@@ -702,6 +702,19 @@ def _tp_rms_norm(x, weight, eps, full_dim):
     return (x_f * rms).type_as(x) * weight
 
 
+_QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
+
+
+def _tp_rms_norm_qk(q, k, wq, wk, eps, full_dim):
+    """_tp_rms_norm of q and of k with one all-reduce of both local sums of squares."""
+    qf, kf = q.float(), k.float()
+    ss = torch.cat([qf.pow(2).sum(dim=-1, keepdim=True), kf.pow(2).sum(dim=-1, keepdim=True)], -1)
+    ss = tp.all_reduce_fn(ss, "tp") if tp.has_mesh() else tp.all_reduce(ss, _TP_GROUP)
+    rq = torch.rsqrt(ss[..., 0:1] / full_dim + eps)
+    rk = torch.rsqrt(ss[..., 1:2] / full_dim + eps)
+    return (qf * rq).type_as(q) * wq, (kf * rk).type_as(k) * wk
+
+
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -805,7 +818,13 @@ class CausalWanSelfAttention(nn.Module):
                 k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
                 v = self.v(xk).view(b, s, n, d)
                 return q, k, v
-            if getattr(self, 'tp_enabled', False) and self.qk_norm:
+            if getattr(self, 'tp_enabled', False) and self.qk_norm and _QK_AR1:
+                # LINGBOT_QK_AR1=1: the Q and K RMSNorm sums of squares in ONE TP all-reduce
+                # (same per-row sums as two _tp_rms_norm calls, one collective fewer per block).
+                q, k = _tp_rms_norm_qk(self.q(x), self.k(x), self.norm_q.weight, self.norm_k.weight,
+                                       self.eps, self.dim)
+                q, k = q.view(b, s, n, d), k.view(b, s, n, d)
+            elif getattr(self, 'tp_enabled', False) and self.qk_norm:
                 q = _tp_rms_norm(self.q(x), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
                 k = _tp_rms_norm(self.k(x), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
             else:
