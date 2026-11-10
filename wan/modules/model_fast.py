@@ -703,6 +703,27 @@ def _tp_rms_norm(x, weight, eps, full_dim):
 
 
 _QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
+# LINGBOT_QKV_FUSED=1: self-attention Q, K, V as ONE matmul on a [Wq; Wk; Wv] buffer (q/k/v
+# weights become views into it, no extra memory). The block profile charged ~0.3 ms of compiler
+# transposes to EACH of the three projections of the same all-gathered input.
+_QKV_FUSED = os.environ.get("LINGBOT_QKV_FUSED", "0") == "1"
+
+
+def _fuse_qkv_weights(blocks):
+    for blk in blocks:
+        sa = getattr(blk, "_orig_mod", blk).self_attn
+        if getattr(sa, "_wqkv", None) is not None or sa.q.bias is None:
+            continue
+        with torch.no_grad():
+            w = torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0).contiguous()
+            bb = torch.cat([sa.q.bias, sa.k.bias, sa.v.bias], 0).contiguous()
+            nq, nk = sa.q.weight.shape[0], sa.k.weight.shape[0]
+            sa.register_buffer("_wqkv", w, persistent=False)
+            sa.register_buffer("_bqkv", bb, persistent=False)
+            for lin, lo, hi in ((sa.q, 0, nq), (sa.k, nq, nq + nk), (sa.v, nq + nk, w.shape[0])):
+                lin.weight = nn.Parameter(w[lo:hi], requires_grad=False)
+                lin.bias = nn.Parameter(bb[lo:hi], requires_grad=False)
+            sa._qkv_split = (nq, nk, w.shape[0] - nq - nk)
 
 
 def _tp_rms_norm_qk(q, k, wq, wk, eps, full_dim):
@@ -818,6 +839,13 @@ class CausalWanSelfAttention(nn.Module):
                 k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
                 v = self.v(xk).view(b, s, n, d)
                 return q, k, v
+            if (getattr(self, 'tp_enabled', False) and self.qk_norm
+                    and getattr(self, "_wqkv", None) is not None):
+                qkv = torch_F.linear(x, self._wqkv, self._bqkv)
+                nq, nk, nv = self._qkv_split
+                q = _tp_rms_norm(qkv[..., :nq], self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                k = _tp_rms_norm(qkv[..., nq:nq + nk], self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                return q, k, qkv[..., nq + nk:].reshape(b, s, n, d)
             if getattr(self, 'tp_enabled', False) and self.qk_norm and _QK_AR1:
                 # LINGBOT_QK_AR1=1: the Q and K RMSNorm sums of squares in ONE TP all-reduce
                 # (same per-row sums as two _tp_rms_norm calls, one collective fewer per block).
@@ -2795,6 +2823,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
         #
         # Default 'blocks' to match the reference implementation. COMPILE_SCOPE=block_stack restores the
         # previous behaviour.
+        if _QKV_FUSED:
+            _fuse_qkv_weights(self.blocks)
         _scope = os.environ.get("COMPILE_SCOPE", "blocks").strip().lower()
         if _scope in ("block", "blocks"):
             _n = _PROFILE_BLOCK_CAP or len(self.blocks)
