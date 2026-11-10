@@ -102,6 +102,13 @@ if [ -n "${VAE_CFGS:-}" ]; then
           --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$_lat" --save_file "$vd/out.mp4" \
           --timing --warmup > "$vd/dec$i.log" 2>&1
       done
+      if [ -n "${VAE_SYSTRACE:-}" ] && [ "$vn" = "$VAE_SYSTRACE" ]; then   # runtime system trace of a 3rd decode
+        NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 NEURON_RT_INSPECT_DEVICE_PROFILE=0 \
+        NEURON_RT_INSPECT_OUTPUT_DIR="$vd/systrace" torchrun --nproc_per_node="$NPROC" --master_port=29740 \
+          decode_latents_width_sharded.py --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$_lat" \
+          --save_file "$vd/out.mp4" --timing --warmup > "$vd/dec_systrace.log" 2>&1
+        cp -r /tmp/neff_cache "$vd/neff_cache" 2>/dev/null
+      fi
     )
     v=$(cat "$vd"/dec*.log | grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" | grep -oE "[0-9.]+$" | sort -n | head -1)
     echo "VAERESULT $vn ${vkv} VAE_ms=${v:-NA}" | tee -a "$OUT/results.txt"
