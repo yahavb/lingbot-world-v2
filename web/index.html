@@ -65,6 +65,11 @@
   <label for="prompt">Prompt (sent with Start; "Send prompt" switches it live)</label>
   <textarea id="prompt" rows="4"></textarea>
   <div class="row"><button id="sendPrompt">Send prompt</button></div>
+  <div class="row" role="group" aria-label="Content check">
+    <button id="describe">What does Muse Glimmer see?</button>
+    <label><input type="checkbox" id="autoDescribe"> every 10 s</label>
+  </div>
+  <p id="caption" aria-live="polite"></p>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -222,6 +227,22 @@ document.addEventListener("keydown", (e) => {
   if (a) { e.preventDefault(); act(a); }
 });
 window.addEventListener("pagehide", () => navigator.sendBeacon && navigator.sendBeacon("api/stop"));
+// Content eval: Muse-Glimmer-30B describes the last ~3 s of the stream (/api/describe).
+let describing = false;
+async function describe() {
+  if (describing) return;
+  describing = true;
+  $("caption").textContent = "Muse Glimmer is looking...";
+  try {
+    const r = await fetch("api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const j = await r.json();
+    $("caption").textContent = r.ok ? `Muse Glimmer: ${j.text}` : `Muse Glimmer: ${j.detail || r.status}`;
+  } catch (e) {
+    $("caption").textContent = `Muse Glimmer: ${e.message}`;
+  } finally { describing = false; }
+}
+$("describe").addEventListener("click", describe);
+setInterval(() => { if ($("autoDescribe").checked && abort) describe(); }, 10000);
 loadScenes();
 requestAnimationFrame(tick);
 </script>

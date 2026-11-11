@@ -36,13 +36,16 @@ spec:
               set -e
               DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /app
-              pip install -q --root-user-action=ignore --disable-pip-version-check fastapi uvicorn httpx
+              pip install -q --root-user-action=ignore --disable-pip-version-check fastapi uvicorn httpx imageio imageio-ffmpeg numpy pillow
               exec python -u /app/web_app.py
           env:
             - name: BRANCH
               value: "main"
+            # in-pod bind; the Service is ClusterIP and nothing is published (kubectl port-forward)
             - name: HOST
               value: "0.0.0.0"
+            - name: VLM_URL
+              value: "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1"
             - name: LBW_URL
               value: "http://lbw-v2-dit-t5.default.svc.cluster.local:8000"
           ports:
