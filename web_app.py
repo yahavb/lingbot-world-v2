@@ -29,9 +29,15 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 VLM_URL = os.environ.get("VLM_URL", "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1")
 VLM_MODEL = os.environ.get("VLM_MODEL", "meta-models/Muse-Glimmer-30B")
-VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "384"))
-DESCRIBE_FRAMES = int(os.environ.get("DESCRIBE_FRAMES", "48"))      # ~3 s of the stream
-DEFAULT_QUESTION = "Describe what you see in this video in one or two sentences."
+VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "192"))
+# Small inputs keep Muse-Glimmer fast: the newest chunk only (12 frames, ~0.75 s at 16 fps),
+# downscaled to DESCRIBE_WIDTH, plus the session's prompt as text so it can say whether it matches.
+DESCRIBE_FRAMES = int(os.environ.get("DESCRIBE_FRAMES", "12"))
+DESCRIBE_WIDTH = int(os.environ.get("DESCRIBE_WIDTH", "352"))
+QUESTION = ('This short clip was generated from the prompt: "{prompt}". In one sentence, say what '
+            "you see, then say whether it matches the prompt.")
+QUESTION_NO_PROMPT = "In one sentence, say what you see in this short clip."
+state = {"prompt": ""}
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EXAMPLES = os.path.join(ROOT, "examples")
 SCENES = [
@@ -87,6 +93,7 @@ async def session(request: Request):
     if body.get("scene") not in dict(SCENES):
         raise HTTPException(status_code=400, detail="unknown scene")
     body["live"] = True
+    state["prompt"] = body.get("prompt") or scene_prompt(body["scene"])
     req = client.build_request("POST", "/session", json=body)
     r = await client.send(req, stream=True)
     if r.status_code != 200:
@@ -119,19 +126,26 @@ async def session(request: Request):
 
 @app.post("/api/control")
 async def control(request: Request):
-    r = await client.post("/control", json=await request.json())
+    body = await request.json()
+    if body.get("prompt"):
+        state["prompt"] = body["prompt"]
+    r = await client.post("/control", json=body)
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
-def frames_to_mp4(frames_b64, fps=16):
-    """Base64 JPEG frames -> mp4 bytes (H.264 via imageio-ffmpeg)."""
+def frames_to_mp4(frames_b64, fps=16, width=None):
+    """Base64 JPEG frames -> mp4 bytes (H.264 via imageio-ffmpeg), optionally downscaled."""
     import imageio.v2 as imageio
     import numpy as np
     from PIL import Image
     with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
         w = imageio.get_writer(f.name, fps=fps, codec="libx264", quality=7, macro_block_size=16)
         for b in frames_b64:
-            w.append_data(np.asarray(Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB")))
+            im = Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB")
+            if width and im.width > width:
+                h = int(round(im.height * width / im.width / 16)) * 16
+                im = im.resize((width, h), Image.BILINEAR)
+            w.append_data(np.asarray(im))
         w.close()
         return open(f.name, "rb").read()
 
@@ -151,11 +165,13 @@ def vlm_answer(msg):
 async def describe(request: Request):
     """What Muse-Glimmer sees in the last ~3 s of the stream."""
     body = await request.json() if (await request.body()) else {}
-    question = (body.get("question") or DEFAULT_QUESTION)[:500]
+    prompt = state["prompt"]
+    question = (body.get("question") or (QUESTION.format(prompt=prompt[:600]) if prompt
+                                         else QUESTION_NO_PROMPT))[:1000]
     frames = list(recent)
     if len(frames) < 8:
         raise HTTPException(status_code=409, detail="not enough frames yet; start a session")
-    mp4 = await asyncio.to_thread(frames_to_mp4, frames)
+    mp4 = await asyncio.to_thread(frames_to_mp4, frames, 16, DESCRIBE_WIDTH)
     req = {"model": VLM_MODEL, "temperature": 0, "max_tokens": VLM_MAX_TOKENS,
            "messages": [{"role": "system", "content": "Reasoning strength: low"},
                         {"role": "user", "content": [
@@ -167,7 +183,8 @@ async def describe(request: Request):
         r.raise_for_status()
     except httpx.HTTPError as exc:
         return JSONResponse({"detail": f"Muse-Glimmer unreachable: {exc}"}, status_code=502)
-    return {"text": vlm_answer(r.json()["choices"][0]["message"]), "frames": len(frames)}
+    return {"text": vlm_answer(r.json()["choices"][0]["message"]), "frames": len(frames),
+            "prompt": prompt}
 
 
 @app.post("/api/stop")
