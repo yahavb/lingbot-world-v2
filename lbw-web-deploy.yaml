@@ -1,4 +1,4 @@
-# 4-device demo front end (StatefulSet: pod lbw-web-0) for lbw-4dev.yaml; Service ClusterIP only.
+# 4-device demo front end (StatefulSet: pod lbw-web-0) for lbw-deploy.yaml; Service ClusterIP only.
 # Live, steerable front end (web_app.py + web/index.html) for lbw-v2-dit-t5. ClusterIP only:
 #   kubectl port-forward svc/lbw-web 7860:7860   then open http://localhost:7860
 apiVersion: v1
