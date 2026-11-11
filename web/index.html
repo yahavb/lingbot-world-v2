@@ -67,7 +67,8 @@
   <div class="row"><button id="sendPrompt">Send prompt</button></div>
   <div class="row" role="group" aria-label="Content check">
     <button id="describe">What does Muse Glimmer see?</button>
-    <label><input type="checkbox" id="autoDescribe"> every few seconds</label>
+    <label><input type="checkbox" id="autoDescribe"> keep describing</label>
+    <label><input type="checkbox" id="checkPrompt"> compare with the prompt (slower)</label>
   </div>
   <p id="caption" aria-live="polite"></p>
 </main>
@@ -234,7 +235,7 @@ async function describe() {
   describing = true;
   $("caption").textContent = "Muse Glimmer is looking...";
   try {
-    const r = await fetch("api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const r = await fetch("api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ check: $("checkPrompt").checked }) });
     const j = await r.json();
     $("caption").textContent = r.ok ? `Muse Glimmer: ${j.text}` : `Muse Glimmer: ${j.detail || r.status}`;
   } catch (e) {

@@ -168,8 +168,10 @@ async def describe(request: Request):
     """What Muse-Glimmer sees in the last ~3 s of the stream."""
     body = await request.json() if (await request.body()) else {}
     prompt = state["prompt"]
-    question = (body.get("question") or (QUESTION.format(prompt=prompt[:600]) if prompt
-                                         else QUESTION_NO_PROMPT))[:1000]
+    # Default: the fast description (~10 s). check=true also asks "matches"/"differs" for the
+    # session prompt (~20 s: the comparison doubles the model's reasoning).
+    question = (body.get("question") or (QUESTION.format(prompt=prompt[:600])
+                                         if (body.get("check") and prompt) else QUESTION_NO_PROMPT))[:1000]
     frames = list(recent)
     if len(frames) < 8:
         raise HTTPException(status_code=409, detail="not enough frames yet; start a session")
