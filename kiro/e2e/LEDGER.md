@@ -15,7 +15,7 @@ full-window block agrees). Every number: `perf_ledger.jsonl` (read it with `tool
 | q20 at TP4 x CP4 (`l-lnc2`, FILM_ALL=0: see below) | 4 | 6.10 | 0.63 | 6.73 | 12.0 | 32.1% | 26.9 |
 | first stack (`lbw-v2-i2v-4dev-job.yaml`) | 4 | 5.77 | 0.63 | 6.40 | 12.7 | 33.9% | 25.6 |
 | + feature-major FFN / attention output, pre-transposed weights, 480x768 | 4 | 5.39 | 0.63 | 6.02 | 13.5 | 36.0% | 24.1 |
-| **same flags at 448x704 (user approved), `lbw-v2-dit-t5-4dev-deploy.yaml`** | 4 | **4.43** | 0.63 | **5.06** | **16.0** | - | **20.2** |
+| **same flags at 448x704 (user approved), `lbw-deploy.yaml`** | 4 | **4.43** | 0.63 | **5.06** | **16.0** | - | **20.2** |
 | same flags at 416x704 / 384x640 (before the last two flags) | 4 | 4.35 / 3.80 | 0.56 / 0.44 | 4.91 / 4.24 | 16.5 / 19.1 | - | - |
 
 -4.9% e2e at 4 devices against the same-layout baseline; -29% device time per video against the
