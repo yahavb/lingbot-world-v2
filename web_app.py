@@ -31,13 +31,11 @@ VLM_URL = os.environ.get("VLM_URL", "http://muse-glimmer-30b-vllm.default.svc.cl
 VLM_MODEL = os.environ.get("VLM_MODEL", "meta-models/Muse-Glimmer-30B")
 VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "256"))
 # Small inputs keep Muse-Glimmer fast: the newest chunk only (12 frames, ~0.75 s at 16 fps),
-# downscaled to DESCRIBE_WIDTH, plus the session's prompt as text so it can say whether it matches.
+# downscaled to DESCRIBE_WIDTH, and a short question (the answer takes ~10 s).
 DESCRIBE_FRAMES = int(os.environ.get("DESCRIBE_FRAMES", "12"))
 DESCRIBE_WIDTH = int(os.environ.get("DESCRIBE_WIDTH", "352"))
 # Short questions keep the model's reasoning short (~10 tokens/s on one device; the reasoning is
 # most of the output): measured 108 tokens / 10 s for "In at most 15 words, what do you see?".
-QUESTION = ('In at most 12 words, what do you see? Then one word, "matches" or "differs", for this '
-            'prompt: "{prompt}"')
 QUESTION_NO_PROMPT = "In at most 12 words, what do you see?"
 state = {"prompt": ""}
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -166,12 +164,8 @@ def vlm_answer(msg):
 @app.post("/api/describe")
 async def describe(request: Request):
     """What Muse-Glimmer sees in the last ~3 s of the stream."""
-    body = await request.json() if (await request.body()) else {}
     prompt = state["prompt"]
-    # Default: the fast description (~10 s). check=true also asks "matches"/"differs" for the
-    # session prompt (~20 s: the comparison doubles the model's reasoning).
-    question = (body.get("question") or (QUESTION.format(prompt=prompt[:600])
-                                         if (body.get("check") and prompt) else QUESTION_NO_PROMPT))[:1000]
+    question = QUESTION_NO_PROMPT
     frames = list(recent)
     if len(frames) < 8:
         raise HTTPException(status_code=409, detail="not enough frames yet; start a session")
