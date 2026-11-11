@@ -1,5 +1,6 @@
 # 4-DEVICE TEST variant (l-lnc2, 16 ranks, TP4 x CP4, 448x704, VAE inline on the same ranks), the
-# kiro/e2e/LEDGER.md flags. Same Service name as lbw-v2-dit-t5-deploy.yaml: run one or the other.
+# kiro/e2e/LEDGER.md flags. StatefulSet so the pod is just lbw-0; Service lbw (ClusterIP). The web
+# front end is lbw-web.yaml.
 # Original header follows.
 # DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
 # with the q20_kbnw flags -- the half-instance row of kiro/LOOP_ENGINEERING.md (17.88 fps with an
@@ -10,29 +11,28 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: lbw-v2-dit-t5
+  name: lbw
 spec:
   selector:
-    app: lbw-v2-dit-t5
+    app: lbw
   ports:
     - port: 8000
       targetPort: 8000
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
-  name: lbw-v2-dit-t5
+  name: lbw
 spec:
+  serviceName: lbw
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
-      app: lbw-v2-dit-t5
+      app: lbw
   template:
     metadata:
       labels:
-        app: lbw-v2-dit-t5
+        app: lbw
     spec:
       nodeSelector:
         node-type: trn3-dev1
