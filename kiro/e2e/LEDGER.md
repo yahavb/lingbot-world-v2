@@ -13,7 +13,10 @@ full-window block agrees). Every number: `perf_ledger.jsonl` (read it with `tool
 |---|---|---|---|---|---|---|---|
 | deployed q20_kbnw, TP4 x CP8 (`xl-lnc2`) | 8 | 4.08 | 0.42 | 4.50 | 18.0 | 24.1% | 36.0 |
 | q20 at TP4 x CP4 (`l-lnc2`, FILM_ALL=0: see below) | 4 | 6.10 | 0.63 | 6.73 | 12.0 | 32.1% | 26.9 |
-| **this push, best (`lbw-v2-i2v-4dev-job.yaml`)** | 4 | **5.77** | 0.63 | **6.40** | **12.7** | **33.9%** | **25.6** |
+| first stack (`lbw-v2-i2v-4dev-job.yaml`) | 4 | 5.77 | 0.63 | 6.40 | 12.7 | 33.9% | 25.6 |
+| + feature-major FFN / attention output, pre-transposed weights, 480x768 | 4 | 5.39 | 0.63 | 6.02 | 13.5 | 36.0% | 24.1 |
+| **same flags at 448x704 (user approved), `lbw-v2-dit-t5-4dev-deploy.yaml`** | 4 | **4.43** | 0.63 | **5.06** | **16.0** | - | **20.2** |
+| same flags at 416x704 / 384x640 (before the last two flags) | 4 | 4.35 / 3.80 | 0.56 / 0.44 | 4.91 / 4.24 | 16.5 / 19.1 | - | - |
 
 -4.9% e2e at 4 devices against the same-layout baseline; -29% device time per video against the
 8-device deployment. Accuracy (CPU fp32 reference that also covers T5): first 9 frames 36.4 -> 39.4 dB,
@@ -29,6 +32,8 @@ TP2 x CP8 on 4 devices: 6.74 s GEN (+10%), rejected.
 | `LINGBOT_BLOCK_GROUP=2` | 2 DiT blocks per compiled graph (cross-block overlap) | -1.2% | within the approved base's error |
 | `LINGBOT_FILM_ALL_BLOCKS=10 LINGBOT_FILM_ALL_CHUNKS=3` | all-chunk camera FiLM in graphs of 10 blocks x 3 chunks | -0.6% | within the approved base's error |
 | `LINGBOT_T5_FP32=1` | fp32 T5 encode (once per prompt, before GEN) | 0 | context 3.5% -> fp32; first-9-frame PSNR +2.6 dB |
+| `LINGBOT_FFN_FMAJ=1` | SP FFN feature-major: transpose only the rank's 272-token shard, gather [n, C, S], W @ x, reduce-scatter on dim 0 | -2.6% | gate PASS |
+| `LINGBOT_ATTN_FMAJ=1` + `LINGBOT_WT_PRE=1` | attention kernel tp_out (d-major output) into a d-major o-projection; FFN/o weights kept transposed (the shared block graphs take weights as inputs, so the compiler transposed them every call) | -3.8% | gate PASS at 480; at 448 G1 -0.9 dB (user approved by eye) |
 | `LINGBOT_VAE_GATHER1=1` | one all-gather + one host copy of the decoded tiles (was per frame) | 0 (outside the VAE timer): frames on host 0.32 s sooner (651 -> 330 ms) | bit-identical frames |
 
 Stack of the last four on top of EXP_SPLIT: 5.765 / 5.765 s vs 5.863 / 5.860 s.
@@ -51,6 +56,9 @@ Stack of the last four on top of EXP_SPLIT: 5.765 / 5.765 s vs 5.863 / 5.860 s.
 | BLOCK_GROUP 4 | same speed as 2 |
 | one explicit transpose of the QKV input (`LINGBOT_QKV_XT`) | +0.5% |
 | `LINGBOT_TOKEN_PAD` 128 / 512 | +2.5% / +9% (32 stays) |
+| `LINGBOT_WT_PRE=all` (every block Linear) | slower than =1 at 480 and 448 (15.7 vs 16.0 fps) |
+| attention-kernel K/V DMA knobs at CP4 (hwdge sync/act, VGROUP 16, V double buffer) | 0 to +2.4% |
+| VAE frames per step at 448 (3/4/10) | 627-647 ms vs 630 |
 | "VAE is host-bound" | wrong window: the steady decode is 97% device-busy; the host-bound part was the frame gather after the timer (fixed by VAE_GATHER1) |
 
 ## Where the time goes now (`BOTTLENECKS.md`)
@@ -65,6 +73,13 @@ Untested, ranked: (1) feature-major activations in the block (removes most of th
 rewrite of the SP block, norms and RoPE); (2) attention kernel: exp read straight from PSUM and fewer
 Vector copies (~0.3 s); (3) skip the last block's attention/FFN on the 6 cache-commit forwards (exact,
 ~0.35%); (4) fp32 T5 in `serve.py` (not wired; the streaming server builds its own T5).
+
+## Demo: Muse-Glimmer content check
+
+`web_app.py` keeps the newest 12 frames of the live stream; `POST /api/describe` encodes them (352 px wide)
+as an mp4 and asks Muse-Glimmer-30B (VLM_URL, cluster-internal Service) what it sees (~10 s: the model
+decodes ~11 tokens/s and reasons first, so questions are kept short); with `check` it also says whether
+the clip matches the session prompt (~20 s). The page has a button and a "keep describing" mode.
 
 ## Accuracy gate
 

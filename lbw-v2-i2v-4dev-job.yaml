@@ -158,7 +158,7 @@ spec:
             - name: LINGBOT_HOT_ATTN
               value: "cte"
             - name: BRANCH
-              value: "e2e-4dev"
+              value: "main"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: KEEP_ALIVE_SECONDS

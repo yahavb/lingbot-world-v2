@@ -150,7 +150,7 @@ spec:
             - name: LINGBOT_T5_FP32
               value: "1"
             - name: BRANCH
-              value: "e2e-4dev"
+              value: "main"
             - name: SEG_CHUNKS
               value: "14"
             - name: PYTHONUNBUFFERED
