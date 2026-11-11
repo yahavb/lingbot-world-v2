@@ -39,6 +39,20 @@ spec:
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: l-lnc2
+      initContainers:
+        - name: neuron-healthcheck   # as wan2-i2v-14b-deploy.yaml: fail the pod early on a bad device
+          image: public.ecr.aws/neuron/neuron-observer:0.2.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              ls /dev/neuron*
+              neuron-observer health-check --test matmul
+          env:
+            - name: NEURON_RT_ALLOW_LEGACY_NEFF
+              value: "1"
+          resources:
+            claims:
+              - name: neuroncores
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
