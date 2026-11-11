@@ -29,14 +29,16 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 VLM_URL = os.environ.get("VLM_URL", "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1")
 VLM_MODEL = os.environ.get("VLM_MODEL", "meta-models/Muse-Glimmer-30B")
-VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "192"))
+VLM_MAX_TOKENS = int(os.environ.get("VLM_MAX_TOKENS", "256"))
 # Small inputs keep Muse-Glimmer fast: the newest chunk only (12 frames, ~0.75 s at 16 fps),
 # downscaled to DESCRIBE_WIDTH, plus the session's prompt as text so it can say whether it matches.
 DESCRIBE_FRAMES = int(os.environ.get("DESCRIBE_FRAMES", "12"))
 DESCRIBE_WIDTH = int(os.environ.get("DESCRIBE_WIDTH", "352"))
-QUESTION = ('This short clip was generated from the prompt: "{prompt}". In one sentence, say what '
-            "you see, then say whether it matches the prompt.")
-QUESTION_NO_PROMPT = "In one sentence, say what you see in this short clip."
+# Short questions keep the model's reasoning short (~10 tokens/s on one device; the reasoning is
+# most of the output): measured 108 tokens / 10 s for "In at most 15 words, what do you see?".
+QUESTION = ('In at most 12 words, what do you see? Then one word, "matches" or "differs", for this '
+            'prompt: "{prompt}"')
+QUESTION_NO_PROMPT = "In at most 12 words, what do you see?"
 state = {"prompt": ""}
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EXAMPLES = os.path.join(ROOT, "examples")
