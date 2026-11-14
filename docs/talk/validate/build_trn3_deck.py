@@ -28,7 +28,7 @@ orig = open(args.orig, encoding="utf-8").read()
 first = orig.rfind("<", 0, orig.index('data-ref="S0"'))
 last_ref = [m.start() for m in re.finditer(r'data-ref="', orig)][-1]
 k = orig.find("<script", last_ref)
-end_cells = orig.rfind("</div></div>", 0, k) + len("</div></div>")
+end_cells = orig.index("</div><!-- /stage -->", last_ref)   # keep the stage close, #jump, #hud and #notes in SUFFIX
 PREFIX, SUFFIX = orig[:first], orig[end_cells:]
 
 
