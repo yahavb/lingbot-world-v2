@@ -2918,15 +2918,15 @@ requestAnimationFrame(tick);
 
 <!-- ═══════════════════════════ B6b · backup: one kernel call per chunk, merged exactly ═══════════════════════════ -->
 <div class="cell" data-ref="B6b"><section class="slide">
-  <h1>Backup: one kernel call per chunk, merged exactly</h1>
+  <h1>Backup: don’t copy the memory, read it in place</h1>
   <div class="body">
 <div class="stack" style="gap:12px">
-  <div class="anim" style="width:90%;margin:0 auto;height:auto;aspect-ratio:1600/560"><iframe title="Animation: one kernel call per chunk, rescaled to the global max: the same weights as one softmax over all keys" aria-label="Animation: one kernel call per chunk, rescaled to the global max: the same weights as one softmax over all keys" tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
+  <div class="anim" style="width:90%;margin:0 auto;height:auto;aspect-ratio:1600/560"><iframe title="Animation: copying the memory before every call is slow; reading each chunk in place and merging the notes exactly gives the same answer, faster" aria-label="Animation: copying the memory before every call is slow; reading each chunk in place and merging the notes exactly gives the same answer, faster" tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
 &lt;html lang=&quot;en&quot;&gt;
 &lt;head&gt;
 &lt;meta charset=&quot;utf-8&quot;&gt;
 &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
-&lt;title&gt;Attention chunk by chunk, merged into one softmax&lt;/title&gt;
+&lt;title&gt;Copying the memory before every call vs reading it in place&lt;/title&gt;
 &lt;style&gt;
   html,body{margin:0;height:100%;background:#141416;overflow:hidden}
   svg{display:block;width:100vw;height:100vh}
@@ -2935,16 +2935,10 @@ requestAnimationFrame(tick);
 &lt;/head&gt;
 &lt;body&gt;
 &lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 560&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
-     aria-label=&quot;One query attends three cached chunks of keys. Each chunk gets its own kernel call, which reads the chunk in place and scales its attention weights to the chunk&#x27;s own maximum, so the tallest bar of every chunk has the same height. The merge rescales each chunk to the global maximum: chunk 2 holds it and keeps its height, chunks 1 and 3 shrink by 0.37 and 0.17. The rescaled bars then match, bar for bar, the weights of one softmax over all twelve keys.&quot;&gt;
+     aria-label=&quot;The model&#x27;s memory holds three chunks of keys. Old way: before every attention call, all three chunks are copied into one new buffer padded with zeros, which is slow and lets the zeros into the softmax. New way: each chunk is read where it already is and gives a small note; the notes are rescaled by 1, 0.37 and 0.17 and added, which is exactly one softmax. Then two chunks go into one call, so there are fewer calls. Measured on 8 trn3 chips: 7.37 s, then 4.34 s, then 4.08 s per video.&quot;&gt;
   &lt;defs&gt;
-    &lt;filter id=&quot;glow&quot; x=&quot;-20%&quot; y=&quot;-60%&quot; width=&quot;140%&quot; height=&quot;220%&quot;&gt;
-      &lt;feGaussianBlur stdDeviation=&quot;7&quot; result=&quot;b&quot;/&gt;
-      &lt;feMerge&gt;&lt;feMergeNode in=&quot;b&quot;/&gt;&lt;feMergeNode in=&quot;SourceGraphic&quot;/&gt;&lt;/feMerge&gt;
-    &lt;/filter&gt;
-    &lt;marker id=&quot;ahY&quot; viewBox=&quot;0 0 10 10&quot; refX=&quot;8&quot; refY=&quot;5&quot; markerWidth=&quot;4.5&quot; markerHeight=&quot;4.5&quot; orient=&quot;auto-start-reverse&quot;&gt;
+    &lt;marker id=&quot;ah&quot; viewBox=&quot;0 0 10 10&quot; refX=&quot;8&quot; refY=&quot;5&quot; markerWidth=&quot;4.5&quot; markerHeight=&quot;4.5&quot; orient=&quot;auto-start-reverse&quot;&gt;
       &lt;path d=&quot;M0,0 L10,5 L0,10 z&quot; fill=&quot;#fab219&quot;/&gt;&lt;/marker&gt;
-    &lt;marker id=&quot;ahG&quot; viewBox=&quot;0 0 10 10&quot; refX=&quot;8&quot; refY=&quot;5&quot; markerWidth=&quot;5&quot; markerHeight=&quot;5&quot; orient=&quot;auto-start-reverse&quot;&gt;
-      &lt;path d=&quot;M0,0 L10,5 L0,10 z&quot; fill=&quot;#898781&quot;/&gt;&lt;/marker&gt;
   &lt;/defs&gt;
   &lt;rect width=&quot;1600&quot; height=&quot;560&quot; fill=&quot;#141416&quot;/&gt;
   &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
@@ -2963,123 +2957,153 @@ requestAnimationFrame(tick);
   function T(x, y, size, txt, fill, op, anchor){
     return &#x27;&lt;text x=&quot;&#x27; + x + &#x27;&quot; y=&quot;&#x27; + y + &#x27;&quot; font-size=&quot;&#x27; + size + &#x27;&quot; text-anchor=&quot;&#x27; + (anchor || &#x27;start&#x27;) + &#x27;&quot; style=&quot;fill:&#x27; +
       fill + &#x27;&quot;&#x27; + (op != null ? &#x27; opacity=&quot;&#x27; + op + &#x27;&quot;&#x27; : &#x27;&#x27;) + &#x27;&gt;&#x27; + txt + &#x27;&lt;/text&gt;&#x27;; }
-
-  var YEL = &quot;#fab219&quot;, GRN = &quot;#3fbf3f&quot;, INK2 = &quot;#c3c2b7&quot;;
+  var YEL = &quot;#fab219&quot;, RED = &quot;#e5484d&quot;, GRN = &quot;#3fbf3f&quot;, INK2 = &quot;#c3c2b7&quot;, GRY = &quot;#898781&quot;;
   var COL = [&quot;#3987e5&quot;, &quot;#d95926&quot;, &quot;#199e70&quot;];
-  var NAME = [&quot;chunk 1&quot;, &quot;chunk 2&quot;, &quot;chunk 3&quot;];
-  // one query row&#x27;s scores against the 4 keys of each cached chunk
-  var SC = [[1.0, 2.0, 0.5, 1.5], [2.5, 3.0, 1.8, 2.2], [0.8, 1.2, 0.3, 1.0]];
-  var MX = SC.map(function(r){ return Math.max.apply(null, r); });
-  var GM = Math.max.apply(null, MX);
-  var OWN = SC.map(function(r, c){ return r.map(function(s){ return Math.exp(s - MX[c]); }); });  // what each call computes
-  var FAC = MX.map(function(m){ return Math.exp(m - GM); });                                      // the merge&#x27;s rescale
+  var FAC = [0.37, 1, 0.17];                       // each note&#x27;s rescale to the global max (chunk 2 holds it)
 
   // geometry (viewBox 1600 x 560)
-  var X0 = [160, 610, 1060], CW = 380;      // chunks
-  var CY = 10, CH = 76;                     // the cache row
-  var YB = 440, HB = 262, YT = YB - HB;     // bars: baseline, full height, top
-  function cellX(c, j){ return X0[c] + 23 + j * 90; }   // 64-wide key cells
-  function barX(c, j){ return cellX(c, j) + 4; }       // 56-wide bars under them
+  var X0 = [210, 660, 1110], CW = 380;             // the three chunks in memory
+  var MY = 52, MH = 70;                             // memory row
+  function keyX(c, j){ return X0[c] + 22 + j * 88; }  // 64-wide key cells
+  var BY = 196, BH = 62;                            // the copy buffer row
+  function bufX(i){ return 228 + i * 74; }          // 16 cells: 12 keys + 4 zeros
+  var NY = 300;                                     // notes row (baseline of the note bars)
 
-  // timeline (s): three calls, the rescale, the check
-  var C0 = 0.8, CD = 1.7, P2 = C0 + 3 * CD + 0.3, P3 = P2 + 2.9, OK = P3 + 1.2, LOOP = OK + 1.6;
-
-  var CHIPS = [[&quot;1&quot;, &quot;one kernel call per chunk&quot;, 452], [&quot;2&quot;, &quot;rescale to the global max&quot;, 452], [&quot;3&quot;, &quot;same as one softmax&quot;, 400]];
+  // timeline (s)
+  var A = 0.6, B = 6.6, C = 11.2, D = 15.6, END = 20.0;
+  var CHIPS = [[&quot;1&quot;, &quot;copy memory first&quot;, 300], [&quot;2&quot;, &quot;read it in place&quot;, 268], [&quot;3&quot;, &quot;merge the notes exactly&quot;, 350], [&quot;4&quot;, &quot;two chunks per call&quot;, 312]];
+  var STAT = [&quot;8 trn3 chips: &lt;tspan style=&#x27;fill:&quot; + RED + &quot;&#x27;&gt;7.37 s&lt;/tspan&gt; per video, error vs fp32 0.032&quot;,
+              &quot;8 trn3 chips: &lt;tspan style=&#x27;fill:&quot; + GRN + &quot;&#x27;&gt;4.34 s&lt;/tspan&gt; per video&quot;,
+              &quot;same answer as one softmax: error vs fp32 0.011&quot;,
+              &quot;8 trn3 chips: &lt;tspan style=&#x27;fill:&quot; + GRN + &quot;&#x27;&gt;4.08 s&lt;/tspan&gt; per video&quot;];
 
   function render(t){
-    var s = &quot;&quot;, c, j;
-    var fin = ease(prog(t, 0, 0.6));
-    var k = ease(prog(t, P2 + 0.9, 1.3));                        // rescale progress
-    var scale = function(c){ return 1 + (FAC[c] - 1) * k; };
+    var s = &quot;&quot;, c, j, i;
+    var fin = ease(prog(t, 0, 0.5));
+    var beat = t &lt; B ? 0 : t &lt; C ? 1 : t &lt; D ? 2 : 3;
 
-    // the query, and the cache: three chunks of keys, each read in place by its own call
+    // ── the query and the memory (always there) ──
     s += &#x27;&lt;g opacity=&quot;&#x27; + fin + &#x27;&quot;&gt;&#x27;;
-    s += R(40, CY + 6, 72, CH - 12, 12, &quot;rgba(255,255,255,.06)&quot;, &quot;rgba(255,255,255,.45)&quot;, 2);
-    s += T(76, CY + CH / 2 + 12, 34, &quot;q&quot;, &quot;#fff&quot;, null, &quot;middle&quot;);
-    s += &#x27;&lt;path d=&quot;M116,&#x27; + (CY + CH / 2) + &#x27; L150,&#x27; + (CY + CH / 2) + &#x27;&quot; stroke=&quot;#898781&quot; stroke-width=&quot;3&quot; fill=&quot;none&quot; marker-end=&quot;url(#ahG)&quot;/&gt;&#x27;;
-    s += &#x27;&lt;line x1=&quot;160&quot; y1=&quot;&#x27; + YB + &#x27;&quot; x2=&quot;1440&quot; y2=&quot;&#x27; + YB + &#x27;&quot; stroke=&quot;#383835&quot; stroke-width=&quot;2&quot;/&gt;&#x27;;
-    for (c = 0; c &lt; 3; c++) s += T(X0[c] + CW / 2, YB + 34, 24, NAME[c], COL[c], null, &quot;middle&quot;);
+    s += T(210, 26, 24, &quot;memory (KV cache): what the model saw in the earlier chunks&quot;, INK2, null, &quot;start&quot;);
+    s += R(40, MY + 4, 120, MH - 8, 12, &quot;rgba(255,255,255,.06)&quot;, &quot;rgba(255,255,255,.45)&quot;, 2);
+    s += T(100, MY + MH / 2 + 4, 22, &quot;new chunk&quot;, &quot;#fff&quot;, null, &quot;middle&quot;);
+    s += T(100, MY + MH / 2 + 28, 16, &quot;(the query)&quot;, INK2, null, &quot;middle&quot;);
+    for (c = 0; c &lt; 3; c++){
+      s += R(X0[c], MY, CW, MH, 14, rgba(COL[c], .10), COL[c], 2);
+      for (j = 0; j &lt; 4; j++) s += R(keyX(c, j), MY + 10, 64, MH - 20, 8, rgba(COL[c], .45), COL[c], 2);
+      s += T(X0[c] + CW / 2, MY + MH + 30, 22, &quot;chunk &quot; + (c + 1), COL[c], null, &quot;middle&quot;);
+    }
     s += &#x27;&lt;/g&gt;&#x27;;
 
-    for (c = 0; c &lt; 3; c++){
-      var cs = C0 + c * CD;
-      var hi = (t &gt;= cs &amp;&amp; t &lt; cs + 1.5) ? Math.min(ease(prog(t, cs, .25)), 1 - ease(prog(t, cs + 1.25, .25))) : 0;
-      if (hi &gt; 0) s += R(X0[c], CY, CW, YB - CY, 14, rgba(COL[c], .08 * hi), null, 0);
-      s += &#x27;&lt;g opacity=&quot;&#x27; + fin + &#x27;&quot;&gt;&#x27; + R(X0[c], CY, CW, CH, 14, rgba(COL[c], .08 + .12 * hi), COL[c], 2 + 3 * hi,
-                                              hi &gt; .05 ? &#x27; filter=&quot;url(#glow)&quot;&#x27; : &#x27;&#x27;);
-      for (j = 0; j &lt; 4; j++) s += R(cellX(c, j), CY + 12, 64, CH - 24, 8, rgba(COL[c], .3 + .4 * hi), COL[c], 2);
-      s += &#x27;&lt;/g&gt;&#x27;;
-      // the call&#x27;s weights, scaled to the chunk&#x27;s own max (then rescaled by the merge)
-      for (j = 0; j &lt; 4; j++){
-        var g = ease(prog(t, cs + 0.25 + j * 0.08, 0.6));
-        var h = OWN[c][j] * HB * scale(c) * g;
-        if (h &gt; 0.5) s += R(barX(c, j), YB - h, 56, h, 6, COL[c], null, 0);
-      }
-      // the chunk&#x27;s own max: every call&#x27;s tallest bar reaches it
-      var lo = ease(prog(t, cs + 0.9, 0.3)) * (1 - ease(prog(t, P3, 0.5)));
-      var ly = YB - HB * scale(c);
-      if (lo &gt; 0) s += &#x27;&lt;line x1=&quot;&#x27; + (X0[c] + 8) + &#x27;&quot; y1=&quot;&#x27; + ly + &#x27;&quot; x2=&quot;&#x27; + (X0[c] + CW - 8) + &#x27;&quot; y2=&quot;&#x27; + ly +
-                       &#x27;&quot; stroke=&quot;&#x27; + YEL + &#x27;&quot; stroke-width=&quot;4&quot; opacity=&quot;&#x27; + lo + &#x27;&quot;/&gt;&#x27;;
-    }
-
-    // left label: own max (the calls), then global max (the merge)
-    var a1 = ease(prog(t, C0 + 0.9, 0.3)) * (1 - ease(prog(t, P2, 0.4))), a2 = ease(prog(t, P2, 0.4));
-    if (a1 &gt; 0) s += T(148, YT + 8, 24, &quot;own max&quot;, YEL, a1, &quot;end&quot;);
-    if (a2 &gt; 0){
-      s += T(148, YT + 8, 24, &quot;global max&quot;, YEL, a2, &quot;end&quot;);
-      s += &#x27;&lt;line x1=&quot;160&quot; y1=&quot;&#x27; + YT + &#x27;&quot; x2=&quot;1440&quot; y2=&quot;&#x27; + YT + &#x27;&quot; stroke=&quot;&#x27; + YEL +
-           &#x27;&quot; stroke-width=&quot;3&quot; stroke-dasharray=&quot;12 9&quot; opacity=&quot;&#x27; + a2 + &#x27;&quot;/&gt;&#x27;;
-    }
-
-    // the merge: each chunk rescaled by exp(own max - global max)
-    var pa = ease(prog(t, P2 + 0.5, 0.4));
-    if (pa &gt; 0){
-      for (c = 0; c &lt; 3; c++){
-        var y = YB - HB * scale(c);
-        var txt = &quot;× &quot; + (FAC[c] &gt; 0.995 ? &quot;1&quot; : FAC[c].toFixed(2));
-        var pw = 118, px = X0[c] + CW / 2 - pw / 2, py = y - 50;
-        if (FAC[c] &lt; 0.99 &amp;&amp; k &gt; 0.02)
-          s += &#x27;&lt;path d=&quot;M&#x27; + (X0[c] + 14) + &#x27;,&#x27; + (YT + 6) + &#x27; L&#x27; + (X0[c] + 14) + &#x27;,&#x27; + (y - 6) + &#x27;&quot; stroke=&quot;&#x27; + YEL +
-               &#x27;&quot; stroke-width=&quot;3&quot; fill=&quot;none&quot; marker-end=&quot;url(#ahY)&quot; opacity=&quot;&#x27; + pa + &#x27;&quot;/&gt;&#x27;;
-        s += &#x27;&lt;g opacity=&quot;&#x27; + pa + &#x27;&quot;&gt;&#x27; + R(px, py, pw, 40, 20, rgba(YEL, .16), YEL, 2) +
-             T(X0[c] + CW / 2, py + 29, 26, txt, &quot;#fff&quot;, null, &quot;middle&quot;) + &#x27;&lt;/g&gt;&#x27;;
-      }
-    }
-
-    // the check: one softmax over all twelve keys drops onto the merged bars
-    var ga = ease(prog(t, P3, 0.6));
-    if (ga &gt; 0){
-      var dy = -70 * (1 - ease(prog(t, P3, 1.0)));
-      var gc = t &gt;= OK ? GRN : &quot;#ffffff&quot;;
+    // ── beat 1: copy every chunk into one new, zero-padded buffer, before EVERY call ──
+    var b1 = ease(prog(t, A, 0.4)) * (1 - ease(prog(t, B - 0.4, 0.4)));
+    if (b1 &gt; 0){
+      s += &#x27;&lt;g opacity=&quot;&#x27; + b1 + &#x27;&quot;&gt;&#x27;;
+      s += T(1520, BY - 14, 20, &quot;new buffer, every call&quot;, INK2, null, &quot;end&quot;);
+      s += R(214, BY - 6, 16 * 74 + 2, BH + 12, 12, &quot;rgba(255,255,255,.03)&quot;, &quot;rgba(255,255,255,.25)&quot;, 2);
       for (c = 0; c &lt; 3; c++) for (j = 0; j &lt; 4; j++){
-        var gh = Math.exp(SC[c][j] - GM) * HB;
-        s += &#x27;&lt;rect x=&quot;&#x27; + (barX(c, j) - 5) + &#x27;&quot; y=&quot;&#x27; + (YB - gh - 5 + dy) + &#x27;&quot; width=&quot;66&quot; height=&quot;&#x27; + (gh + 5) +
-             &#x27;&quot; rx=&quot;8&quot; fill=&quot;none&quot; stroke=&quot;&#x27; + gc + &#x27;&quot; stroke-width=&quot;3&quot; stroke-dasharray=&quot;9 6&quot; opacity=&quot;&#x27; + ga + &#x27;&quot;/&gt;&#x27;;
+        var k = c * 4 + j, st = A + 0.3 + k * 0.18, p = ease(prog(t, st, 0.5));
+        if (p &lt;= 0) continue;
+        var x = keyX(c, j) + (bufX(k) - keyX(c, j)) * p, y = MY + 10 + (BY - MY - 10) * p;
+        s += R(x, y, 64, BH - 2, 8, rgba(COL[c], .45 + .2 * (1 - p)), COL[c], 2);
+      }
+      var zp = ease(prog(t, A + 2.6, 0.5));
+      for (i = 12; i &lt; 16; i++){
+        if (zp &lt;= 0) break;
+        s += R(bufX(i), BY, 64, BH - 2, 8, &quot;rgba(229,72,77,&quot; + (.12 * zp) + &quot;)&quot;, RED, 2);
+        s += T(bufX(i) + 32, BY + 40, 26, &quot;0&quot;, RED, zp, &quot;middle&quot;);
+      }
+      var zl = ease(prog(t, A + 3.1, 0.5));
+      if (zl &gt; 0){
+        s += T(bufX(14) + 32, BY + BH + 34, 20, &quot;padding zeros leak into the softmax&quot;, RED, zl, &quot;middle&quot;);
+        s += T(800, NY + 40, 30, &quot;slow: the same data moves again before every call&quot;, &quot;#fff&quot;, zl, &quot;middle&quot;);
+      }
+      s += &#x27;&lt;/g&gt;&#x27;;
+    }
+
+    // ── beats 2-4: read each chunk where it is; each call writes a small note ──
+    var b2 = ease(prog(t, B, 0.4));
+    if (b2 &gt; 0){
+      // calls: beat 2-3 one per chunk; beat 4 merges chunks 1+2 into one call
+      var g4 = ease(prog(t, D + 0.3, 0.8));
+      var calls = [[X0[0] - 10, CW + 20, 0], [X0[1] - 10, CW + 20, 1], [X0[2] - 10, CW + 20, 2]];
+      for (c = 0; c &lt; 3; c++){
+        var on = ease(prog(t, B + 0.3 + c * 0.9, 0.35));
+        if (on &lt;= 0) continue;
+        var cx = calls[c][0], cw = calls[c][1];
+        if (c &lt; 2 &amp;&amp; g4 &gt; 0){                       // chunks 1 and 2 slide into one call box
+          var lx = X0[0] - 10, lw = X0[1] + CW + 10 - lx;
+          cx = cx + (lx - cx) * g4; cw = cw + (lw - cw) * g4;
+        }
+        if (c === 1 &amp;&amp; g4 &gt; 0.98) continue;         // one box covers chunks 1 and 2
+        s += R(cx, MY - 6, cw, MH + 12, 18, &quot;none&quot;, YEL, 3, &#x27; stroke-dasharray=&quot;14 10&quot; opacity=&quot;&#x27; + (on * b2) + &#x27;&quot;&#x27;);
+        // the call reads its chunk where it is: a short arrow from the chunk down to its note
+        if (t &lt; C){
+          var ax = X0[c] + CW / 2, ao = on * (1 - ease(prog(t, C - 0.4, 0.3)));
+          s += &#x27;&lt;path d=&quot;M&#x27; + ax + &#x27;,&#x27; + (MY + MH + 40) + &#x27; L&#x27; + ax + &#x27;,&#x27; + (NY - 12) +
+               &#x27;&quot; stroke=&quot;&#x27; + YEL + &#x27;&quot; stroke-width=&quot;4&quot; fill=&quot;none&quot; marker-end=&quot;url(#ah)&quot; opacity=&quot;&#x27; + ao + &#x27;&quot;/&gt;&#x27;;
+          s += T(ax + 12, (MY + MH + NY) / 2 + 26, 20, &quot;call &quot; + (c + 1), YEL, ao, &quot;start&quot;);
+        }
+      }
+      // call counter, top right of the notes area
+      var ncall = t &lt; D + 0.8 ? 3 : 2;
+      s += T(1520, NY - 118, 26, ncall + &quot; kernel calls&quot;, YEL, b2, &quot;end&quot;);
+
+      // notes: one bar per chunk, under its chunk; beat 3 rescales them and stacks them into one answer
+      var m = ease(prog(t, C + 0.4, 1.2)), sum = ease(prog(t, C + 2.0, 1.0));
+      var hNote = 120, wNote = 120;
+      var stackY = NY + 150;                       // where the merged answer sits
+      var acc = 0;
+      for (c = 0; c &lt; 3; c++){
+        var appear = ease(prog(t, B + 0.6 + c * 0.9, 0.5));
+        if (appear &lt;= 0) continue;
+        var h = hNote * (1 + (FAC[c] - 1) * m) * appear;
+        var nx0 = X0[c] + CW / 2 - wNote / 2, ny0 = NY + hNote - h;
+        var tx = 800 - wNote / 2, ty = stackY - acc - h;      // stacked position in the answer
+        var x = nx0 + (tx - nx0) * sum, y = ny0 + (ty - ny0) * sum;
+        s += R(x, y, wNote, h, 8, rgba(COL[c], .85), null, 0);
+        if (sum &lt; 0.5) s += T(nx0 + wNote / 2, NY + hNote + 28, 20, &quot;note &quot; + (c + 1), COL[c], (1 - 2 * sum) * appear, &quot;middle&quot;);
+        if (m &gt; 0.05 &amp;&amp; sum &lt; 0.6)
+          s += T(nx0 + wNote + 14, ny0 + 26, 26, &quot;× &quot; + (FAC[c] === 1 ? &quot;1&quot; : FAC[c].toFixed(2)), YEL, m * (1 - sum), &quot;start&quot;);
+        acc += h;
+      }
+      if (sum &gt; 0.6){
+        var so = (sum - 0.6) / 0.4;
+        s += T(800 + wNote / 2 + 24, stackY - acc / 2 + 10, 28, &quot;= one softmax over all 12 keys, exactly&quot;, GRN, so, &quot;start&quot;);
+        s += T(800 - wNote / 2 - 24, stackY - acc / 2 + 10, 22, &quot;notes added&quot;, INK2, so, &quot;end&quot;);
+      }
+      if (t &gt;= B &amp;&amp; t &lt; C){
+        var nl = ease(prog(t, B + 3.0, 0.4));
+        s += T(632, 222, 22, &quot;no copy: each call reads&quot;, &quot;#fff&quot;, nl, &quot;middle&quot;);
+        s += T(632, 250, 22, &quot;its chunk where it is&quot;, &quot;#fff&quot;, nl, &quot;middle&quot;);
+      }
+      if (t &gt;= D){
+        var fl = ease(prog(t, D + 1.0, 0.4));
+        s += T(800, MY + MH + 70, 24, &quot;each call has a fixed start-up cost: fewer, bigger calls&quot;, &quot;#fff&quot;, fl, &quot;middle&quot;);
       }
     }
 
-    // the three steps
-    var act = [t &gt;= C0 &amp;&amp; t &lt; P2, t &gt;= P2 &amp;&amp; t &lt; P3, t &gt;= P3 &amp;&amp; t &lt; OK], done = [t &gt;= P2, t &gt;= P3, t &gt;= OK];
-    var total = CHIPS.reduce(function(a, ch){ return a + ch[2]; }, 0) + 2 * 26;
-    var x = (1600 - total) / 2;
+    // ── the measured number of the current beat ──
+    var sa = ease(prog(t, [A + 3.4, B + 3.2, C + 2.6, D + 1.4][beat], 0.4)) * (beat === 0 ? b1 : 1);
+    if (sa &gt; 0) s += T(800, 474, 26, STAT[beat], &quot;#fff&quot;, sa, &quot;middle&quot;);
+
+    // ── the four step chips ──
+    var starts = [A, B, C, D], total = CHIPS.reduce(function(a, ch){ return a + ch[2]; }, 0) + 3 * 22;
+    var x0 = (1600 - total) / 2;
     s += &#x27;&lt;g opacity=&quot;&#x27; + fin + &#x27;&quot;&gt;&#x27;;
-    for (var i = 0; i &lt; 3; i++){
-      var st = (i === 2 &amp;&amp; done[2]) ? &quot;ok&quot; : act[i] ? &quot;on&quot; : done[i] ? &quot;done&quot; : &quot;off&quot;;
-      var fill = {off: &quot;rgba(255,255,255,.02)&quot;, on: &quot;rgba(57,135,229,.16)&quot;, done: &quot;rgba(255,255,255,.04)&quot;, ok: &quot;rgba(12,163,12,.16)&quot;}[st];
-      var stroke = {off: &quot;#2c2c2a&quot;, on: &quot;#3987e5&quot;, done: &quot;rgba(255,255,255,.22)&quot;, ok: &quot;#0ca30c&quot;}[st];
-      var tc = {off: &quot;#5a5955&quot;, on: &quot;#ffffff&quot;, done: INK2, ok: &quot;#ffffff&quot;}[st];
-      var nc = {off: &quot;#3a3a38&quot;, on: &quot;#3987e5&quot;, done: &quot;#5a5955&quot;, ok: &quot;#0ca30c&quot;}[st];
-      var w = CHIPS[i][2], y0 = 494, hh = 54;
-      s += R(x, y0, w, hh, 27, fill, stroke, 2);
-      s += &#x27;&lt;circle cx=&quot;&#x27; + (x + 31) + &#x27;&quot; cy=&quot;&#x27; + (y0 + hh / 2) + &#x27;&quot; r=&quot;16&quot; fill=&quot;&#x27; + nc + &#x27;&quot;/&gt;&#x27;;
-      s += T(x + 31, y0 + hh / 2 + 7, 19, CHIPS[i][0], &quot;#ffffff&quot;, null, &quot;middle&quot;);
-      s += T(x + 60, y0 + hh / 2 + 9, 26, CHIPS[i][1], tc, null, &quot;start&quot;);
-      if (st === &quot;ok&quot;){
-        var cx = x + w - 34, cy = y0 + hh / 2;
-        s += &#x27;&lt;path d=&quot;M&#x27; + (cx - 11) + &#x27;,&#x27; + cy + &#x27; L&#x27; + (cx - 3) + &#x27;,&#x27; + (cy + 9) + &#x27; L&#x27; + (cx + 12) + &#x27;,&#x27; + (cy - 9) +
-             &#x27;&quot; stroke=&quot;&#x27; + GRN + &#x27;&quot; stroke-width=&quot;4.5&quot; fill=&quot;none&quot; stroke-linecap=&quot;round&quot; stroke-linejoin=&quot;round&quot;/&gt;&#x27;;
-      }
-      x += w + 26;
+    for (i = 0; i &lt; 4; i++){
+      var stc = beat === i ? &quot;on&quot; : (beat &gt; i ? &quot;done&quot; : &quot;off&quot;);
+      if (i === 0 &amp;&amp; beat &gt; 0) stc = &quot;bad&quot;;
+      var fill = {off: &quot;rgba(255,255,255,.02)&quot;, on: &quot;rgba(57,135,229,.16)&quot;, done: &quot;rgba(12,163,12,.12)&quot;, bad: &quot;rgba(229,72,77,.10)&quot;}[stc];
+      var stroke = {off: &quot;#2c2c2a&quot;, on: &quot;#3987e5&quot;, done: &quot;#0ca30c&quot;, bad: RED}[stc];
+      var tc = {off: &quot;#5a5955&quot;, on: &quot;#ffffff&quot;, done: INK2, bad: INK2}[stc];
+      var nc = {off: &quot;#3a3a38&quot;, on: &quot;#3987e5&quot;, done: &quot;#0ca30c&quot;, bad: RED}[stc];
+      var w = CHIPS[i][2], y0 = 496, hh = 50;
+      s += R(x0, y0, w, hh, 25, fill, stroke, 2);
+      s += &#x27;&lt;circle cx=&quot;&#x27; + (x0 + 28) + &#x27;&quot; cy=&quot;&#x27; + (y0 + hh / 2) + &#x27;&quot; r=&quot;15&quot; fill=&quot;&#x27; + nc + &#x27;&quot;/&gt;&#x27;;
+      s += T(x0 + 28, y0 + hh / 2 + 7, 18, CHIPS[i][0], &quot;#ffffff&quot;, null, &quot;middle&quot;);
+      s += T(x0 + 54, y0 + hh / 2 + 8, 22, CHIPS[i][1], tc, null, &quot;start&quot;);
+      x0 += w + 22;
     }
     s += &#x27;&lt;/g&gt;&#x27;;
     document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
@@ -3090,11 +3114,10 @@ requestAnimationFrame(tick);
   function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
   var hm = /t=([\d.]+)/.exec(location.hash);          // e.g. #t=8 freezes at 8 s (for checking)
   if (hm){ render(parseFloat(hm[1])); return; }
-  if (reduce){ render(LOOP - 0.01); return; }
-  // play once, then hold the final picture (click or Space plays it again)
+  if (reduce){ render(END - 0.01); return; }
   function tick(now){
     var t = (now - t0) / 1000;
-    if (t &gt;= LOOP){ render(LOOP - 0.01); running = false; return; }
+    if (t &gt;= END){ render(END - 0.01); running = false; return; }
     render(t); requestAnimationFrame(tick);
   }
   running = true; requestAnimationFrame(tick);
@@ -3106,8 +3129,8 @@ requestAnimationFrame(tick);
 &lt;/html&gt;
 "></iframe></div>
 <div class="stats c2">
-  <div class="stat g"><div class="v">8.95 → 5.73 <small>s GEN</small></div><div class="l">no copies, with sequence parallelism</div></div>
-  <div class="stat g" data-step="1"><div class="v">3.28 → 2.88 <small>ms per block</small></div><div class="l">then two chunks per call</div></div>
+<div class="stat g"><div class="v">7.37 → 4.34 <small>s GEN</small></div><div class="l">read in place, no copies (8 trn3 chips)</div></div>
+<div class="stat g" data-step="1"><div class="v">4.34 → 4.08 <small>s GEN</small></div><div class="l">then two chunks per call</div></div>
 </div>
 </div>
   </div>
@@ -3115,13 +3138,13 @@ requestAnimationFrame(tick);
 </section>
 <div class="nt">
 <p class="meta">Backup · move less data, cut from idea 3 · the animation plays when the slide opens (R restarts it) · 2 clicks</p>
-<p>One query against three cached chunks of four keys. The bars are the query’s attention weights.</p>
-<p><b>Step 1, one kernel call per chunk:</b> each call reads its chunk in place. Inside a call, the softmax is taken against that chunk’s own maximum, so every chunk’s tallest bar reaches the same line. The kernel returns the result without normalizing it, plus the chunk’s max and sum.</p>
-<p><b>Step 2, rescale to the global max:</b> the merge multiplies each chunk by how far its max is below the largest one: ×1, ×0.37, ×0.17.</p>
-<p><b>Step 3, the check:</b> the dashed outlines are one softmax over all twelve keys, as if the chunks had been copied into one buffer. They match exactly: the merge is exact, not an approximation.</p>
-<p><b>Results:</b> GEN (the DiT and T5) 8.95 → 5.73 s, together with sequence parallelism. <b>Click 1:</b> then fewer, fuller calls: two chunks per call, 3.28 → 2.88 ms per block.</p>
-<p><b>If asked:</b> the factor is exp(m<sub>c</sub> − M), applied to each chunk’s output and sum: out = Σ exp(m<sub>c</sub> − M)·O<sub>c</sub> / Σ exp(m<sub>c</sub> − M)·S<sub>c</sub>, in fp32 on small per-row stats. Gain 1.0000 on every head. 5.73 s is the job’s TP8 × CP8 layout; TP4 × CP16 (the layout in S9c) gives 5.75 s. Two chunks per call: each call costs ~0.15 ms whatever its size, and the first chunk goes in as the kernel’s prefix-cache prior, the same softmax over their union (<a class="lnk" href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/wan/modules/model_fast.py#L1052-L1077" target="_blank" rel="noopener">model_fast.py</a>, <code>LINGBOT_ATTN_PAIR=1</code>; GEN 4.88 → 4.48 s).</p>
-<p><b>Click 2, the takeaway:</b> Don’t copy data to fit a kernel: call it where the data is, and merge the results.</p>
+<p>The boxes at the top are the model’s memory, the KV cache: what it saw in the three earlier chunks. Every new chunk has to look at all of it.</p>
+<p><b>1, copy memory first (the old way):</b> before every attention call, all three chunks were copied into one new buffer, padded with zeros to the kernel’s size. The same data moves again before every call, and the padding zeros get weight in the softmax. On 8 trn3 chips: 7.37 s GEN per video, error vs fp32 0.032.</p>
+<p><b>2, read it in place:</b> one kernel call per chunk, reading the chunk where it already is. Each call returns a small note: its unnormalized output, its row max and its row sum.</p>
+<p><b>3, merge the notes exactly:</b> each note is rescaled by how far its max is below the largest one (×1, ×0.37, ×0.17) and the notes are added. That is exactly one softmax over all twelve keys, not an approximation. 4.34 s GEN, error vs fp32 0.011.</p>
+<p><b>4, two chunks per call:</b> every call has a fixed start-up cost, so two chunks go into one call (the first as the kernel’s prefix prior). 4.34 → 4.08 s GEN.</p>
+<p>Measured on 8 trn3 chips, TP4 × CP8, q20 flags with one flag off at a time (<code>LINGBOT_CTE_MERGE</code>, then <code>LINGBOT_ATTN_PAIR</code>): <code>docs/talk/validate/RESULTS.md</code>, Backups, B6a/B6b. The trn2 numbers this slide had (8.95 → 5.73 s, 3.28 → 2.88 ms per block) are replaced.</p>
+<p>Click 1: the second number. Click 2, the takeaway.</p>
 </div></div>
 
 <!-- ═══════════════════════════ B6c · backup: the win was data movement, not new math ═══════════════════════════ -->

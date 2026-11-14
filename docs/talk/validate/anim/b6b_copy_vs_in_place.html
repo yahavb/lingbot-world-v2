@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Copying the memory before every call vs reading it in place</title>
+<style>
+  html,body{margin:0;height:100%;background:#141416;overflow:hidden}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:650;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 560" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="The model's memory holds three chunks of keys. Old way: before every attention call, all three chunks are copied into one new buffer padded with zeros, which is slow and lets the zeros into the softmax. New way: each chunk is read where it already is and gives a small note; the notes are rescaled by 1, 0.37 and 0.17 and added, which is exactly one softmax. Then two chunks go into one call, so there are fewer calls. Measured on 8 trn3 chips: 7.37 s, then 4.34 s, then 4.08 s per video.">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4.5" markerHeight="4.5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#fab219"/></marker>
+  </defs>
+  <rect width="1600" height="560" fill="#141416"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x < 0 ? 0 : x > 1 ? 1 : x; }
+  function prog(t, a, d){ return clamp((t - a) / d); }
+  function ease(p){ return p < .5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; }
+  function rgba(h, a){ var n = parseInt(h.slice(1), 16);
+    return "rgba(" + (n >> 16 & 255) + "," + (n >> 8 & 255) + "," + (n & 255) + "," + a + ")"; }
+  function R(x, y, w, h, rx, fill, stroke, sw, extra){
+    return '<rect x="' + x + '" y="' + y + '" width="' + Math.max(0, w) + '" height="' + Math.max(0, h) + '" rx="' + rx +
+      '" fill="' + fill + '"' + (stroke ? ' stroke="' + stroke + '" stroke-width="' + sw + '"' : '') + (extra || '') + '/>'; }
+  function T(x, y, size, txt, fill, op, anchor){
+    return '<text x="' + x + '" y="' + y + '" font-size="' + size + '" text-anchor="' + (anchor || 'start') + '" style="fill:' +
+      fill + '"' + (op != null ? ' opacity="' + op + '"' : '') + '>' + txt + '</text>'; }
+  var YEL = "#fab219", RED = "#e5484d", GRN = "#3fbf3f", INK2 = "#c3c2b7", GRY = "#898781";
+  var COL = ["#3987e5", "#d95926", "#199e70"];
+  var FAC = [0.37, 1, 0.17];                       // each note's rescale to the global max (chunk 2 holds it)
+
+  // geometry (viewBox 1600 x 560)
+  var X0 = [210, 660, 1110], CW = 380;             // the three chunks in memory
+  var MY = 52, MH = 70;                             // memory row
+  function keyX(c, j){ return X0[c] + 22 + j * 88; }  // 64-wide key cells
+  var BY = 196, BH = 62;                            // the copy buffer row
+  function bufX(i){ return 228 + i * 74; }          // 16 cells: 12 keys + 4 zeros
+  var NY = 300;                                     // notes row (baseline of the note bars)
+
+  // timeline (s)
+  var A = 0.6, B = 6.6, C = 11.2, D = 15.6, END = 20.0;
+  var CHIPS = [["1", "copy memory first", 300], ["2", "read it in place", 268], ["3", "merge the notes exactly", 350], ["4", "two chunks per call", 312]];
+  var STAT = ["8 trn3 chips: <tspan style='fill:" + RED + "'>7.37 s</tspan> per video, error vs fp32 0.032",
+              "8 trn3 chips: <tspan style='fill:" + GRN + "'>4.34 s</tspan> per video",
+              "same answer as one softmax: error vs fp32 0.011",
+              "8 trn3 chips: <tspan style='fill:" + GRN + "'>4.08 s</tspan> per video"];
+
+  function render(t){
+    var s = "", c, j, i;
+    var fin = ease(prog(t, 0, 0.5));
+    var beat = t < B ? 0 : t < C ? 1 : t < D ? 2 : 3;
+
+    // ── the query and the memory (always there) ──
+    s += '<g opacity="' + fin + '">';
+    s += T(210, 26, 24, "memory (KV cache): what the model saw in the earlier chunks", INK2, null, "start");
+    s += R(40, MY + 4, 120, MH - 8, 12, "rgba(255,255,255,.06)", "rgba(255,255,255,.45)", 2);
+    s += T(100, MY + MH / 2 + 4, 22, "new chunk", "#fff", null, "middle");
+    s += T(100, MY + MH / 2 + 28, 16, "(the query)", INK2, null, "middle");
+    for (c = 0; c < 3; c++){
+      s += R(X0[c], MY, CW, MH, 14, rgba(COL[c], .10), COL[c], 2);
+      for (j = 0; j < 4; j++) s += R(keyX(c, j), MY + 10, 64, MH - 20, 8, rgba(COL[c], .45), COL[c], 2);
+      s += T(X0[c] + CW / 2, MY + MH + 30, 22, "chunk " + (c + 1), COL[c], null, "middle");
+    }
+    s += '</g>';
+
+    // ── beat 1: copy every chunk into one new, zero-padded buffer, before EVERY call ──
+    var b1 = ease(prog(t, A, 0.4)) * (1 - ease(prog(t, B - 0.4, 0.4)));
+    if (b1 > 0){
+      s += '<g opacity="' + b1 + '">';
+      s += T(1520, BY - 14, 20, "new buffer, every call", INK2, null, "end");
+      s += R(214, BY - 6, 16 * 74 + 2, BH + 12, 12, "rgba(255,255,255,.03)", "rgba(255,255,255,.25)", 2);
+      for (c = 0; c < 3; c++) for (j = 0; j < 4; j++){
+        var k = c * 4 + j, st = A + 0.3 + k * 0.18, p = ease(prog(t, st, 0.5));
+        if (p <= 0) continue;
+        var x = keyX(c, j) + (bufX(k) - keyX(c, j)) * p, y = MY + 10 + (BY - MY - 10) * p;
+        s += R(x, y, 64, BH - 2, 8, rgba(COL[c], .45 + .2 * (1 - p)), COL[c], 2);
+      }
+      var zp = ease(prog(t, A + 2.6, 0.5));
+      for (i = 12; i < 16; i++){
+        if (zp <= 0) break;
+        s += R(bufX(i), BY, 64, BH - 2, 8, "rgba(229,72,77," + (.12 * zp) + ")", RED, 2);
+        s += T(bufX(i) + 32, BY + 40, 26, "0", RED, zp, "middle");
+      }
+      var zl = ease(prog(t, A + 3.1, 0.5));
+      if (zl > 0){
+        s += T(bufX(14) + 32, BY + BH + 34, 20, "padding zeros leak into the softmax", RED, zl, "middle");
+        s += T(800, NY + 40, 30, "slow: the same data moves again before every call", "#fff", zl, "middle");
+      }
+      s += '</g>';
+    }
+
+    // ── beats 2-4: read each chunk where it is; each call writes a small note ──
+    var b2 = ease(prog(t, B, 0.4));
+    if (b2 > 0){
+      // calls: beat 2-3 one per chunk; beat 4 merges chunks 1+2 into one call
+      var g4 = ease(prog(t, D + 0.3, 0.8));
+      var calls = [[X0[0] - 10, CW + 20, 0], [X0[1] - 10, CW + 20, 1], [X0[2] - 10, CW + 20, 2]];
+      for (c = 0; c < 3; c++){
+        var on = ease(prog(t, B + 0.3 + c * 0.9, 0.35));
+        if (on <= 0) continue;
+        var cx = calls[c][0], cw = calls[c][1];
+        if (c < 2 && g4 > 0){                       // chunks 1 and 2 slide into one call box
+          var lx = X0[0] - 10, lw = X0[1] + CW + 10 - lx;
+          cx = cx + (lx - cx) * g4; cw = cw + (lw - cw) * g4;
+        }
+        if (c === 1 && g4 > 0.98) continue;         // one box covers chunks 1 and 2
+        s += R(cx, MY - 6, cw, MH + 12, 18, "none", YEL, 3, ' stroke-dasharray="14 10" opacity="' + (on * b2) + '"');
+        // the call reads its chunk where it is: a short arrow from the chunk down to its note
+        if (t < C){
+          var ax = X0[c] + CW / 2, ao = on * (1 - ease(prog(t, C - 0.4, 0.3)));
+          s += '<path d="M' + ax + ',' + (MY + MH + 40) + ' L' + ax + ',' + (NY - 12) +
+               '" stroke="' + YEL + '" stroke-width="4" fill="none" marker-end="url(#ah)" opacity="' + ao + '"/>';
+          s += T(ax + 12, (MY + MH + NY) / 2 + 26, 20, "call " + (c + 1), YEL, ao, "start");
+        }
+      }
+      // call counter, top right of the notes area
+      var ncall = t < D + 0.8 ? 3 : 2;
+      s += T(1520, NY - 118, 26, ncall + " kernel calls", YEL, b2, "end");
+
+      // notes: one bar per chunk, under its chunk; beat 3 rescales them and stacks them into one answer
+      var m = ease(prog(t, C + 0.4, 1.2)), sum = ease(prog(t, C + 2.0, 1.0));
+      var hNote = 120, wNote = 120;
+      var stackY = NY + 150;                       // where the merged answer sits
+      var acc = 0;
+      for (c = 0; c < 3; c++){
+        var appear = ease(prog(t, B + 0.6 + c * 0.9, 0.5));
+        if (appear <= 0) continue;
+        var h = hNote * (1 + (FAC[c] - 1) * m) * appear;
+        var nx0 = X0[c] + CW / 2 - wNote / 2, ny0 = NY + hNote - h;
+        var tx = 800 - wNote / 2, ty = stackY - acc - h;      // stacked position in the answer
+        var x = nx0 + (tx - nx0) * sum, y = ny0 + (ty - ny0) * sum;
+        s += R(x, y, wNote, h, 8, rgba(COL[c], .85), null, 0);
+        if (sum < 0.5) s += T(nx0 + wNote / 2, NY + hNote + 28, 20, "note " + (c + 1), COL[c], (1 - 2 * sum) * appear, "middle");
+        if (m > 0.05 && sum < 0.6)
+          s += T(nx0 + wNote + 14, ny0 + 26, 26, "× " + (FAC[c] === 1 ? "1" : FAC[c].toFixed(2)), YEL, m * (1 - sum), "start");
+        acc += h;
+      }
+      if (sum > 0.6){
+        var so = (sum - 0.6) / 0.4;
+        s += T(800 + wNote / 2 + 24, stackY - acc / 2 + 10, 28, "= one softmax over all 12 keys, exactly", GRN, so, "start");
+        s += T(800 - wNote / 2 - 24, stackY - acc / 2 + 10, 22, "notes added", INK2, so, "end");
+      }
+      if (t >= B && t < C){
+        var nl = ease(prog(t, B + 3.0, 0.4));
+        s += T(632, 222, 22, "no copy: each call reads", "#fff", nl, "middle");
+        s += T(632, 250, 22, "its chunk where it is", "#fff", nl, "middle");
+      }
+      if (t >= D){
+        var fl = ease(prog(t, D + 1.0, 0.4));
+        s += T(800, MY + MH + 70, 24, "each call has a fixed start-up cost: fewer, bigger calls", "#fff", fl, "middle");
+      }
+    }
+
+    // ── the measured number of the current beat ──
+    var sa = ease(prog(t, [A + 3.4, B + 3.2, C + 2.6, D + 1.4][beat], 0.4)) * (beat === 0 ? b1 : 1);
+    if (sa > 0) s += T(800, 474, 26, STAT[beat], "#fff", sa, "middle");
+
+    // ── the four step chips ──
+    var starts = [A, B, C, D], total = CHIPS.reduce(function(a, ch){ return a + ch[2]; }, 0) + 3 * 22;
+    var x0 = (1600 - total) / 2;
+    s += '<g opacity="' + fin + '">';
+    for (i = 0; i < 4; i++){
+      var stc = beat === i ? "on" : (beat > i ? "done" : "off");
+      if (i === 0 && beat > 0) stc = "bad";
+      var fill = {off: "rgba(255,255,255,.02)", on: "rgba(57,135,229,.16)", done: "rgba(12,163,12,.12)", bad: "rgba(229,72,77,.10)"}[stc];
+      var stroke = {off: "#2c2c2a", on: "#3987e5", done: "#0ca30c", bad: RED}[stc];
+      var tc = {off: "#5a5955", on: "#ffffff", done: INK2, bad: INK2}[stc];
+      var nc = {off: "#3a3a38", on: "#3987e5", done: "#0ca30c", bad: RED}[stc];
+      var w = CHIPS[i][2], y0 = 496, hh = 50;
+      s += R(x0, y0, w, hh, 25, fill, stroke, 2);
+      s += '<circle cx="' + (x0 + 28) + '" cy="' + (y0 + hh / 2) + '" r="15" fill="' + nc + '"/>';
+      s += T(x0 + 28, y0 + hh / 2 + 7, 18, CHIPS[i][0], "#ffffff", null, "middle");
+      s += T(x0 + 54, y0 + hh / 2 + 8, 22, CHIPS[i][1], tc, null, "start");
+      x0 += w + 22;
+    }
+    s += '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var t0 = performance.now(), running = false;
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  var hm = /t=([\d.]+)/.exec(location.hash);          // e.g. #t=8 freezes at 8 s (for checking)
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END - 0.01); return; }
+  function tick(now){
+    var t = (now - t0) / 1000;
+    if (t >= END){ render(END - 0.01); running = false; return; }
+    render(t); requestAnimationFrame(tick);
+  }
+  running = true; requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code === 'Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>
