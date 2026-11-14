@@ -357,8 +357,47 @@ The row-max measurement (`LINGBOT_ROWMAX_GRAPH=1`) is also on the chained path o
 (`wan/modules/model_fast.py:223` on `loop_engineering_8dev`), so it cannot run on trn3 either.
 The slide's ranges (-8.3..71.5, 126-864) and timings (0.70 -> 0.36 ms, 3.30 -> 3.06 s) stay trn2 numbers.
 
+## B7c: four layouts on one device -> LingBot layouts on 8 trn3 chips
+
+Deck: Wan2.2 on one trn2 device, 29.4 -> 20.6 ms per block. **WAN.** LingBot's layout comparison, q20 flags,
+`talk-b6-layouts-job.yaml` (32 ranks):
+
+| Layout | GEN | VAE | fps | Status |
+|---|---|---|---|---|
+| **TP4 x CP8** (TP inside a chip) | 4.08 s | 0.42 s | **18.04** | measured |
+| TP8 x CP4 (TP across two chips) | 4.40 s | 0.41 s | 16.84 | measured |
+| TP2 x CP16 | 5.05 s | 0.41 s | 14.85 | measured |
+
+Same order as the 2026-10-31 sweep (17.88 / 16.70 / 14.74). Keeping TP inside a chip wins (S7b's point).
+
+## B6e: three changes to a copy of the kernel (rest)
+
+| q20 with one flag off | GEN | fps | GEN cost of turning it off | Status |
+|---|---|---|---|---|
+| `LINGBOT_CROSS_NMAJOR` (cross-attention cache in the kernel's layout) | 4.12 s | 17.88 | +0.04 s (deck: -250 us/block) | measured |
+| `LINGBOT_CTE_KV_DGE=none` (runtime-built DMA descriptors) | | | | running |
+
+## B6f: one block now
+
+Deck: 2.53-2.60 ms at TP4 x CP16 on trn2 (270 tokens per rank). On 8 trn3 chips each rank holds twice
+the tokens (540), so the block is not comparable 1:1.
+
+LingBot q20, TP4 x CP8, the steady block (`lbw-talk-b6-layouts/lnc2_4x8_q20/prof/pairs/rankr0-3645ms-dit-c535e56b`,
+1280 calls, 2.85 ms per call in the system trace):
+
+| | Measured |
+|---|---|
+| Block | **2.92 ms** (30.4% MFU) |
+| Tensor busy | 64.5% |
+| Every engine idle | 0.236 ms (8.1%) |
+| Attention kernel (self + cross, `attention_cte_lb.py`) | 1.22 ms |
+| Projections / FFN / norms (`model_fast.py`) | 1.09 ms |
+| Attention merge / prep (`attention.py`) | 0.11 ms |
+| Unattributed (collectives, DMA queues) | 1.23 ms (overlaps the above) |
+
+The 8dev-flags block (19.9 fps config) is profiled in `talk-b6f-8dev-job.yaml`: running.
+
 ## Still running (jobs `talk-b6-layouts`, `talk-b6-nopair`, `talk-b6-nomerge`, `talk-b6f-8dev`)
 
-B7c (layouts TP4xCP8, TP8xCP4, TP2xCP16 on 8 chips), B6e (cross-attention layout, runtime DMA
-descriptors), B6f (block breakdown, q20 and the 8dev flags), B6b (ms per block with / without two
+B6e (runtime DMA descriptors), B6f (the 8dev flags), B6b (ms per block with / without two
 chunks per call), B6a (ms of the copy inside the block).
