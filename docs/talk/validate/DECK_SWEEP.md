@@ -44,7 +44,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | S9a | step 0 within bf16 floor; VAE 44.6 dB | WAN (44.6) | c0s0 0.0108-0.0137; VAE 52.7 dB |
 | S9b | Wan journey 76.6 / 36.8 / 16.1 / 10.8 / 8.7 s; A100 16.92 s | WAN | LingBot journey 21.6 / 8.09 / 4.48 s (RESULTS S9c); no A100 number for LingBot |
 | S9c | 16 trn2 devices: 11.90 -> 3.24 s, 6.81 -> 25.02 fps; 8 devices with check 4.40 s, 18.40 fps | TRN2 | 8 trn3 chips: rows in RESULTS S9c; check-on row pending (job 4) |
-| S9d | 17.3 fps, ~1.07 s key press, ~0.58 s per chunk, half a trn3 | OK (trn3 deploy) but not re-measured | pending: serving deploy |
+| S9d | 17.3 fps, ~1.07 s key press, ~0.58 s per chunk, half a trn3 | OK (trn3), needs > 8 chips (separate VAE deploy) | per chunk 0.554 s confirmed on 8 chips; inline VAE: 11.8 fps, 2.05 s (RESULTS S9d) |
 | S11b | `serve_ti2v.py`, 8 ranks, T5 on CPU | WAN | LingBot `serve.py` / `lbw-deploy.yaml` |
 | S11c | VAE warm-up 186 / 21 / 3.6 s | WAN | LingBot main: GEN pass 1 151.0 s, pass 2 4.28 s; VAE first decode still compiles (job 1 `dec1.log`) |
 | S11d | device busy 96.9% -> 99.5% (`device_unipc.py`); ffmpeg vfork 90 ms; `wan2-ti2v-5b-deploy.yaml` | WAN | LingBot host fixes: `LINGBOT_VAE_GATHER1` frames 0.32 s sooner (kiro/e2e/LEDGER.md, 4 devices) |

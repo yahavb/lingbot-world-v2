@@ -251,9 +251,28 @@ number is not measured yet.
 
 ## S9d: A live stream
 
-Deck: 17.3 fps, ~1.07 s key press to new frames, ~0.58 s per chunk.
+Deck: 17.3 fps, ~1.07 s key press to new frames, ~0.58 s per chunk; DiT + T5 on half a trn3 and the
+fused VAE on a **separate** deployment (lbw-v2-vae).
 
-Needs the serving deployment. Measured last, within 8 chips. Pending.
+LingBot, `serve.py` on 8 trn3 chips (`talk-live-deploy.yaml`: today's `main` flags, TP4 x CP8, 480x768),
+VAE **inline on the same 8 chips** (a separate VAE deployment needs more than 8 chips). Client
+`live_latency.py` on this Mac through `kubectl port-forward` (ClusterIP only), scene 03, presses
+alternating left / right after 15 s. Two sessions:
+
+| | Session 1 (8 presses) | Session 2 (6 presses) |
+|---|---|---|
+| Stream fps at the client | 11.12 | 11.82 |
+| Key press -> first new frame, median | 2.026 s (2.008-2.630) | 2.046 s (1.961-2.081) |
+| Server, per chunk: denoise start -> x0 (DiT) | | **0.554 s** |
+| Server, per chunk: x0 -> decoded (VAE, inline) | | 0.276 s |
+| Server, per chunk: decoded -> client | | 0.053 s |
+| Server, chunk period | | 1.009 s |
+
+What this validates: the DiT per chunk, **0.554 s vs the deck's ~0.58 s**. What it does not: 17.3 fps and
+1.07 s need the VAE overlapped on other chips. Inline, DiT and VAE run one after the other (0.83 s of the
+1.01 s period), so a press waits about two chunk periods (2.0 s). With the VAE off the DiT's chips the
+period would be about the DiT's 0.55 s, and two periods ~1.1 s, which is consistent with the deck, but
+that was not measured here.
 
 ---
 

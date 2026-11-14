@@ -34,6 +34,7 @@ def post(path, body, timeout=30):
 
 
 frames = []          # (client receive time, action, chunk)
+chunk_t = {}         # chunk -> server times of its first frame (ctl, start, x0, dec)
 lock = threading.Lock()
 done = threading.Event()
 
@@ -53,6 +54,8 @@ def reader():
         if "frame_index" in ev:
             with lock:
                 frames.append((time.time(), ev.get("action"), ev.get("chunk")))
+                if isinstance(ev.get("t"), dict) and ev.get("chunk") not in chunk_t:
+                    chunk_t[ev.get("chunk")] = dict(ev["t"], recv=time.time())
         elif "error" in ev or "done" in ev or "superseded" in ev:
             print("stream:", {k: v for k, v in ev.items() if k != "frame"})
             break
@@ -97,6 +100,18 @@ with lock:
     fr = [f for f in frames if f[0] >= t_start + args.settle]
 if len(fr) > 1:
     print(f"stream: {len(fr)} frames in {fr[-1][0] - fr[0][0]:.2f} s = {(len(fr) - 1) / (fr[-1][0] - fr[0][0]):.2f} fps")
+ck = [chunk_t[c] for c in sorted(k for k in chunk_t if k is not None)]
+ck = [c for c in ck if c.get("start", 0) >= t_start + args.settle]
+def med(xs): return statistics.median(xs) if xs else float("nan")
+if len(ck) > 2:
+    period = [b["start"] - a["start"] for a, b in zip(ck, ck[1:])]
+    print(f"server, per chunk (median of {len(ck)}): period {med(period):.3f} s | denoise start->x0 "
+          f"{med([c['x0'] - c['start'] for c in ck if 'x0' in c]):.3f} s | x0->decoded "
+          f"{med([c['dec'] - c['x0'] for c in ck if 'dec' in c and 'x0' in c]):.3f} s | decoded->client "
+          f"{med([c['recv'] - c['dec'] for c in ck if 'dec' in c]):.3f} s")
+    ctl = [c for c in ck if c.get("ctl")]
+    if ctl:
+        print(f"server, after a press: ctl->start {med([c['start'] - c['ctl'] for c in ctl]):.3f} s")
 if lat:
     print(f"key press -> new frames: median {statistics.median(lat):.3f} s, min {min(lat):.3f}, "
           f"max {max(lat):.3f} over {len(lat)} presses")
