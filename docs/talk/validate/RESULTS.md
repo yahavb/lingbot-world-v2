@@ -343,3 +343,22 @@ softmax shortcut is off too), `4x8_d8nochain` in `talk-8dev-job.yaml`:
 Repeat bitwise identical (deterministic: True). Pass 2 of the first process still compiled (7.9 s).
 This beats q20 on `main` (18.08 fps) by 10% and is the number to put on S7a / S9c for 8 trn3 chips,
 labelled "without the softmax shortcut".
+
+## B6h: the check's runtime branch in the kernel
+
+Code only. **Matches the source**: `kernels/attention_cmax2_lb.py:389-403` on `loop_engineering_8dev`
+(`nisa.register_alloc` / `register_load` of `any_redo`, `_redo_any`, `_redo_one`, `_redo_block`, two
+`nl.fori_loop` with the register as the trip count). Not on `main`. Because the guarded kernel only runs
+on the chained path, this code cannot execute on trn3 today (see B6d).
+
+## B6g: why one constant works in 34 of 40 layers
+
+The row-max measurement (`LINGBOT_ROWMAX_GRAPH=1`) is also on the chained path only
+(`wan/modules/model_fast.py:223` on `loop_engineering_8dev`), so it cannot run on trn3 either.
+The slide's ranges (-8.3..71.5, 126-864) and timings (0.70 -> 0.36 ms, 3.30 -> 3.06 s) stay trn2 numbers.
+
+## Still running (jobs `talk-b6-layouts`, `talk-b6-nopair`, `talk-b6-nomerge`, `talk-b6f-8dev`)
+
+B7c (layouts TP4xCP8, TP8xCP4, TP2xCP16 on 8 chips), B6e (cross-attention layout, runtime DMA
+descriptors), B6f (block breakdown, q20 and the 8dev flags), B6b (ms per block with / without two
+chunks per call), B6a (ms of the copy inside the block).
