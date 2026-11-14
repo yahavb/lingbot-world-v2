@@ -1372,14 +1372,14 @@
   <div class="body">
 <div class="stack" style="gap:30px">
 <div class="cards c2">
-  <div class="card big k4"><b>A copy before every call</b><p>+3.03 s per video (7.37 vs 4.34 s)</p></div>
+  <div class="card big k4"><b>A copy before every call</b><p>14.4 ms of a 17.1 ms block</p></div>
   <div class="card big k4"><b>Zero keys in every softmax</b><p>error vs fp32 0.032 (vs 0.011 read in place)</p></div>
 </div>
   <div data-step="1"><div class="code"><div class="cap"><span>Fix: one call per chunk, merged</span><span class="lnks"><a class="lnk" href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/wan/modules/attention.py#L630-L682" target="_blank" rel="noopener">wan/modules/attention.py</a></span></div><pre style="font-size:16px"><span class="ln"><span class="tk-k">for</span> kc, vc <span class="tk-k">in</span> zip(k_chunks, v_chunks):          <span class="tk-c"># the cache's own chunks, read in place</span></span><span class="ln hl">    o, neg_max, s = _attention_cte(q_c, kc, vc, ..., skip_output_normalization=<span class="tk-k">True</span>)</span><span class="ln"><span class="tk-c"># out = sum_c exp(m_c - M) O_c / sum_c exp(m_c - M) S_c</span></span></pre></div></div>
 </div>
   </div>
 </section>
-<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>copy 1.7 ms of a 10.4 ms block → +3.03 s per video on 8 trn3 chips (LINGBOT_CTE_MERGE off vs on)</li><li>heads scaled by 0.94-0.99 → step-0 error vs fp32 0.032 vs 0.011 (the zero keys' effect, measured end to end)</li></ul><p>Per-block ms of the copy at q20: pending job talk-b6-nomerge.</p></div></div>
+<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>copy 1.7 ms of a 10.4 ms block (trn2) → 14.4 ms of a 17.1 ms block (trn3, LINGBOT_CTE_MERGE off: lbw-talk-b6-nomerge rank-0 pair rankr0-6681ms, attention.py:440-459); +3.03 s per video (7.37 vs 4.34 s)</li><li>heads scaled by 0.94-0.99 → step-0 error vs fp32 0.032 vs 0.011 (the zero keys' effect, measured end to end)</li></ul></div></div>
 <div class="cell" data-ref="B6b-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>trn2: 8.95 → 5.73 s, 3.28 → 2.88 ms</small></div>
   <h1>Backup: one kernel call per chunk, merged exactly</h1>
   <div class="body">
@@ -1816,15 +1816,15 @@
   <div class="body">
 <div class="stack" style="gap:30px">
 <div class="cards c3">
-  <div class="card big k1"><div class="top"><span class="n">1</span><span class="k">No copies</span></div><b>Read the cache in place</b><p>7.37 → 4.34 s per video.</p></div>
-  <div class="card big k2"><div class="top"><span class="n">2</span><span class="k">Fewer calls</span></div><b>Two chunks per kernel call</b><p>4.34 → 4.08 s per video.</p></div>
+  <div class="card big k1"><div class="top"><span class="n">1</span><span class="k">No copies</span></div><b>Read the cache in place</b><p>The copy took 14.4 of 17.1 ms per block.</p></div>
+  <div class="card big k2"><div class="top"><span class="n">2</span><span class="k">Fewer calls</span></div><b>Two chunks per kernel call</b><p>3.11 → 2.85 ms per block.</p></div>
   <div class="card big k3"><div class="top"><span class="n">3</span><span class="k">Fewer DMAs</span></div><b>Bigger loads, no permutes</b><p>K layout 4.32 → 4.08 s, V tiles 4.20 → 4.08 s.</p></div>
 </div>
 </div>
   </div>
   <p class="takeaway" data-step="1"><span class="k">Takeaway</span><span>Count copies, calls and DMAs before you optimize the math.</span></p>
 </section>
-<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>1.7 of 10.4 ms → 7.37 → 4.34 s</li><li>3.28 → 2.88 ms per block → 4.34 → 4.08 s per video</li><li>3.94 → 3.66 s → 4.32 → 4.08 s (LINGBOT_K_BLOCKED) and 4.20 → 4.08 s (LINGBOT_CTE_VGROUP=8)</li></ul></div></div>
+<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>1.7 of 10.4 ms → 14.4 of 17.1 ms (7.37 → 4.34 s per video)</li><li>3.28 → 2.88 ms per block → 3.11 → 2.85 ms per steady block, system trace (4.34 → 4.08 s per video)</li><li>3.94 → 3.66 s → 4.32 → 4.08 s (LINGBOT_K_BLOCKED) and 4.20 → 4.08 s (LINGBOT_CTE_VGROUP=8)</li></ul></div></div>
 <div class="cell" data-ref="B6d-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>trn2, branch loop_engineering_8dev</small></div>
   <h1>Backup: a softmax shortcut that checks itself</h1>
   <p class="dek">Subtract one constant instead of the running max: exact, but only while the scores stay in range</p>
@@ -1995,7 +1995,7 @@
 </ol>
   </div>
 </section>
-<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>8 V tiles per DMA: 3.94 → 3.74 s → 4.20 → 4.08 s</li><li>K in the all-gather's layout: 3.74 → 3.66 s → 4.32 → 4.08 s</li><li>cross-attention cache layout: −250 µs per block → 4.12 → 4.08 s per video</li><li>each is q20 with that one flag off vs all on, 8 trn3 chips</li></ul></div></div>
+<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>8 V tiles per DMA: 3.94 → 3.74 s → 4.20 → 4.08 s</li><li>K in the all-gather's layout: 3.74 → 3.66 s → 4.32 → 4.08 s</li><li>cross-attention cache layout: −250 µs per block → 4.12 → 4.08 s per video</li><li>each is q20 with that one flag off vs all on, 8 trn3 chips</li><li>runtime-built K/V DMA descriptors (LINGBOT_CTE_KV_DGE=none): 4.67 vs 4.08 s, slower (BEFORE notes: 4.26 vs 3.94 s)</li></ul></div></div>
 <div class="cell" data-ref="B6f-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>trn2, TP4 × CP16, 2.5 ms</small></div>
   <h1>Backup: one block now, 2.5 ms</h1>
   <p class="dek">TP4 × CP16, LingBot-World v2</p>
@@ -2018,21 +2018,21 @@
 <p><b>Correctness:</b> only DMAs changed, yet some ranks move by up to 6.2e-3 (output RMS 0.515): one fp32 ulp in the row sum. An autoregressive rollout amplifies any rounding change, so the gate is chunk 0 against fp32 (0.0125, upstream 0.0257), determinism, and the video.</p>
 </div></div>
 <div class="cell" data-ref="B6f-AFTER"><section class="slide"><div class="bab after">AFTER<small>LingBot-World v2 · 8 trn3 chips</small></div>
-  <h1>Backup: one block now, 2.92 ms</h1>
-  <p class="dek">TP4 × CP8, LingBot-World v2, q20, 8 trn3 chips</p>
+  <h1>Backup: one block now, 2.74 ms</h1>
+  <p class="dek">TP4 × CP8, LingBot-World v2, 19.9 fps flags, 8 trn3 chips</p>
   <div class="body">
 <div class="stack" style="gap:30px">
 <div class="stats c4">
-  <div class="stat big"><div class="v">236 <small>µs</small></div><div class="l">every engine idle</div></div>
-  <div class="stat big"><div class="v">1.09 <small>ms</small></div><div class="l">projections, FFN, norms</div></div>
-  <div class="stat big"><div class="v">0.11 <small>ms</small></div><div class="l">attention merge and prep</div></div>
-  <div class="stat big"><div class="v">1.22 <small>ms</small></div><div class="l">attention kernel</div></div>
+  <div class="stat big"><div class="v">232 <small>µs</small></div><div class="l">every engine idle</div></div>
+  <div class="stat big"><div class="v">1.02 <small>ms</small></div><div class="l">projections, FFN, norms</div></div>
+  <div class="stat big"><div class="v">0.13 <small>ms</small></div><div class="l">attention merge and prep</div></div>
+  <div class="stat big"><div class="v">1.08 <small>ms</small></div><div class="l">attention kernel</div></div>
 </div>
 <p class="say big b" data-step="1">The win was fewer calls, fewer DMAs, no copies. Not new math.</p>
 </div>
   </div>
 </section>
-<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>2.5 ms at TP4 × CP16 (trn2, 270 tokens per rank) → 2.92 ms at TP4 × CP8 (trn3, 540 tokens per rank)</li><li>the four parts re-measured with engine_overlap on lbw-talk-b6-layouts/lnc2_4x8_q20 (rank 0 pair); they are busy times and overlap</li></ul></div></div>
+<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>2.5 ms at TP4 × CP16 (trn2, 270 tokens per rank) → 2.74 ms at TP4 × CP8 (trn3, 540 tokens per rank), the 19.9 fps config (2.71 ms per call in the system trace)</li><li>the four parts re-measured on lbw-talk-b6f-8dev/lnc2_4x8_d8nochain (rank 0 pair); they are busy times and overlap. q20 block: 2.92 ms</li></ul></div></div>
 <div class="cell" data-ref="B7c-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>Wan2.2 layouts on one trn2 device</small></div>
   <h1>Backup: four layouts on one device</h1>
   <div class="body">

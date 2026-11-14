@@ -397,7 +397,13 @@ LingBot q20, TP4 x CP8, the steady block (`lbw-talk-b6-layouts/lnc2_4x8_q20/prof
 
 The 8dev-flags block (19.9 fps config) is profiled in `talk-b6f-8dev-job.yaml`: running.
 
-## Still running (jobs `talk-b6-layouts`, `talk-b6-nopair`, `talk-b6-nomerge`, `talk-b6f-8dev`)
+## B6a / B6b / B6e / B6f: per-block numbers (jobs talk-b6-nopair, talk-b6-nomerge, talk-b6f-8dev, talk-b6-layouts)
 
-B6e (runtime DMA descriptors), B6f (the 8dev flags), B6b (ms per block with / without two
-chunks per call), B6a (ms of the copy inside the block).
+| Slide | Deck (trn2) | LingBot, 8 trn3 chips | Source |
+|---|---|---|---|
+| B6a: the copy inside the block | 1.7 of 10.4 ms | **14.4 of 17.1 ms** | `lbw-talk-b6-nomerge/.../rankr0-6681ms-dit-18ab0e4b` (+2% vs trace), `attention.py:440-459` |
+| B6b: two chunks per call | 3.28 -> 2.88 ms per block | **3.11 -> 2.85 ms** (steady block, system trace) | nopair `rankr0-3987ms` vs q20 `rankr0-3645ms`, 1280 calls each |
+| B6e: runtime-built DMA descriptors | 4.26 vs 3.94 s | **4.67 vs 4.08 s** GEN (slower) | `4x8_kvdge` (`LINGBOT_CTE_KV_DGE=none`), c0s0 0.0125 |
+| B6f: one block now | 2.5 ms (TP4 x CP16) | **2.74 ms** (TP4 x CP8, 19.9 fps flags); Tensor 63.8%, all idle 8.4%; attention kernel 1.08, projections/FFN 1.02, merge 0.13 ms | `lbw-talk-b6f-8dev/.../rankr0-3470ms-dit-4b1f2b11` |
+
+The 19.9 fps config re-ran in this job at 19.87 fps (GEN 3.686 s): third process, same number.

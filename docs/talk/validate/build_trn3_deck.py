@@ -406,21 +406,21 @@ pair("B4i", "64 ranks on trn2",
       "\"convolution: 0.2 s\" kept from the original: not re-measured on trn3"])
 
 pair("B6a", "trn2, 16 devices",
-     [("r", "1.7 ms of a 10.4 ms block", "+3.03 s per video (7.37 vs 4.34 s)"),
+     [("r", "1.7 ms of a 10.4 ms block", "14.4 ms of a 17.1 ms block"),
       ("r", "heads scaled by 0.94–0.99", "error vs fp32 0.032 (vs 0.011 read in place)")],
-     ["copy 1.7 ms of a 10.4 ms block → +3.03 s per video on 8 trn3 chips (LINGBOT_CTE_MERGE off vs on)",
+     ["copy 1.7 ms of a 10.4 ms block (trn2) → 14.4 ms of a 17.1 ms block (trn3, LINGBOT_CTE_MERGE off: lbw-talk-b6-nomerge rank-0 pair rankr0-6681ms, attention.py:440-459); +3.03 s per video (7.37 vs 4.34 s)",
       "heads scaled by 0.94-0.99 → step-0 error vs fp32 0.032 vs 0.011 (the zero keys' effect, measured end to end)"],
-     ["Per-block ms of the copy at q20: pending job talk-b6-nomerge."])
+     [])
 
 PAIRS.append(with_banner(cell_of(orig, "B6b"), "B6b", "before", "trn2: 8.95 → 5.73 s, 3.28 → 2.88 ms"))
 cur = open(os.path.join(REPO, "demo", "talk-deck.html"), encoding="utf-8").read()
 PAIRS.append(with_banner(cell_of(cur, "B6b"), "B6b", "after", "LingBot-World v2 · 8 trn3 chips · approved"))
 
 pair("B6c", "trn2 numbers",
-     [("r", "The copy took 1.7 of 10.4 ms per block.", "7.37 → 4.34 s per video."),
-      ("r", "3.28 → 2.88 ms per block.", "4.34 → 4.08 s per video."),
+     [("r", "The copy took 1.7 of 10.4 ms per block.", "The copy took 14.4 of 17.1 ms per block."),
+      ("r", "3.28 → 2.88 ms per block.", "3.11 → 2.85 ms per block."),
       ("r", "Generation 3.94 → 3.66 s per video.", "K layout 4.32 → 4.08 s, V tiles 4.20 → 4.08 s.")],
-     ["1.7 of 10.4 ms → 7.37 → 4.34 s", "3.28 → 2.88 ms per block → 4.34 → 4.08 s per video",
+     ["1.7 of 10.4 ms → 14.4 of 17.1 ms (7.37 → 4.34 s per video)", "3.28 → 2.88 ms per block → 3.11 → 2.85 ms per steady block, system trace (4.34 → 4.08 s per video)",
       "3.94 → 3.66 s → 4.32 → 4.08 s (LINGBOT_K_BLOCKED) and 4.20 → 4.08 s (LINGBOT_CTE_VGROUP=8)"])
 
 NA = ('<p class="dek" style="color:#fab219">Not measurable on trn3: the shortcut needs chained kernel calls, which assert '
@@ -437,17 +437,17 @@ pair("B6e", "trn2: 3.94 → 3.74 → 3.66 s",
       ("r", "−250 µs per block", "4.12 → 4.08 s")],
      ["8 V tiles per DMA: 3.94 → 3.74 s → 4.20 → 4.08 s", "K in the all-gather's layout: 3.74 → 3.66 s → 4.32 → 4.08 s",
       "cross-attention cache layout: −250 µs per block → 4.12 → 4.08 s per video",
-      "each is q20 with that one flag off vs all on, 8 trn3 chips"])
+      "each is q20 with that one flag off vs all on, 8 trn3 chips", "runtime-built K/V DMA descriptors (LINGBOT_CTE_KV_DGE=none): 4.67 vs 4.08 s, slower (BEFORE notes: 4.26 vs 3.94 s)"])
 
 pair("B6f", "trn2, TP4 × CP16, 2.5 ms",
-     [("r", "Backup: one block now, 2.5 ms", "Backup: one block now, 2.92 ms"),
-      ("r", "TP4 × CP16, LingBot-World v2", "TP4 × CP8, LingBot-World v2, q20, 8 trn3 chips"),
-      ("r", '~350 <small>µs</small></div><div class="l">idle, waiting for K/V all-gathers', '236 <small>µs</small></div><div class="l">every engine idle'),
-      ("r", '~310 <small>µs</small></div><div class="l">FFN', '1.09 <small>ms</small></div><div class="l">projections, FFN, norms'),
-      ("r", '~150 <small>µs</small></div><div class="l">merging (data layout)', '0.11 <small>ms</small></div><div class="l">attention merge and prep'),
-      ("r", '~100 <small>µs</small></div><div class="l">K/V loads', '1.22 <small>ms</small></div><div class="l">attention kernel')],
-     ["2.5 ms at TP4 × CP16 (trn2, 270 tokens per rank) → 2.92 ms at TP4 × CP8 (trn3, 540 tokens per rank)",
-      "the four parts re-measured with engine_overlap on lbw-talk-b6-layouts/lnc2_4x8_q20 (rank 0 pair); they are busy times and overlap"])
+     [("r", "Backup: one block now, 2.5 ms", "Backup: one block now, 2.74 ms"),
+      ("r", "TP4 × CP16, LingBot-World v2", "TP4 × CP8, LingBot-World v2, 19.9 fps flags, 8 trn3 chips"),
+      ("r", '~350 <small>µs</small></div><div class="l">idle, waiting for K/V all-gathers', '232 <small>µs</small></div><div class="l">every engine idle'),
+      ("r", '~310 <small>µs</small></div><div class="l">FFN', '1.02 <small>ms</small></div><div class="l">projections, FFN, norms'),
+      ("r", '~150 <small>µs</small></div><div class="l">merging (data layout)', '0.13 <small>ms</small></div><div class="l">attention merge and prep'),
+      ("r", '~100 <small>µs</small></div><div class="l">K/V loads', '1.08 <small>ms</small></div><div class="l">attention kernel')],
+     ["2.5 ms at TP4 × CP16 (trn2, 270 tokens per rank) → 2.74 ms at TP4 × CP8 (trn3, 540 tokens per rank), the 19.9 fps config (2.71 ms per call in the system trace)",
+      "the four parts re-measured on lbw-talk-b6f-8dev/lnc2_4x8_d8nochain (rank 0 pair); they are busy times and overlap. q20 block: 2.92 ms"])
 
 pair("B7c", "Wan2.2 layouts on one trn2 device",
      [("re", r"<h1>[^<]*</h1>", "<h1>Backup: three layouts on 8 trn3 chips</h1>"),
