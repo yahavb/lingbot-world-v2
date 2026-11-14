@@ -123,6 +123,10 @@ Tensor sits idle.
 
 ## S5f / S5g: attention_cte
 
+Per call, attention alone, one LingBot rank's shape on one core (`demo/`, `demo/README.md`):
+SDPA (matmul -> softmax -> matmul) **2.69 ms** -> nkilib attention_cte **1.57 ms** device time (1.7x).
+Deck: 18.2 -> 5.3 ms (Wan2.2, 7,854 tokens).
+
 Deck: self-attention 18.2 -> 5.3 ms per call; 16.2 -> 13.2 s per video. **Wrong model.**
 
 LingBot, both compiled one graph per block, everything else off:
