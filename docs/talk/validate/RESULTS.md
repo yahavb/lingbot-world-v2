@@ -37,7 +37,8 @@ LingBot, eager (nothing compiled, native SDPA, every loop flag off, eager fp32 V
 | First pass (compile + warmup) | 184.8 s | measured |
 | Accuracy: chunk-0 step-0 vs fp32 CPU | | pending |
 
-Eager with attention_cte (`4x8_eagercte`): pending.
+Eager with attention_cte (`4x8_eagercte`): DiT 24.3 s (median 0.71 s per forward), GEN 24.70 s, VAE 2.04 s,
+total 26.7 s, 3.03 fps. Measured. In eager, attention_cte is slower than native SDPA.
 
 ## S4c: What one graph per block buys
 
@@ -48,9 +49,12 @@ LingBot, one compiled graph per DiT block, native SDPA, everything else as eager
 
 | | Eager | Compiled blocks | Status |
 |---|---|---|---|
-| DiT per forward | 0.54 s | | pending |
-| DiT per video | 19.2 s | | pending |
-| Total | 21.6 s | | pending |
+| DiT per forward (median) | 0.54 s | 0.173 s (3.1x) | measured |
+| DiT per video | 19.2 s | 5.7 s | measured |
+| GEN | 19.59 s | 6.07 s (last of 3 passes; pass 2 6.04 s) | measured |
+| VAE (unchanged, eager) | 2.03 s | 2.02 s | measured |
+| **Total** | **21.6 s, 3.75 fps** | **8.09 s, 10.0 fps** (2.7x) | measured |
+| First pass (compile + warmup) | 184.8 s | 23.9 s | measured |
 
 ## S4e: Compile is not always the answer, the VAE
 
