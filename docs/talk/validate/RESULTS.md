@@ -407,3 +407,24 @@ The 8dev-flags block (19.9 fps config) is profiled in `talk-b6f-8dev-job.yaml`: 
 | B6f: one block now | 2.5 ms (TP4 x CP16) | **2.74 ms** (TP4 x CP8, 19.9 fps flags); Tensor 63.8%, all idle 8.4%; attention kernel 1.08, projections/FFN 1.02, merge 0.13 ms | `lbw-talk-b6f-8dev/.../rankr0-3470ms-dit-4b1f2b11` |
 
 The 19.9 fps config re-ran in this job at 19.87 fps (GEN 3.686 s): third process, same number.
+
+## S2c: one node, how the chips are linked
+
+Deck: 16 chips in a 4 x 4 2-D torus, 4 neighbours per chip, chip 0 -> 1, 3, 4, 12. Its own note says this was
+read off neuron-ls on a **trn2.48xlarge**.
+
+trn3-dev1 (`neuron-ls`, CONNECTED DEVICES, printed by the talk jobs; rows 0-6, the log keeps 20 lines):
+
+| Chip | Linked to |
+|---|---|
+| 0 | 1, 2, 4, 6, 8, 10, 12, 14 |
+| 1 | 0, 3, 5, 7, 9, 11, 13, 15 |
+| 2 | 3, 0, 4, 6, 8, 10, 12, 14 |
+| 3 | 2, 1, 5, 7, 9, 11, 13, 15 |
+| 4 | 5, 0, 2, 6, 8, 10, 12, 14 |
+| 5 | 4, 1, 3, 7, 9, 11, 13, 15 |
+| 6 | 7, 0, 2, 4, 8, 10, 12, 14 |
+
+**8 linked chips per chip, not 4**: its partner (d xor 1) and every other chip of the same parity. 144 GB HBM
+per chip and 4 logical cores per chip at LNC2 (8 physical) confirmed. Rows 7-15 were not printed; check them on
+the box. The S2c AFTER slide draws this.

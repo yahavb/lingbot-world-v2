@@ -18,7 +18,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | S1a | 14B, 40 blocks, 7 chunks x 3 latent frames, 4,320 tokens/chunk, 17,280 keys, 4 steps, no CFG, 34 forwards, 1,360 block calls | OK | measured: 35 forwards when the last commit runs (eager, compiled), 34 with `LINGBOT_SKIP_LAST_COMMIT=1` (q20, main) |
 | S1b-S1d | none | NONE | |
 | S2b | Trainium3: 8 NeuronCore-v4, 144 GiB HBM, 4.9 TB/s, NeuronLink-v4 2.56 TB/s, 16 CC-Cores, 32 MiB SBUF | OK | AWS docs |
-| S2c | 16 chips, 128 cores, 4x4 2-D torus, chip 0 neighbours 1, 3, 4, 12 | OK, but the note says "read off neuron-ls on a trn2.48xlarge" | confirm with neuron-ls on trn3 (job logs print it) |
+| S2c | 16 chips, 128 cores, 4x4 2-D torus, chip 0 neighbours 1, 3, 4, 12 | TRN2 topology: on trn3 each chip links to 8 others (neuron-ls), not 4 | S2c AFTER redrawn from neuron-ls on trn3-dev1 (RESULTS S2c) |
 | S2d | "one NEFF for all 30 blocks" | WAN | LingBot: 40 blocks share block graphs per chunk position |
 | S3a | 76.6 s eager (DiT 44.3, VAE 32.3); code `inference_neuron_ti2v.py` | WAN | 21.6 s (DiT 19.2, VAE 2.03); code link should be LingBot's `generate.py` |
 | S4a | prototype: FFN compiled, all-reduce outside (`models/tp_utils.py`) | WAN (code) | LingBot's piecewise path: `model_fast.py` "selective torch.compile" comment |

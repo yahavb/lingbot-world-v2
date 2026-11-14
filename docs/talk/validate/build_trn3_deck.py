@@ -139,6 +139,34 @@ def code_panel(cap, path, line, lines, hl=0, size=16):
             % (cap, GH, path, line, path, size, pre))
 
 
+def s2c_svg():
+    """16 trn3 chips as neuron-ls on trn3-dev1 lists them: each chip links to its partner (d xor 1)
+    and to every other chip of the same parity (rows 0-6 printed; the pattern holds for all of them)."""
+    W, H = 636, 424
+    o = ('<svg viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="A Trainium3 node as neuron-ls on '
+         'trn3-dev1 lists it: 16 chips of 8 cores. Each chip links to its partner (0 and 1, 2 and 3, ...) and to every '
+         'other chip of the same parity: the 8 even chips are all linked to each other, and so are the 8 odd chips.">' % (W, H, W, H))
+    o += '<text class="lbl" x="0" y="14">TRAINIUM3 NODE · 16 CHIPS · 128 CORES · LINKS FROM neuron-ls</text>'
+    cw, gap, x0 = 66, 8, 26
+    ys = {0: 92, 1: 300}
+    for par, y in ys.items():
+        o += '<rect class="bx-w" x="%d" y="%d" width="%d" height="%d" rx="12" style="fill:none"/>' % (x0 - 12, y - 30, 8 * cw + 7 * gap + 24, 104)
+        lab = "even chips: every one links to every other" if par == 0 else "odd chips: every one links to every other"
+        o += '<text class="t-s" x="%d" y="%d">%s</text>' % (x0 - 4, y - 38 if par == 0 else y + 92, lab)
+    for k in range(8):
+        x = x0 + k * (cw + gap)
+        o += '<line class="br" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (x + cw / 2, ys[0] + 48, x + cw / 2, ys[1])
+        for par in (0, 1):
+            d = 2 * k + par
+            cls = "bx-a" if d in (0, 1) else "bx"
+            o += '<rect class="%s" x="%d" y="%d" width="%d" height="48" rx="8"/>' % (cls, x, ys[par], cw)
+            o += '<text class="t" x="%d" y="%d" text-anchor="middle">chip %d</text>' % (x + cw / 2, ys[par] + 30, d)
+    ly = (ys[0] + 48 + ys[1]) / 2
+    o += '<rect x="%d" y="%d" width="236" height="30" rx="6" style="fill:#141416"/>' % (x0 + 3 * (cw + gap) - 10, ly - 15)
+    o += '<text class="t-s" x="%d" y="%d">partner links: 0–1, 2–3, … 14–15</text>' % (x0 + 3 * (cw + gap), ly + 6)
+    return o + "</svg>"
+
+
 # ───────────── edit machinery ─────────────
 class Miss(Exception):
     pass
@@ -204,6 +232,20 @@ pair("S0a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 → 8.7 s",
 pair("S1a", "numbers on this slide are already LingBot's", [],
      ["no number on the slide changes: 14B, 40 blocks, 7 chunks, 4,320 tokens, 17,280 keys, 4 steps are LingBot's",
       "measured: 35 forwards per video (28 denoise + 7 commits), 34 with LINGBOT_SKIP_LAST_COMMIT=1"])
+
+pair("S2c", "the 4 × 4 torus was read off neuron-ls on a trn2.48xlarge",
+     [("r", "One node: 16 chips in a 2-D torus", "One node: 16 chips, each linked to 8 others"),
+      ("svg", 0, s2c_svg()),
+      ("r", "4 <small>neighbours per chip</small>", "8 <small>linked chips per chip</small>"),
+      ("r", "over NeuronLink · one each way in its row and in its column, wrapping at the edges",
+       "its partner (0–1, 2–3, …) and every other chip of the same parity"),
+      ("r", "8 <small>cores in a chip</small>", "8 <small>cores in a chip</small>"),
+      ("re", r'(<p class="foot">Source: )', r'\1neuron-ls on trn3-dev1 (CONNECTED DEVICES) · ')],
+     ["title: \"16 chips in a 2-D torus\" → \"16 chips, each linked to 8 others\"",
+      "figure: 4 × 4 torus, 4 neighbours (read on a trn2.48xlarge) → the links neuron-ls lists on trn3-dev1: chip 0 → 1, 2, 4, 6, 8, 10, 12, 14; chip 1 → 0, 3, 5, …, 15",
+      "4 neighbours per chip → 8 linked chips per chip; 144 GB HBM per chip confirmed"],
+     ["neuron-ls printed rows 0-6 in the job logs (head -20); every row follows the pattern partner + same parity. Check rows 7-15 on the box before re:Invent.",
+      "This also explains kiro/core_order.py: each CP8 group must sit on chips that are all linked."])
 
 pair("S3a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 s",
      [("code", 0, code_panel("Move the model to the device", "generate.py", 663,
