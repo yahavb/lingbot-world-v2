@@ -254,3 +254,57 @@ number is not measured yet.
 Deck: 17.3 fps, ~1.07 s key press to new frames, ~0.58 s per chunk.
 
 Needs the serving deployment. Measured last, within 8 chips. Pending.
+
+---
+
+# Backups re-measured on trn3 (8 chips)
+
+Job 4, `talk-ladder-job.yaml`, branch `main`, same setup as above. Raw logs on the node in
+`/opt/lingbot-world-v2/e2e/lbw-talk-ladder/`.
+
+## B4h / B4i: LingBot VAE, step by step
+
+Deck: 64 ranks on trn2: 3.01 / 1.36 / 0.80 / 0.55 / 0.33 / 0.31 s; 43.5 -> 56.6 dB. **TRN2.**
+
+LingBot, 32 ranks on 8 trn3 chips, decode-only on the same latents (q20), each step adds to the row above.
+dB = frames vs an fp32 CPU decode of the same latents.
+
+| Step | VAE | vs fp32 decode |
+|---|---|---|
+| upstream decoder, per-conv eager (`v0_eager`) | 2.03 s | 56.34 dB |
+| whole blocks compiled (`LINGBOT_VAE_FUSED=1`, `v1_fused`) | 1.38 s | 56.34 dB |
+| bf16 convolutions (`v2_bf16`) | 0.86 s | 52.71 dB |
+| -O1, norm as a matmul (`v3_o1mm`) | 0.65 s | 52.71 dB |
+| 2-D tiles (`v4_2d`) | 0.46 s | 52.70 dB |
+| 6 frames per step (`final`) | 0.41 s | 52.71 dB |
+
+Differences from the deck: on trn3 the upstream decoder is already 56.3 dB (no 43.5 dB padding bug at
+this tiling), and bf16 is what costs 3.6 dB (56.3 -> 52.7), not a gain. B4i's "~3 s -> 1.36 s" is
+2.03 -> 1.38 s here.
+
+## B6a / B6b / B6c / B6e: attention flags, one at a time
+
+Each row is q20 with ONE flag turned off. GEN = last of 3 passes; c0s0 = chunk-0 step-0 vs fp32 CPU.
+
+| Config | Flag off | GEN | fps | c0s0 vs fp32 | GEN cost of turning it off |
+|---|---|---|---|---|---|
+| `4x8_q20` (all on) | | 4.08 s | 18.03 | 0.0108 | |
+| `4x8_nomerge` | `LINGBOT_CTE_MERGE` (+ ATTN_PAIR, ATTN_EARLY that need it) | 7.37 s | 10.42 | **0.0315** | +3.28 s |
+| `4x8_nopair` | `LINGBOT_ATTN_PAIR` (two chunks per call) | 4.34 s | 17.06 | 0.0108 | +0.26 s |
+| `4x8_novgroup` | `LINGBOT_CTE_VGROUP=8` (8 V tiles per DMA) | 4.20 s | 17.56 | 0.0131 | +0.12 s |
+| `4x8_nokblk` | `LINGBOT_K_BLOCKED` (K in the all-gather's layout) | 4.32 s | 17.12 | 0.0109 | +0.24 s |
+
+For the slides:
+- **B6a** (copy before every call, zero keys in the softmax): reading the cache in place is worth
+  3.28 s of GEN on 8 trn3 chips and cuts the error vs fp32 from 0.0315 to 0.0108. Deck: 8.95 -> 5.73 s (trn2, 16 devices).
+- **B6b** (two chunks per call): 4.34 -> 4.08 s. Deck: 4.88 -> 4.48 s.
+- **B6e** (V tiles per DMA, K layout): 4.20 -> 4.08 s and 4.32 -> 4.08 s. Deck: 3.94 -> 3.74 -> 3.66 s.
+- q20 again in this job: 18.03 fps (18.08 in job 1): run-to-run spread 0.3%.
+
+## B6d / B6g / S7a 18.64 / S9c 18.40: the softmax shortcut and its check
+
+These come from branch `loop_engineering_8dev` (ad34d57), measured on trn2. **They do not run on trn3
+as written**: every run from q21 on uses chained kernel calls (`LINGBOT_CTE_CHAIN=1`), and the kernel
+asserts that path is not handled on trn3 (`kernels/attention_cte_lb.py:767`, `is_trn3_b1()`:
+"chained calls: the Vector-engine exp path is not handled"). Job 5 (`talk-8dev-job.yaml`) re-runs
+exact / shortcut / shortcut + check with chaining off: pending.
