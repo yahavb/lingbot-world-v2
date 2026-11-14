@@ -1,0 +1,75 @@
+# Talk S5b / S5h demo: LingBot attention on ONE trn3 NeuronCore pair (s-lnc2), SDPA vs NKI attention_cte.
+# kubectl create configmap lbw-talk-demo-src --from-file=sdpa_vs_nki.py --from-file=../attn_span.py
+# kubectl apply -f demo_job.yaml        Results on the node: /opt/lingbot-world-v2/e2e/lbw-talk-demo/
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-talk-demo
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: s-lnc2
+      containers:
+        - name: demo
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -uo pipefail
+              OUT=/node-cache/e2e/lbw-talk-demo; mkdir -p "$OUT"
+              trap 'echo "results: node:/opt/lingbot-world-v2/e2e/lbw-talk-demo"; sleep "$KEEP_ALIVE_SECONDS"' EXIT
+              git clone -q https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              pip install -q -r /tmp/lingbot/requirements_neuron.txt duckdb pyarrow 2>&1 | tail -2
+              cp /src/sdpa_vs_nki.py /src/attn_span.py "$OUT/"
+              PROF="$(command -v neuron-explorer || command -v neuron-profile)"; echo "profiler: $PROF"
+              export NEURON_LOGICAL_NC_CONFIG=2 NEURON_RT_LOG_LEVEL=ERROR NEURON_CC_LOG_LEVEL=ERROR
+              for m in sdpa nki; do
+                d="$OUT/$m"; rm -rf "$d"; mkdir -p "$d"
+                TORCH_NEURONX_NEFF_CACHE_DIR="$d/neff_cache" python3 "$OUT/sdpa_vs_nki.py" --mode $m 2>&1 | tee "$d/run.log" | grep "^\[$m\]"
+                neff=$(find "$d/neff_cache" -name "*.neff" -printf "%s %p\n" | sort -n | tail -1 | cut -d' ' -f2)
+                [ -n "$neff" ] || { echo "$m: no NEFF found"; continue; }
+                cp "$neff" "$d/$m.neff"
+                ( cd "$d" && timeout 1800 "$PROF" capture -n "$m.neff" -s "$m.ntff" --num-exec=1 --enable-dge-notifs > capture.log 2>&1 )
+                [ -s "$d/$m.ntff" ] || { f=$(ls -S "$d"/*.ntff 2>/dev/null | head -1); [ -n "$f" ] && mv "$f" "$d/$m.ntff"; }
+                [ -s "$d/$m.ntff" ] || { echo "$m: capture failed"; tail -5 "$d/capture.log"; continue; }
+                timeout 3600 "$PROF" view -n "$d/$m.neff" -s "$d/$m.ntff" --output-format summary-json > "$d/summary.json" 2>/dev/null
+                # the parquet writer idles after writing: stop it once Instruction.parquet is readable (kiro/e2e/tools/neuron_pairs.sh)
+                timeout 3600 "$PROF" view -n "$d/$m.neff" -s "$d/$m.ntff" --output-format parquet --output-file "$d/pq" --ignore-event-trace > "$d/view.log" 2>&1 &
+                pid=$!
+                for _ in $(seq 1 700); do sleep 5; kill -0 $pid 2>/dev/null || break
+                  python3 -c "import duckdb; duckdb.connect().execute(\"select count(*) from read_parquet('$d/pq/Instruction.parquet')\").fetchall()" 2>/dev/null && { sleep 20; break; }
+                done; kill $pid 2>/dev/null; wait $pid 2>/dev/null
+                pq=$(dirname "$(find "$d" -name Instruction.parquet | head -1)")
+                python3 - "$d/summary.json" <<'PY'
+              import json, sys
+              d = json.load(open(sys.argv[1])); s = d[list(d)[0]]
+              print("  device time %.3f ms, tensor busy %.0f%%" % (s["total_time"] * 1e3, 100 * s.get("tensor_engine_active_time_percent", 0)))
+              PY
+                python3 /tmp/lingbot/kiro/e2e/tools/engine_overlap.py "$pq" --top 6 > "$d/overlap.txt" 2>&1; sed -n 3,16p "$d/overlap.txt"
+                pat=$([ $m = sdpa ] && echo sdpa_vs_nki.py || echo attention_cte.py)
+                python3 "$OUT/attn_span.py" "$pq" "$pat" | tee "$d/attn_span.txt"
+              done
+              echo "DEMO COMPLETE"
+          resources:
+            claims:
+              - name: neuroncores
+          volumeMounts:
+            - {name: node-cache, mountPath: /node-cache}
+            - {name: src, mountPath: /src, readOnly: true}
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: KEEP_ALIVE_SECONDS, value: "900"}
+      volumes:
+        - name: node-cache
+          hostPath: {path: /opt/lingbot-world-v2, type: DirectoryOrCreate}
+        - name: src
+          configMap: {name: lbw-talk-demo-src}
