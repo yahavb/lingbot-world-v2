@@ -101,7 +101,19 @@ The real "before the kernel" block, compiled with matmul -> softmax -> matmul
 
 Deck: self-attention 18.2 -> 5.3 ms per call; 16.2 -> 13.2 s per video. **Wrong model.**
 
-LingBot: `4x8_compile` vs `4x8_compilecte`. Pending.
+LingBot, both compiled one graph per block, everything else off:
+
+| Attention | GEN | VAE | Total | fps | Status |
+|---|---|---|---|---|---|
+| native SDPA in the code; the compiler swaps in attention_cte (`4x8_compile`) | 6.07 s | 2.02 s | 8.09 s | 10.0 | measured |
+| attention_cte called by our code, `ATTENTION_BACKEND=cte` (`4x8_compilecte`) | 8.98 s | 2.02 s | 11.00 s | 7.37 | measured |
+
+**Finding: on LingBot the deck's S5g claim is reversed.** Calling attention_cte ourselves is slower than
+leaving native SDPA in the code (8.98 vs 6.07 s GEN), because on SDK 2.33 the compiler already uses
+attention_cte for SDPA. Our `cte` path also copies every KV chunk into a zero-filled, 512-aligned
+buffer before each call (`kiro/LOOP_ENGINEERING.md`, "Merged attention"). The LingBot win from the
+kernel came later, from changing how the kernel reads the cache (`LINGBOT_CTE_MERGE` and the q20 flags; S7d row).
+The per-call times (deck: 18.2 -> 5.3 ms) come from the block profiles of jobs 2 and 3: pending.
 
 ## S5h / S5i: The same block with the kernel
 
@@ -125,7 +137,7 @@ Deck: 17.88 fps on half a trn3, TP4 x CP8. **LingBot, trn3**: from `kiro/LOOP_EN
 |---|---|---|
 | VAE on one core, eager (`vae_1rank_eager`) | | pending |
 | VAE split over 32 cores, eager | 2.03 s | measured |
-| 17.88 fps re-run, q20 flags (`4x8_q20`) | | pending |
+| 17.88 fps re-run, q20 flags (`4x8_q20`) | **18.08 fps** (GEN 4.07 s, VAE 0.41 s); 17.88 confirmed within 1% | measured |
 
 ## S9a: Validate every step against the eager reference
 
