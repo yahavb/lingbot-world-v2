@@ -159,7 +159,18 @@ LingBot, the same block both ways, same shard (pairs as in S5a):
 Note for the slide: on LingBot "every engine idle" does **not** drop (16.6% -> 17.1%). The kernel
 removes the softmax gaps, but the rest of the block (collective waits on GpSimd, transposes) keeps
 the idle time. The deck's 1.1% is Wan2.2 with no collectives in its profile.
-The explicit-cte block profile (job 3, `talk-cte-prof-job.yaml`), to explain S5g's slower path: pending.
+Why our own attention_cte path is slower and less accurate (S5g): job 3 (`talk-cte-prof-job.yaml`,
+`lbw-talk-cte-prof/.../prof/pairs/`, rank 1, `engine_overlap.py`):
+
+| Block graph (explicit cte) | Per call | Calls | Tensor busy | What dominates |
+|---|---|---|---|---|
+| steady block (`rankr1-6946ms-dit-c172464e`) | 4.92 ms | 1600 | 53% | same as the compiler's cte block (4.37 ms) plus the copy |
+| one chunk position (`rankr1-6999ms-dit-b34b4834`) | **17.89 ms** | 400 | **10.6%** | Sync + GpSimd DMAs 83% / 79% busy: `attention.py:449`, the scatter that copies each KV chunk into a zero-filled, 512-aligned buffer |
+
+That one graph costs 7.0 s of the run's DiT time. The zero-padded keys also enter every softmax
+(no bounds are passed on this path), which is why its c0s0 is 0.034 instead of 0.012 (the B6a story,
+now on trn3). The fix in the q20 flags reads the cache in place (`LINGBOT_CTE_MERGE=1`).
+
 
 ## S5j: The same approach for the VAE convolutions
 
