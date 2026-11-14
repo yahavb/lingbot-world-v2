@@ -100,8 +100,26 @@ heaviest DiT block graph (`prof/pairs/rankr0-6758ms-dit-f22a6c8d`, 1600 calls pe
 | Tensor time spent on transposes | ~0.86 of 2.44 ms busy (`transpose.py:714` + unattributed) | measured |
 | Biggest serial item | GpSimd semaphore wait 0.24 ms | measured |
 
-The real "before the kernel" block, compiled with matmul -> softmax -> matmul
-(`TORCH_NEURONX_ENABLE_NKI_SDPA=0`): job `talk-sdpa-math-job.yaml`, pending.
+The real "before the kernel" block: job `talk-sdpa-math-job.yaml`, config `4x8_compilemath`, the same
+compiled block with `TORCH_NEURONX_ENABLE_NKI_SDPA=0`, so SDPA becomes matmul -> softmax -> matmul.
+Pair `lbw-talk-sdpa-math/.../prof/pairs/rankr1-14107ms-dit-67edba54` (rank 1: +2% vs the system trace;
+rank 0's capture is +16%). Tools: `engine_overlap.py`, `attn_span.py` (this folder).
+
+| LingBot block, matmul -> softmax -> matmul | Measured | Deck (Wan2.2) |
+|---|---|---|
+| One block | **8.98 ms** (8.82 ms per call in the system trace) | 56.1 ms |
+| Tensor busy | **45.3%** | 39% |
+| Exactly one engine busy | **28.5%** | 36% |
+| Every engine idle | **16.6%** | 16% |
+| Tensor gaps > 50 us during attention | **6 gaps, 1.54 ms** (each ~0.3 ms) | 3 gaps, ~22 ms |
+| Softmax work (Vector + Scalar) while Tensor idle | **2.32 ms** | |
+| Attention on Vector (max, sum) / Scalar (exp) | **2.93 / 1.87 ms** | 12.8 / 7.7 ms |
+| Source line of every attention instruction (S5b) | `wan/modules/attention.py:802`, `F.scaled_dot_product_attention` | |
+| Whole pipeline in this mode | GEN 11.37 s, VAE 2.03 s, 13.4 s, 6.05 fps | 21.9 s |
+
+So the deck's S5a-S5d story (Tensor waits for the softmax) **does reproduce on LingBot**, once the
+compiler's automatic kernel is switched off: Vector and Scalar run the softmax in 6 stretches where
+Tensor sits idle.
 
 ## S5f / S5g: attention_cte
 
@@ -125,7 +143,28 @@ The per-call times (deck: 18.2 -> 5.3 ms) come from the block profiles of jobs 2
 
 Deck: 56.1 -> 17.3 ms; idle 16% -> 1.1%; Tensor busy 39% -> 79%. **Wrong model.**
 
-LingBot: needs a profile of `4x8_compilecte` (job 2, after job 1). Pending.
+LingBot, the same block both ways, same shard (pairs as in S5a):
+
+| | matmul -> softmax -> matmul | attention_cte (the compiler's) | Deck (Wan2.2) |
+|---|---|---|---|
+| Block | **8.98 ms** | **4.37 ms** (2.1x) | 56.1 -> 17.3 ms |
+| Attention span in the block | 7.16 ms | 2.52 ms | ~32 -> ~5 ms |
+| Softmax work while Tensor idle | 2.32 ms | 0.21 ms | |
+| Tensor gaps > 50 us during attention | 6, 1.54 ms | 3, 0.33 ms | |
+| Every engine idle | 16.6% | 17.1% | 16% -> 1.1% |
+| Tensor busy | 45.3% | 56.0% | 39% -> 79% |
+| 3+ engines busy | 22.1% | 28.1% | 16% -> 34% |
+| Pipeline GEN | 11.37 s | 6.07 s | |
+
+Note for the slide: on LingBot "every engine idle" does **not** drop (16.6% -> 17.1%). The kernel
+removes the softmax gaps, but the rest of the block (collective waits on GpSimd, transposes) keeps
+the idle time. The deck's 1.1% is Wan2.2 with no collectives in its profile.
+The explicit-cte block profile (job 3, `talk-cte-prof-job.yaml`), to explain S5g's slower path: pending.
+
+## S5j: The same approach for the VAE convolutions
+
+Deck: Wan2.2 VAE 6.0 -> 2.6 s with nkilib conv3d. **Wrong model.** LingBot's VAE path is compiled
+blocks, not nkilib conv3d (see S4e): 2.03 -> 1.39 -> 0.41 s.
 
 ## S7a: The frame rate decides how many chips
 
