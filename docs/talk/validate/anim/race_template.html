@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Measured times, drawn to scale</title>
+<style>
+  html,body{margin:0;height:100%;background:#141416;overflow:hidden}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:650;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 560" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Measured times, drawn to scale; the bars grow at the same rate, so the faster way finishes first.">
+  <rect width="1600" height="560" fill="#141416"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  // CFG: {unit, lanes: [{name, sub, color, segs: [[value, color, label]], end, note}]}  (filled in by build_trn3_deck.py)
+  var CFG = /*CONFIG*/null || {unit: "s", lanes: [
+    {name: "before", sub: "", color: "#e5484d", segs: [[3, "#55544f", "work"]], end: "3 s", note: ""},
+    {name: "after", sub: "", color: "#3fbf3f", segs: [[1, "#55544f", "work"]], end: "1 s", note: ""}]};
+  function clamp(x){ return x < 0 ? 0 : x > 1 ? 1 : x; }
+  function prog(t, a, d){ return clamp((t - a) / d); }
+  function ease(p){ return p < .5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2; }
+  function R(x, y, w, h, rx, fill, op){
+    return '<rect x="' + x + '" y="' + y + '" width="' + Math.max(0, w) + '" height="' + h + '" rx="' + rx + '" fill="' + fill + '" opacity="' + op + '"/>'; }
+  function T(x, y, size, txt, fill, op, anchor){
+    return '<text x="' + x + '" y="' + y + '" font-size="' + size + '" text-anchor="' + (anchor || 'start') + '" style="fill:' +
+      fill + '" opacity="' + op + '">' + txt + '</text>'; }
+  var L = CFG.lanes, n = L.length;
+  var X0 = 520, MAXW = 760, TOP = 34, H = (540 - TOP) / n;
+  var BH = Math.min(44, H * 0.40), TS = Math.min(30, H * 0.26), SS = Math.min(18, H * 0.16);
+  var tot = L.map(function(l){ return l.segs.reduce(function(a, s){ return a + s[0]; }, 0); });
+  var maxv = Math.max.apply(null, tot), PX = MAXW / maxv;          // to scale: pixels per unit
+  var T0 = 0.6, DUR = 4.2, RATE = MAXW / DUR;                        // same growth rate in every lane
+  var END = T0 + DUR + 2.2;
+
+  function render(t){
+    var s = "", fin = ease(prog(t, 0, 0.5));
+    s += T(X0, 22, 17, "time, to scale (" + CFG.unit + "); every bar grows at the same speed", "#898781", fin, "start");
+    for (var i = 0; i < n; i++){
+      var l = L[i], y = TOP + i * H, by = y + (H - BH) / 2;
+      s += T(30, by + BH / 2 + (l.sub ? -2 : TS * 0.35), TS, l.name, l.color, fin, "start");
+      if (l.sub) s += T(30, by + BH / 2 + SS + 6, SS, l.sub, "#c3c2b7", fin, "start");
+      var grown = Math.max(0, (t - T0) * RATE), x = X0;
+      for (var k = 0; k < l.segs.length; k++){
+        var sw = Math.min(l.segs[k][0] * PX, Math.max(0, grown - (x - X0)));
+        if (sw <= 0) break;
+        s += R(x, by, sw, BH, 6, l.segs[k][1], 0.9);
+        if (l.segs[k][2] && sw > 70) s += T(x + 10, by + BH / 2 + SS * 0.36, SS, l.segs[k][2], "#fff", 1, "start");
+        x += sw;
+      }
+      var done = grown >= tot[i] * PX;
+      if (done){
+        var tdone = T0 + tot[i] * PX / RATE, a = ease(prog(t, tdone, 0.35));
+        s += T(x + 14, by + BH / 2 + TS * 0.34, TS, l.end, l.color, a, "start");
+        if (l.note) s += T(x + 14, by + BH / 2 + TS * 0.34 + SS + 8, SS, l.note, "#c3c2b7", a, "start");
+      }
+      if (i > 0) s += '<line x1="30" y1="' + y + '" x2="1570" y2="' + y + '" stroke="#2c2c2a" stroke-width="1.5" opacity="' + fin + '"/>';
+    }
+    document.getElementById('dyn').innerHTML = s;
+  }
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var t0 = performance.now(), running = false;
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  var hm = /t=([\d.]+)/.exec(location.hash);
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END); return; }
+  function tick(now){
+    var t = (now - t0) / 1000;
+    if (t >= END){ render(END); running = false; return; }
+    render(t); requestAnimationFrame(tick);
+  }
+  running = true; requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code === 'Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>
