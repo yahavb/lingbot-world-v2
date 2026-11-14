@@ -1,377 +1,469 @@
 #!/usr/bin/env python3
 """Build demo/talk-deck-trn3.html: every validated slide as a BEFORE / AFTER pair.
 
-BEFORE = the slide exactly as in the original deck (~/Downloads/talk-deck_v2.html, md5 a03a9769),
-         red BEFORE banner, data-ref "<id>-BEFORE". Delete these after the review.
-AFTER  = the same slide with the numbers measured on LingBot-World v2, 8 trn3 chips
-         (docs/talk/validate/RESULTS.md), green AFTER banner, data-ref "<id>".
-Before/after slides get a two-lane (or n-lane) race animation: bars grow at the same rate,
-drawn to scale from the measured numbers, so the slower way is still running when the faster ends.
-B6b keeps its hand-made animation (anim/b6b_copy_vs_in_place.html).
+BEFORE = the slide exactly as in the original deck (~/Downloads/talk-deck_v2.html), red banner,
+         data-ref "<id>-BEFORE". Delete these after the review.
+AFTER  = THE SAME SLIDE (same title, layout, figure, point), with only the Wan2.2 / trn2 numbers,
+         file names and code replaced by the LingBot-World v2 ones measured on 8 trn3 chips
+         (docs/talk/validate/RESULTS.md). Green banner, data-ref "<id>-AFTER". Its notes list every
+         change, old -> new. Every edit is asserted: the build fails if the original text moved.
+B6b AFTER is the approved two-lane animation (demo/talk-deck.html).
 
-  python3 docs/talk/validate/build_trn3_deck.py [--orig ~/Downloads/talk-deck_v2.html]
+  python3 docs/talk/validate/build_trn3_deck.py
 """
-import argparse
 import html
 import json
 import os
 import re
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-ap = argparse.ArgumentParser()
-ap.add_argument("--orig", default=os.path.expanduser("~/Downloads/talk-deck_v2.html"))
-ap.add_argument("--out", default=os.path.join(REPO, "demo", "talk-deck-trn3.html"))
-args = ap.parse_args()
+ORIG = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/Downloads/talk-deck_v2.html")
+OUT = os.path.join(REPO, "demo", "talk-deck-trn3.html")
+GH = "https://github.com/yahavb/lingbot-world-v2/blob/main/"
 
-orig = open(args.orig, encoding="utf-8").read()
+orig = open(ORIG, encoding="utf-8").read()
 first = orig.rfind("<", 0, orig.index('data-ref="S0"'))
 last_ref = [m.start() for m in re.finditer(r'data-ref="', orig)][-1]
-k = orig.find("<script", last_ref)
-end_cells = orig.index("</div><!-- /stage -->", last_ref)   # keep the stage close, #jump, #hud and #notes in SUFFIX
+end_cells = orig.index("</div><!-- /stage -->", last_ref)
 PREFIX, SUFFIX = orig[:first], orig[end_cells:]
 
 
-def cell_of(ref):
-    i = orig.index('data-ref="%s"' % ref)
-    st = orig.rfind("<", 0, i)
-    nxt = orig.find('<div class="cell" data-ref="', i)
-    if nxt < 0:
-        nxt = end_cells
-    seg = orig[st:nxt]
-    e = seg.rfind("</div></div>") + len("</div></div>")
-    return seg[:e]
+def cell_of(src, ref):
+    i = src.index('data-ref="%s"' % ref)
+    st = src.rfind("<", 0, i)
+    nx = src.find('<div class="cell" data-ref="', i)
+    seg = src[st:nx if nx > 0 else len(src)]
+    return seg[:seg.rfind("</div></div>") + len("</div></div>")]
 
 
 CSS = """
-<style>
 .bab{position:absolute;top:20px;right:28px;z-index:5;padding:7px 18px;border-radius:9px;font-weight:800;
-     font-size:21px;letter-spacing:.12em;color:#fff}
+     font-size:21px;letter-spacing:.12em;color:#fff;text-align:left}
 .bab.before{background:#d03b3b}
 .bab.after{background:#0c8f0c}
-.bab small{display:block;font-size:11px;letter-spacing:.04em;font-weight:600;opacity:.9}
-.tbl td.ok{color:#4cd04c}
-.tbl td.no{color:#ff6b6b}
-</style>
+.bab small{display:block;font-size:11px;letter-spacing:.04em;font-weight:600;opacity:.92}
+.tl-lbl{font-size:15px;fill:#c3c2b7;font-weight:600}
+.tl-ax{font-size:12px;fill:#898781}
 """
 
 
 def banner(kind, why):
-    lab = "BEFORE" if kind == "before" else "AFTER"
-    return '<div class="bab %s">%s<small>%s</small></div>' % (kind, lab, html.escape(why))
+    return '<div class="bab %s">%s<small>%s</small></div>' % (kind, kind.upper(), html.escape(why))
 
 
-def before(ref, why):
-    c = cell_of(ref)
-    c = c.replace('data-ref="%s"' % ref, 'data-ref="%s-BEFORE"' % ref, 1)
-    c = re.sub(r'(<section class="slide[^"]*">)', lambda m: m.group(1) + banner("before", why), c, count=1)
-    c = c.replace('<div class="nt">', '<div class="nt"><p class="chk">BEFORE: the original slide, kept for the review. '
-                  'Delete this slide once the AFTER version is approved.</p>', 1)
+def with_banner(cell, ref, kind, why, notes_html=None):
+    c = cell.replace('data-ref="%s"' % ref, 'data-ref="%s-%s"' % (ref, kind.upper()), 1)
+    c = re.sub(r'(<section class="slide[^"]*">)', lambda m: m.group(1) + banner(kind, why), c, count=1)
+    if notes_html is not None:
+        a = c.index('<div class="nt">') + len('<div class="nt">')
+        b = c.rindex("</div></div>")
+        c = c[:a] + notes_html + c[b:]
     return c
 
 
-RACE = open(os.path.join(HERE, "anim", "race_template.html"), encoding="utf-8").read()
+# ───────────── figure builders, in the deck's own SVG classes ─────────────
+def hbars(cols, rows, x0=440, maxw=622, rowh=66, w=1152, vmax=None):
+    """cols: [(x, LABEL)]; rows: dict(label, v, text, bar, t, chips=[], step=None, extra=[(x, text, cls)])."""
+    vmax = vmax or max(r["v"] for r in rows)
+    h = 22 + rowh * len(rows) + 8
+    s = '<svg viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="%s">' % (
+        w, h, w, h, html.escape("; ".join("%s %s" % (r["label"], r["text"]) for r in rows)))
+    for x, lab in cols:
+        s += '<text class="lbl" x="%d" y="12">%s</text>' % (x, lab)
+    s += '<line class="ax" x1="0" y1="22" x2="%d" y2="22"/>' % w
+    for i, r in enumerate(rows):
+        y = 22 + i * rowh + rowh / 2
+        bw = maxw * r["v"] / vmax
+        g = '<g%s>' % (' data-step="%d"' % r["step"] if r.get("step") else "")
+        g += '<text class="tk" x="0" y="%.1f">%s</text>' % (y + 6, r["label"])
+        for k, ch in enumerate(r.get("chips", [])):
+            cx = 352 + 34 * k
+            g += ('<rect class="ichip" x="%d" y="%.1f" width="28" height="26" rx="7"/><text class="ichip-t" x="%d" y="%.1f" '
+                  'text-anchor="middle">%s</text>' % (cx, y - 14, cx + 14, y + 4, ch))
+        g += '<rect class="%s" x="%d" y="%.1f" width="%.1f" height="32" rx="4"/>' % (r["bar"], x0, y - 17, bw)
+        g += '<text class="%s" x="%.1f" y="%.1f">%s</text>' % (r["t"], x0 + bw + 10, y + 4, r["text"])
+        for ex, et, ec in r.get("extra", []):
+            g += '<text class="%s" x="%d" y="%.1f">%s</text>' % (ec, ex, y + 4, et)
+        s += g + "</g>"
+    return s + "</svg>"
 
 
-def race(cfg, title):
-    doc = RACE.replace("/*CONFIG*/null", json.dumps(cfg))
-    return ('<div class="anim" style="width:94%;margin:0 auto;height:auto;aspect-ratio:1600/' + str(cfg.get("h", 560)) + '">'
-            '<iframe title="%s" aria-label="%s" tabindex="-1" srcdoc="%s"></iframe></div>'
-            % (html.escape(title), html.escape(title), html.escape(doc, quote=True)))
+TLROWS = ["Tensor", "Vector", "Scalar", "GpSimd", "Sync"]
+TLCOL = {"Tensor": "#3987e5", "Vector": "#199e70", "Scalar": "#c98a2b", "GpSimd": "#7c6bd6", "Sync": "#6b6a64"}
 
 
-def stats(items, cols=None):
-    cols = cols or len(items)
-    out = '<div class="stats c%d">' % cols
-    for v, unit, label in items:
-        out += '<div class="stat g"><div class="v">%s <small>%s</small></div><div class="l">%s</div></div>' % (v, unit, label)
-    return out + "</div>"
+def timeline(prof, w, h, sel_label, gap_ms=0.05):
+    """Engine timeline drawn from the profile's instruction table (anim/profiles/*.json):
+    each engine's busy time; the selected call's instructions in red; Tensor gaps > gap_ms boxed."""
+    d = json.load(open(os.path.join(HERE, "anim", "profiles", prof)))
+    ms = d["ms"]; X0, X1 = 92, w - 12; top = 34; rh = (h - top - 40) / len(TLROWS)
+    sx = lambda t: X0 + (X1 - X0) * t / ms
+    s = ('<svg viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label="Engine timeline of one LingBot block, '
+         'drawn from its profile; red: %s">' % (w, h, w, h, html.escape(sel_label)))
+    s += '<rect x="0" y="0" width="%d" height="%d" rx="8" fill="#101012" stroke="#2c2c2a"/>' % (w, h)
+    s += '<text class="tl-lbl" x="12" y="22">drawn from the profile · red = %s</text>' % html.escape(sel_label)
+    for i, e in enumerate(TLROWS):
+        y = top + i * rh
+        s += '<text class="tl-lbl" x="12" y="%.1f">%s</text>' % (y + rh * 0.62, e)
+        s += '<rect x="%d" y="%.1f" width="%d" height="%.1f" fill="#18181b"/>' % (X0, y + 3, X1 - X0, rh - 6)
+        for a, b in d["eng"].get(e, []):
+            s += '<rect x="%.1f" y="%.1f" width="%.2f" height="%.1f" fill="%s"/>' % (sx(a), y + 5, max(.6, sx(b) - sx(a)), rh - 10, TLCOL[e])
+        for a, b in d["att"].get(e, []):
+            s += '<rect x="%.1f" y="%.1f" width="%.2f" height="%.1f" fill="#e5484d"/>' % (sx(a), y + 5, max(.6, sx(b) - sx(a)), rh - 10)
+    # Tensor gaps inside the selected call's span
+    att = [iv for e in TLROWS for iv in d["att"].get(e, [])]
+    if att:
+        a0, a1 = min(a for a, _ in att), max(b for _, b in att)
+        ten = sorted(d["eng"]["Tensor"])
+        for (p0, p1), (q0, q1) in zip(ten, ten[1:]):
+            if q0 - p1 > gap_ms and p1 >= a0 and q0 <= a1:
+                s += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="none" stroke="#fab219" stroke-width="2.5" '
+                      'stroke-dasharray="6 4"/>' % (sx(p1), top + 1, sx(q0) - sx(p1), rh - 2))
+    for t in range(0, int(ms) + 1):
+        if ms > 4 or True:
+            pass
+    step = 1 if ms > 3 else 0.5
+    t = 0.0
+    while t <= ms + 1e-9:
+        s += '<text class="tl-ax" x="%.1f" y="%d" text-anchor="middle">%g ms</text>' % (sx(t), h - 14, t)
+        t += step
+    return s + "</svg>"
 
 
-def table(head, rows, cls="tbl"):
-    out = '<table class="%s"><tr>' % cls + "".join("<th>%s</th>" % h for h in head) + "</tr>"
-    for r in rows:
-        out += "<tr>" + "".join("<td>%s</td>" % c for c in r) + "</tr>"
-    return out + "</table>"
+def code_panel(cap, path, line, lines, hl=0, size=16):
+    pre = "".join('<span class="ln%s">%s</span>' % (" hl" if i == hl else "", html.escape(l)) for i, l in enumerate(lines))
+    return ('<div class="code"><div class="cap"><span>%s</span><span class="lnks"><a class="lnk" href="%s%s#L%s" '
+            'target="_blank" rel="noopener">%s</a></span></div><pre style="font-size:%dpx">%s</pre></div>'
+            % (cap, GH, path, line, path, size, pre))
 
 
-def after(ref, h1, body, takeaway, notes, why="LingBot-World v2 · 8 trn3 chips"):
-    tk = ('<p class="takeaway"><span class="k">Takeaway</span><span>%s</span></p>' % takeaway) if takeaway else ""
-    nts = "".join("<p>%s</p>" % n for n in notes)
-    return ('<div class="cell" data-ref="%s"><section class="slide">%s<h1>%s</h1><div class="body"><div class="stack" '
-            'style="gap:14px">%s</div></div>%s</section><div class="nt"><p class="meta">AFTER · measured on LingBot-World '
-            'v2, 8 trn3 chips (xl-lnc2, TP4 x CP8 unless noted), 81 frames 480x768 · source docs/talk/validate/RESULTS.md'
-            '</p>%s</div></div>\n' % (ref, banner("after", why), h1, body, tk, nts))
+# ───────────── edit machinery ─────────────
+class Miss(Exception):
+    pass
 
 
-RED, GRN, GRY, BLU, YEL = "#e5484d", "#3fbf3f", "#55544f", "#3987e5", "#fab219"
-DIT, VAE = "#3987e5", "#199e70"
+def edit(cell, ops):
+    """ops: ("r", old, new) | ("re", pattern, new) | ("svg", n, new) | ("code", n, new) | ("img", new) | ("table", new)."""
+    body_end = cell.index('<div class="nt">')
+    b, notes = cell[:body_end], cell[body_end:]
+    for op in ops:
+        k = op[0]
+        if k == "r":
+            if op[1] not in b:
+                raise Miss(op[1][:80])
+            b = b.replace(op[1], op[2])
+        elif k == "re":
+            b2 = re.sub(op[1], op[2], b, count=1, flags=re.S)
+            if b2 == b:
+                raise Miss(op[1][:80])
+            b = b2
+        elif k in ("svg", "code", "img", "table"):
+            pat = {"svg": r"<svg\b.*?</svg>", "code": r'<div class="code">.*?</pre></div>',
+                   "img": r"<img\b[^>]*>", "table": r"<table\b.*?</table>"}[k]
+            ms = list(re.finditer(pat, b, flags=re.S))
+            n = op[1] if k in ("svg", "code") else 0
+            new = op[2] if k in ("svg", "code") else op[1]
+            if len(ms) <= n:
+                raise Miss("%s #%d" % (k, n))
+            m = ms[n]
+            b = b[:m.start()] + new + b[m.end():]
+    return b + notes
 
-# ───────────────────────── the pairs ─────────────────────────
-P = []
+
+def notes(changes, extra=()):
+    li = "".join("<li>%s</li>" % c for c in changes)
+    ex = "".join("<p>%s</p>" % e for e in extra)
+    return ('<p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames '
+            '480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul>%s</ul>%s'
+            % (li, ex))
 
 
-def pair(ref, why_before, after_html):
-    P.append(before(ref, why_before))
-    P.append(after_html)
+PAIRS = []
 
+
+def pair(ref, why_before, ops, changes, extra=(), why_after="LingBot-World v2 · 8 trn3 chips", src=None):
+    c = cell_of(src or orig, ref)
+    PAIRS.append(with_banner(c, ref, "before", why_before,
+                             None))
+    try:
+        a = edit(c, ops) if ops else c
+    except Miss as e:
+        sys.exit("EDIT MISS on %s: %r" % (ref, str(e)))
+    PAIRS.append(with_banner(a, ref, "after", why_after, notes(changes, extra)))
+
+
+# ═══════════════════ the slides ═══════════════════
+pair("S0a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 → 8.7 s",
+     [("r", "Wan2.2-TI2V-5B", "LingBot-World v2"), ("r", "704×544", "480×768"),
+      ("r", "one Trainium2 device", "8 Trainium3 chips"), ("r", "from 76.6 s to 8.7 s", "from 21.6 s to 4.07 s")],
+     ["Wan2.2-TI2V-5B → LingBot-World v2", "704×544 → 480×768", "one Trainium2 device → 8 Trainium3 chips",
+      "76.6 → 8.7 s → 21.6 → 4.07 s (eager → loop_engineering_8dev flags without chained calls)"])
+
+pair("S1a", "numbers on this slide are already LingBot's", [],
+     ["no number on the slide changes: 14B, 40 blocks, 7 chunks, 4,320 tokens, 17,280 keys, 4 steps are LingBot's",
+      "measured: 35 forwards per video (28 denoise + 7 commits), 34 with LINGBOT_SKIP_LAST_COMMIT=1"])
+
+pair("S3a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 s",
+     [("code", 0, code_panel("Move the model to the device", "generate.py", 663,
+                             ['torch.neuron.set_device(local_rank)', 'dist.init_process_group(backend="neuron", ...)',
+                              'text_encoder.model.to(device)'], size=17)),
+      ("r", '<div class="v">2 <small>changes</small></div><div class="l">RoPE with real cos/sin tables · no float64</div>',
+       '<div class="v">19.2 + 2.03 <small>s</small></div><div class="l">DiT (35 forwards) + VAE, eager, native SDPA</div>'),
+      ("r", "76.6 s <small>baseline</small>", "21.6 s <small>baseline</small>"),
+      ("r", "Correct, and saved as the reference", "Correct (0.0129 vs fp32), and saved as the reference")],
+     ["code: Wan2.2 inference_neuron_ti2v.py → LingBot generate.py:663 / :341",
+      "\"2 changes: RoPE with real cos/sin tables · no float64\" (Wan2.2 port) → 19.2 s DiT + 2.03 s VAE",
+      "76.6 s → 21.6 s baseline (config 4x8_eager: nothing compiled, native SDPA, every loop flag off)",
+      "added: step-0 error vs fp32 CPU 0.0129"])
+
+pair("S4b", "Wan2.2 models/fast_dit.py, FFN 3072 → 14336 → 3072",
+     [("code", 0, code_panel("One graph per block", "wan/modules/model_fast.py", 2985,
+                             ['_scope = os.environ.get("COMPILE_SCOPE", "blocks")',
+                              'for _i in range(len(self.blocks)):',
+                              '    self.blocks[_i] = torch.compile(',
+                              '        self.blocks[_i], backend="neuron", fullgraph=True, dynamic=False)'], hl=2))],
+     ["code: Wan2.2 models/fast_dit.py → LingBot wan/modules/model_fast.py:2985 (COMPILE_SCOPE=blocks)",
+      "notes: LingBot's FFN is 5120 → 13824 → 5120 (Wan2.2-5B: 3072 → 14336 → 3072)"])
+
+pair("S4c", "Wan2.2: 4.4 → 1.91 s/step, 76.6 → 36.8 s",
+     [("r", "shared by all 30 DiT blocks", "shared by all 40 DiT blocks"),
+      ("r", "4.4 → 1.91 <small>s/step</small>", "0.54 → 0.173 <small>s/forward</small>"),
+      ("r", "76.6 → 36.8 <small>s</small>", "21.6 → 8.09 <small>s</small>")],
+     ["30 → 40 DiT blocks", "DiT 4.4 → 1.91 s/step → 0.54 → 0.173 s per forward (no CFG in LingBot)",
+      "76.6 → 36.8 s → 21.6 → 8.09 s per video (4x8_eager vs 4x8_compile)"])
+
+pair("S4e", "Wan2.2 VAE; for LingBot the result is the opposite",
+     [("r", "Compile is not always the answer: the VAE", "On LingBot, compiling the VAE wins"),
+      ("table", '<table class="tbl big"><thead><tr><th>VAE</th><th class="r">Run time</th><th class="r">vs fp32 decode</th></tr></thead><tbody>'
+                '<tr class="bad"><td>Eager, upstream decoder (per conv)</td><td class="r">2.03 s</td><td class="r">56.3 dB</td></tr>'
+                '<tr><td>Whole decoder blocks compiled</td><td class="r">1.38 s</td><td class="r">56.3 dB</td></tr>'
+                '<tr class="win"><td><b>+ bf16, -O1, 2-D tiles, 6 frames per step</b></td><td class="r"><b>0.41 s</b></td><td class="r">52.7 dB</td></tr>'
+                '</tbody></table>'),
+      ("code", 0, code_panel("One graph per decoder block", "wan/modules/vae2_1_fused.py", 325,
+                             ['return torch.compile(fn, backend="neuron", dynamic=False, fullgraph=True)'])),
+      ("r", "Compile where shapes are static and the compiler is strong; elsewhere, call a kernel.",
+       "Measure both: on LingBot the compiler wins on the VAE, 5× over eager.")],
+     ["title: \"Compile is not always the answer\" → \"On LingBot, compiling the VAE wins\" (the measured result is the opposite of Wan2.2)",
+      "table: Wan2.2 compile 11.5-12.9 s / static 12.8-14.2 s / eager+NKI 1.7 s → LingBot eager 2.03 s, compiled blocks 1.38 s, tuned 0.41 s",
+      "column Compile time (not measured for LingBot) → accuracy vs fp32 decode",
+      "code: Wan2.2 vae2_2.py _rms_silu → LingBot vae2_1_fused.py:325", "takeaway rewritten to match"])
+
+pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
+     [("r", "One compiled DiT block, native SDPA, one core: 56.1 ms",
+       "One compiled LingBot DiT block, SDPA as matmul → softmax → matmul, one core: 8.98 ms"),
+      ("img", timeline("iv_blk_sdpa.json", 726, 478, "F.scaled_dot_product_attention (attention.py:802)")),
+      ("r", "<b>Three long Tensor gaps:</b> ~22 of 56 ms", "<b>Six Tensor gaps:</b> 1.54 of 8.98 ms (dashed)"),
+      ("r", "<b>Three times,</b> once per head", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle")],
+     ["screenshot of the Wan2.2 block → engine timeline drawn from the LingBot block's profile (pairs/1_sdpa_math_rank1, rank 1)",
+      "56.1 ms → 8.98 ms; three gaps ~22 ms → six gaps 1.54 ms", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
+     ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself."])
+
+pair("S5b", "Wan2.2 Explorer screenshot",
+     [("img", timeline("iv_demo_sdpa.json", 726, 478, "every instruction of F.scaled_dot_product_attention")),
+      ("r", "red from ~5 to ~34 ms", "red from 0 to 2.7 ms"),
+      ("r", "short red bursts with gaps", "idle from 0.71 to 1.88 ms (dashed)")],
+     ["screenshot → timeline drawn from pairs/demo_sdpa (one LingBot rank's attention, one core, demo/sdpa_vs_nki.py)",
+      "Vector, Scalar red ~5-34 ms → 0-2.7 ms", "Tensor: one 1.17 ms gap, 0.71-1.88 ms"],
+     ["To show the real Explorer view: open pairs/demo_sdpa/sdpa.neff + sdpa.ntff (demo/README.md)."])
+
+pair("S5d", "Wan2.2: 39% / 36% / 16%",
+     [("r", "One native-SDPA block, 56.1 ms, measured from the profile", "One LingBot block, SDPA as matmul → softmax → matmul, 8.98 ms, measured from the profile"),
+      ("re", r">39%<", ">45%<"), ("re", r">36%<", ">29%<"), ("re", r">16%<", ">17%<")],
+     ["56.1 ms → 8.98 ms", "Tensor busy 39% → 45%", "one engine busy 36% → 29% (28.5%)", "every engine idle 16% → 17% (16.6%)"])
+
+pair("S5f", "Wan2.2: 18.2 → 5.3 ms per call, 7,854 tokens",
+     [("svg", 0, hbars([(0, "SELF-ATTENTION, ONE LINGBOT RANK: 640 × 17,280"), (298, "PER CALL")],
+                       [dict(label="Native SDPA", v=2.687, text="2.69 ms", bar="bar-x", t="t"),
+                        dict(label="nkilib attention_cte", v=1.574, text="1.57 ms", bar="bar-g", t="t-g", step=1)],
+                       x0=298, maxw=744, rowh=120))],
+     ["7,854 tokens (Wan2.2) → one LingBot rank: 640 queries × 17,280 keys, 10 heads",
+      "18.2 → 5.3 ms → 2.69 → 1.57 ms device time per call (demo/sdpa_vs_nki.py, one core)"])
+
+pair("S5g", "Wan2.2: 16.2 → 13.2 s; for LingBot calling it yourself is slower",
+     [("code", 0, code_panel("Inside the compiled block", "wan/modules/attention.py", 350,
+                             ['from nkilib.core.attention.attention_cte import attention_cte',
+                              '_attention_cte = wrap_nki(attention_cte)',
+                              'out = _attention_cte(q_c, k_c, v_c, scale=1.0, causal_mask=False,',
+                              '                     tp_q=True, tp_k=True, tp_out=False)'], hl=2)),
+      ("r", "16.2 → 13.2 <small>s</small>", "8.09 → 11.0 <small>s</small>"),
+      ("r", "per video, self- and cross-attention", "per video: slower than native SDPA, which already uses it"),
+      ("r", "Reach for nkilib first: production kernels, called like any torch op.",
+       "Check what the compiler already does: native SDPA already runs attention_cte here.")],
+     ["code: Wan2.2 models/fast_dit.py → LingBot wan/modules/attention.py:350",
+      "16.2 → 13.2 s → 8.09 s (native SDPA, the compiler puts in attention_cte) vs 11.0 s (our own call: it copies each KV chunk into a padded buffer, attention.py:449)",
+      "takeaway changed: the LingBot result is the opposite"])
+
+pair("S5h", "Wan2.2: 56.1 → 17.3 ms, Explorer screenshot",
+     [("r", "The same block with the kernel: 56.1 → 17.3 ms", "The same block with the kernel: 8.98 → 4.37 ms"),
+      ("img", timeline("iv_blk_cte.json", 730, 480, "attention_cte instructions")),
+      ("r", "<b>Self-attention ~5 ms</b> (was ~32)", "<b>Attention 2.52 ms</b> (was 7.16)"),
+      ("r", "<b>No Tensor gaps:</b> the softmax overlaps the matmuls", "<b>Softmax with Tensor idle 0.21 ms</b> (was 2.32)")],
+     ["56.1 → 17.3 ms → 8.98 → 4.37 ms (same rank, same shard: pairs/1_sdpa_math_rank1 vs pairs/2_attention_cte_rank1)",
+      "screenshot → timeline drawn from the LingBot profile", "self-attention ~32 → ~5 ms → attention span 7.16 → 2.52 ms",
+      "\"no Tensor gaps\" → softmax with Tensor idle 2.32 → 0.21 ms (a few short gaps remain)"])
+
+pair("S5i", "Wan2.2 table",
+     [("table", '<table class="tbl big"><thead><tr><th></th><th class="r">Native SDPA</th><th class="r">attention_cte</th></tr></thead><tbody>'
+                '<tr><td>Block</td><td class="r">8.98 ms</td><td class="r"><b>4.37 ms</b></td></tr>'
+                '<tr><td>Attention</td><td class="r">7.16 ms</td><td class="r"><b>2.52 ms</b></td></tr>'
+                '<tr><td>Every engine idle</td><td class="r">16.6%</td><td class="r">17.1%</td></tr>'
+                '<tr><td>Tensor busy</td><td class="r">45%</td><td class="r"><b>56%</b></td></tr>'
+                '</tbody></table>')],
+     ["block 56.1 / 17.3 ms → 8.98 / 4.37 ms", "self-attention ~32 / ~5 ms → attention span 7.16 / 2.52 ms",
+      "every engine idle 16% / 1.1% → 16.6% / 17.1% (collective waits and transposes stay in LingBot's block)",
+      "Tensor busy 39% / 79% → 45% / 56%"])
+
+pair("S5j", "Wan2.2 nkilib conv3d VAE",
+     [("r", "The same approach for the VAE convolutions", "The VAE: compile whole blocks, then tune"),
+      ("code", 0, code_panel("Whole decoder blocks compiled", "wan/modules/vae2_1_fused.py", 325,
+                             ['return torch.compile(fn, backend="neuron", dynamic=False, fullgraph=True)'])),
+      ("r", "6.0 → 2.6 <small>s</small>", "2.03 → 0.41 <small>s</small>")],
+     ["title: conv3d kernels (Wan2.2) → LingBot compiles whole VAE blocks", "code: kernels/vae_conv3d.py → vae2_1_fused.py:325",
+      "VAE 6.0 → 2.6 s → 2.03 → 0.41 s (B4h has every step)"])
+
+pair("S7a", "trn2: 18.64 and 25.02 fps",
+     [("svg", 0, hbars([(0, "LINGBOT-WORLD v2 · ONE 81-FRAME CLIP, 4 DENOISE STEPS · TRN3")],
+                       [dict(label="8 chips, main", v=18.08, text="18.08 fps", bar="bar", t="t-v"),
+                        dict(label="8 chips, best flags", v=19.9, text="19.9 fps", bar="bar-g", t="t-g")],
+                       x0=300, maxw=700, rowh=76))],
+     ["8 chips 18.64 fps (trn2) → 18.08 fps (main, q20) and 19.9 fps (loop_engineering_8dev flags, no chained calls) on trn3",
+      "16 chips 25.02 fps (trn2) removed: not measured (over the 8-chip budget), and it needs chained calls, which assert on trn3"])
+
+pair("S7d", "Wan2.2 VAE 9.0 → 6.0 s",
+     [("code", 0, code_panel("Sequence parallelism inside the block graph", "wan/modules/model_fast.py", 792,
+                             ['g = fc.all_gather_tensor(h[0].t().contiguous(), 0, m)   # token shard -> all tokens',
+                              'u = torch.matmul(_w(ffn[0]), g) ...',
+                              'r = fc.reduce_scatter_tensor(y2, "sum", 0, m)            # back to the shard'])),
+      ("r", "9.0 → 6.0 <small>s</small>", "18.2 → 2.03 <small>s</small>"),
+      ("r", "17.88 <small>fps</small>", "18.08 <small>fps</small>")],
+     ["code: Wan2.2 fast_dit.py → LingBot model_fast.py:792 (feature-major FFN under SP)",
+      "VAE 9.0 → 6.0 s → 18.2 s on one core → 2.03 s with one width tile per core, 32 cores",
+      "17.88 fps → 18.08 fps (q20, re-run on trn3)"])
+
+pair("S9a", "VAE 44.6 dB is Wan2.2",
+     [("r", "<b>Within the bf16 floor</b>", "<b>0.0108</b>"), ("r", "<b>44.6 dB</b>", "<b>52.7 dB</b>")],
+     ["\"within the bf16 floor\" → 0.0108 rel-RMS, step-0 noise prediction vs an fp32 CPU forward (q20)",
+      "44.6 dB (Wan2.2) → 52.7 dB, VAE frames vs an fp32 CPU decode of the same latents"])
+
+pair("S9b", "the Wan2.2 journey",
+     [("r", "The journey: 76.6 s → 8.7 s per video", "The journey: 21.6 s → 4.07 s per video"),
+      ("svg", 0, hbars([(0, "LINGBOT-WORLD v2 · 8 TRN3 CHIPS"), (352, "IDEAS"), (440, "PER VIDEO")],
+                       [dict(label="Eager", v=21.62, text="21.6 s", bar="bar-m", t="t-v", chips=["1"]),
+                        dict(label="+ torch.compile", v=8.09, text="8.09 s", bar="bar", t="t-v", chips=["2"]),
+                        dict(label="+ NKI attention, SP, fused VAE", v=4.48, text="4.48 s", bar="bar", t="t-v", chips=["3", "4"]),
+                        dict(label="+ 8dev flags, no chained calls", v=4.07, text="4.07 s", bar="bar-g", t="t-g", chips=["3", "4"])]))],
+     ["76.6 / 36.8 / 16.1 / 10.8 / 8.7 s (Wan2.2) → 21.6 / 8.09 / 4.48 / 4.07 s (LingBot)",
+      "A100 16.92 s removed: no A100 number for LingBot"])
+
+pair("S9c", "16 and 8 trn2 devices",
+     [("r", "LingBot-World v2: 25 fps on 16 devices, 18.4 on 8", "LingBot-World v2: 19.9 fps on 8 trn3 chips"),
+      ("svg", 0, hbars([(0, "8 TRN3 CHIPS (32 RANKS)"), (440, "GEN + VAE PER VIDEO"), (1080, "FPS")],
+                       [dict(label="Eager", v=21.62, text="21.6 s", bar="bar-m", t="t-v", extra=[(1080, "3.75", "t-v")]),
+                        dict(label="+ compiled blocks", v=8.09, text="8.09 s", bar="bar", t="t-v", extra=[(1080, "10.0", "t-v")]),
+                        dict(label="+ q20 flags (main)", v=4.48, text="4.48 s", bar="bar", t="t-v", extra=[(1080, "18.1", "t-v")]),
+                        dict(label="today's main flags", v=4.68, text="4.68 s", bar="bar", t="t-v", extra=[(1080, "17.3", "t-v")]),
+                        dict(label="+ 8dev flags, no chained calls", v=4.07, text="4.07 s", bar="bar-g", t="t-g", extra=[(1080, "19.9", "t-g")])],
+                       maxw=560))],
+     ["16 trn2 devices table (11.90 → 3.24 s, 25.02 fps) → 8 trn3 chips: 21.6 → 4.07 s, 19.9 fps",
+      "8 trn2 devices with the check 4.40 s / 18.40 fps → not measurable on trn3 (the check needs chained calls)"])
+
+pair("S9d", "17.3 fps / 1.07 s used a separate VAE deployment",
+     [("r", "half a trn3 · ~0.58 s per chunk", "half a trn3 · 0.554 s per chunk"),
+      ("r", ">Fused VAE<", ">Fused VAE (same chips)<"),
+      ("r", "17.3 <small>fps</small>", "11.8 <small>fps</small>"), ("r", "~1.07 <small>s</small>", "2.05 <small>s</small>")],
+     ["~0.58 s per chunk → 0.554 s (DiT, measured server-side)",
+      "fused VAE on its own deployment → on the same 8 chips (a separate VAE needs more than the 8-chip budget)",
+      "17.3 fps → 11.8 fps; ~1.07 s → 2.05 s key press to new frames (VAE inline: DiT and VAE run one after the other)"],
+     ["With the VAE on other chips the chunk period would be about the DiT's 0.55 s: not measured."])
+
+pair("S11c", "Wan2.2 VAE warm-up 186 / 21 / 3.6 s",
+     [("svg", 0, hbars([(0, "WARM-UP RUN"), (128, "GEN TIME")],
+                       [dict(label="Run 1", v=151.0, text="151 s", bar="bar-x", t="t"),
+                        dict(label="Run 2", v=4.28, text="4.28 s", bar="bar-w", t="t", step=1),
+                        dict(label="Run 3", v=4.27, text="4.27 s", bar="bar-g", t="t-g", step=2)],
+                       x0=128, maxw=944, rowh=84))],
+     ["VAE time 186 / 21 / 3.6 s (Wan2.2) → LingBot GEN time 151 / 4.28 / 4.27 s (today's main flags, 4x8_final)"])
+
+pair("B4h", "64 ranks on trn2",
+     [("svg", 0, hbars([(0, "VAE, 32 RANKS, TRN3"), (440, "TIME"), (1010, "VS FP32 DECODE")],
+                       [dict(label="Upstream, per conv", v=2.03, text="2.03 s", bar="bar-m", t="t-v", extra=[(1010, "56.3 dB", "t-v")]),
+                        dict(label="Whole blocks compiled", v=1.38, text="1.38 s", bar="bar", t="t-v", extra=[(1010, "56.3 dB", "t-v")]),
+                        dict(label="bf16 convolutions", v=0.86, text="0.86 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
+                        dict(label="-O1, norm as a matmul", v=0.65, text="0.65 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
+                        dict(label="2-D tiles", v=0.46, text="0.46 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
+                        dict(label="6 frames per step", v=0.41, text="0.41 s", bar="bar-g", t="t-g", extra=[(1010, "52.7 dB", "t-g")])],
+                       maxw=480, rowh=56))],
+     ["64 ranks trn2 → 32 ranks trn3", "3.01 / 1.36 / 0.80 / 0.55 / 0.33 / 0.31 s → 2.03 / 1.38 / 0.86 / 0.65 / 0.46 / 0.41 s",
+      "43.5 → 56.6 dB → 56.3 dB from the start (no padding bug at this tiling); bf16 costs 3.6 dB (56.3 → 52.7)"])
+
+pair("B4i", "64 ranks on trn2",
+     [("r", "UPSTREAM DECODER, 64 RANKS", "UPSTREAM DECODER, 32 RANKS"), ("r", "~3 s", "2.03 s"),
+      ("r", "~3 → 1.36 <small>s</small>", "2.03 → 1.38 <small>s</small>"), ("r", "0.31 <small>s</small>", "0.41 <small>s</small>")],
+     ["64 → 32 ranks", "upstream ~3 s → 2.03 s", "~3 → 1.36 s → 2.03 → 1.38 s", "0.31 s after tuning → 0.41 s",
+      "\"convolution: 0.2 s\" kept from the original: not re-measured on trn3"])
+
+pair("B6a", "trn2, 16 devices",
+     [("r", "1.7 ms of a 10.4 ms block", "+3.03 s per video (7.37 vs 4.34 s)"),
+      ("r", "heads scaled by 0.94–0.99", "error vs fp32 0.032 (vs 0.011 read in place)")],
+     ["copy 1.7 ms of a 10.4 ms block → +3.03 s per video on 8 trn3 chips (LINGBOT_CTE_MERGE off vs on)",
+      "heads scaled by 0.94-0.99 → step-0 error vs fp32 0.032 vs 0.011 (the zero keys' effect, measured end to end)"],
+     ["Per-block ms of the copy at q20: pending job talk-b6-nomerge."])
+
+PAIRS.append(with_banner(cell_of(orig, "B6b"), "B6b", "before", "trn2: 8.95 → 5.73 s, 3.28 → 2.88 ms"))
+cur = open(os.path.join(REPO, "demo", "talk-deck.html"), encoding="utf-8").read()
+PAIRS.append(with_banner(cell_of(cur, "B6b"), "B6b", "after", "LingBot-World v2 · 8 trn3 chips · approved"))
+
+pair("B6c", "trn2 numbers",
+     [("r", "The copy took 1.7 of 10.4 ms per block.", "7.37 → 4.34 s per video."),
+      ("r", "3.28 → 2.88 ms per block.", "4.34 → 4.08 s per video."),
+      ("r", "Generation 3.94 → 3.66 s per video.", "K layout 4.32 → 4.08 s, V tiles 4.20 → 4.08 s.")],
+     ["1.7 of 10.4 ms → 7.37 → 4.34 s", "3.28 → 2.88 ms per block → 4.34 → 4.08 s per video",
+      "3.94 → 3.66 s → 4.32 → 4.08 s (LINGBOT_K_BLOCKED) and 4.20 → 4.08 s (LINGBOT_CTE_VGROUP=8)"])
+
+NA = ('<p class="dek" style="color:#fab219">Not measurable on trn3: the shortcut needs chained kernel calls, which assert '
+      'on trn3 (kernels/attention_cte_lb.py:767). Numbers below are trn2.</p>')
+for ref in ("B6d", "B6g", "B6h"):
+    pair(ref, "trn2, branch loop_engineering_8dev",
+         [("re", r"(</h1>)", r"\1" + NA.replace("\\", "\\\\"))],
+         ["added: not measurable on trn3 (chained calls assert, attention_cte_lb.py:767; the shortcut only switches on with chaining, model_fast.py:1389)",
+          "numbers unchanged: they stay trn2 results" + (" · the code matches kernels/attention_cmax2_lb.py:389-403" if ref == "B6h" else "")],
+         why_after="trn2 only · cannot run on trn3")
+
+pair("B6e", "trn2: 3.94 → 3.74 → 3.66 s",
+     [("r", "GEN 3.94 → 3.74 s", "GEN 4.20 → 4.08 s"), ("r", "3.74 → 3.66 s", "4.32 → 4.08 s"),
+      ("r", "−250 µs per block", "4.12 → 4.08 s")],
+     ["8 V tiles per DMA: 3.94 → 3.74 s → 4.20 → 4.08 s", "K in the all-gather's layout: 3.74 → 3.66 s → 4.32 → 4.08 s",
+      "cross-attention cache layout: −250 µs per block → 4.12 → 4.08 s per video",
+      "each is q20 with that one flag off vs all on, 8 trn3 chips"])
+
+pair("B6f", "trn2, TP4 × CP16, 2.5 ms",
+     [("r", "Backup: one block now, 2.5 ms", "Backup: one block now, 2.92 ms"),
+      ("r", "TP4 × CP16, LingBot-World v2", "TP4 × CP8, LingBot-World v2, q20, 8 trn3 chips"),
+      ("r", '~350 <small>µs</small></div><div class="l">idle, waiting for K/V all-gathers', '236 <small>µs</small></div><div class="l">every engine idle'),
+      ("r", '~310 <small>µs</small></div><div class="l">FFN', '1.09 <small>ms</small></div><div class="l">projections, FFN, norms'),
+      ("r", '~150 <small>µs</small></div><div class="l">merging (data layout)', '0.11 <small>ms</small></div><div class="l">attention merge and prep'),
+      ("r", '~100 <small>µs</small></div><div class="l">K/V loads', '1.22 <small>ms</small></div><div class="l">attention kernel')],
+     ["2.5 ms at TP4 × CP16 (trn2, 270 tokens per rank) → 2.92 ms at TP4 × CP8 (trn3, 540 tokens per rank)",
+      "the four parts re-measured with engine_overlap on lbw-talk-b6-layouts/lnc2_4x8_q20 (rank 0 pair); they are busy times and overlap"])
+
+pair("B7c", "Wan2.2 layouts on one trn2 device",
+     [("re", r"<h1>[^<]*</h1>", "<h1>Backup: three layouts on 8 trn3 chips</h1>"),
+      ("svg", 0, hbars([(0, "LAYOUT, LINGBOT, 8 TRN3 CHIPS"), (440, "PER VIDEO"), (1080, "FPS")],
+                       [dict(label="TP2 × CP16", v=5.46, text="5.46 s", bar="bar-m", t="t-v", extra=[(1080, "14.9", "t-v")]),
+                        dict(label="TP8 × CP4 (TP across chips)", v=4.81, text="4.81 s", bar="bar", t="t-v", extra=[(1080, "16.8", "t-v")]),
+                        dict(label="TP4 × CP8 (TP inside a chip)", v=4.50, text="4.50 s", bar="bar-g", t="t-g", extra=[(1080, "18.0", "t-g")])],
+                       maxw=560))],
+     ["four Wan2.2 layouts inside one trn2 device (29.4 → 20.6 ms per block) → three LingBot layouts on 8 trn3 chips, per video",
+      "per-block column removed: not measured per layout"])
 
 title = ('<div class="cell" data-ref="T0"><section class="slide title-slide"><h1>LingBot-World v2 on Trainium3: '
          'the validated numbers</h1><p class="byline kind">Every slide twice: <b style="color:#ff6b6b">BEFORE</b> '
-         '(the original) then <b style="color:#4cd04c">AFTER</b> (measured on LingBot, 8 trn3 chips). Delete the '
-         'BEFORE slides once reviewed.</p></section><div class="nt"><p>Built by docs/talk/validate/build_trn3_deck.py '
-         'from the original deck and RESULTS.md. Search for data-ref="...-BEFORE" to remove the originals.</p></div></div>\n')
-
-pair("S0a", "Wan2.2-TI2V-5B, one trn2 device",
-     after("S0a", "Four ideas, one worked example",
-           stats([("21.6 → 4.09", "s", "LingBot-World v2, one 81-frame 480×768 video, 8 trn3 chips"),
-                  ("3.75 → 19.8", "fps", "eager on the device → all four ideas")], 2),
-           "The same four ideas, measured on the world model itself.",
-           ["21.6 s: eager, nothing compiled, native SDPA (4x8_eager). 4.09 s: loop_engineering_8dev flags without "
-            "chained calls (4x8_d8nochain), 19.81 / 19.92 fps in two processes, bitwise repeatable."]))
-
-pair("S1a", "the counts were right; the forward count needs one word",
-     after("S1a", "The pipeline we optimize, end to end",
-           table(["", "LingBot-World v2 (measured config)"],
-                 [["T5", "once per prompt"], ["DiT", "14B, 40 blocks, 7 chunks × 3 latent frames, 4,320 tokens per chunk, "
-                   "KV cache up to 17,280 keys, 4 steps, no CFG"],
-                  ["forwards per video", "35 (28 denoise + 7 cache commits); 34 when the last commit is skipped "
-                   "(<code>LINGBOT_SKIP_LAST_COMMIT=1</code>)"],
-                  ["VAE", "decodes 21 latent frames into 81 frames"]]),
-           None, ["35 forwards counted by the [BENCH] DiT forwards line of 4x8_eager and 4x8_compile."]))
-
-pair("S3a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 s",
-     after("S3a", "Eager first: move the model to the device",
-           stats([("21.6", "s", "per video, eager, native SDPA"), ("19.2", "s", "DiT (35 forwards, 0.54 s each)"),
-                  ("2.03", "s", "VAE (eager, 32 ranks)"), ("0.0129", "", "step-0 error vs fp32 CPU")], 4),
-           "Correct first, fast second: every optimization must reproduce this output.",
-           ["Config 4x8_eager: LINGBOT_COMPILE_DIT=0, ATTENTION_BACKEND=sdpa, every loop flag off. First pass "
-            "(per-op compile) 184.8 s; GEN 19.59 s steady. VAE vs an fp32 CPU decode 56.4 dB.",
-            "Code: generate.py with the eager settings above (the BEFORE slide's inference_neuron_ti2v.py is Wan2.2)."]))
-
-pair("S4b", "Wan2.2 models/fast_dit.py, FFN 3072 → 14336 → 3072",
-     after("S4b", "One graph per transformer block",
-           '<pre class="code" style="font-size:17px">for i, block in enumerate(self.blocks):          # wan/modules/model_fast.py\n'
-           '    self.blocks[i] = torch.compile(block, backend="neuron",\n'
-           '                                   fullgraph=True, dynamic=False)</pre>' +
-           stats([("40", "blocks", "LingBot-World v2 14B"), ("5120 → 13824 → 5120", "", "FFN")], 2),
-           "Compile one graph per repeated block.", ["COMPILE_SCOPE=blocks, model_fast.py around line 2985."]))
-
-pair("S4c", "Wan2.2: 4.4 → 1.91 s/step, 76.6 → 36.8 s",
-     after("S4c", "What one graph per block buys",
-           race({"unit": "s", "lanes": [
-               {"name": "eager", "sub": "every op launched alone", "color": RED,
-                "segs": [[19.59, DIT, "DiT"], [2.03, VAE, "VAE"]], "end": "21.6 s", "note": "0.54 s per DiT forward"},
-               {"name": "one graph per block", "sub": "torch.compile, fullgraph", "color": GRN,
-                "segs": [[6.07, DIT, "DiT"], [2.02, VAE, "VAE"]], "end": "8.09 s", "note": "0.173 s per DiT forward"}]},
-                "eager vs one compiled graph per block") +
-           stats([("0.54 → 0.173", "s per forward", "DiT, 3.1×"), ("21.6 → 8.09", "s per video", "2.7×")], 2),
-           "Compile one graph per repeated block, with the collectives inside it.",
-           ["4x8_eager vs 4x8_compile: same flags, only LINGBOT_COMPILE_DIT. VAE eager in both."]))
-
-pair("S4e", "Wan2.2 VAE; the conclusion flips for LingBot",
-     after("S4e", "On LingBot, compiling the VAE wins",
-           race({"unit": "s", "lanes": [
-               {"name": "eager", "sub": "upstream decoder, per conv", "color": RED, "segs": [[2.03, VAE, ""]], "end": "2.03 s", "note": "56.3 dB vs fp32"},
-               {"name": "compiled blocks", "sub": "LINGBOT_VAE_FUSED=1", "color": YEL, "segs": [[1.38, VAE, ""]], "end": "1.38 s", "note": "56.3 dB"},
-               {"name": "+ bf16, -O1, 2-D tiles, 6 frames", "sub": "today", "color": GRN, "segs": [[0.41, VAE, ""]], "end": "0.41 s", "note": "52.7 dB"}]},
-                "VAE eager vs compiled") ,
-           "On LingBot the VAE compiles well: 5× faster than eager.",
-           ["Decode-only A/B on the same latents (talk-pipeline and talk-ladder jobs). The Wan2.2 result (compile loses) does not hold here."]))
-
-pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads",
-     after("S5a", "What is still slow? Profile before writing a kernel",
-           stats([("8.98", "ms", "one LingBot block, SDPA as matmul → softmax → matmul"),
-                  ("6", "gaps", "Tensor idle while the softmax runs (1.54 ms)"),
-                  ("10", "heads", "per rank (TP4)")], 3),
-           "Profile first: Tensor waits for the softmax.",
-           ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx swaps in an NKI kernel by itself. Pair "
-            "pairs/1_sdpa_math_rank1 (rank 1, +2% vs the system trace). Whole pipeline in this mode: 13.4 s."]))
-
-pair("S5b", "Wan2.2 profile screenshot",
-     after("S5b", "Select one PyTorch call: every instruction it made",
-           table(["", "LingBot"], [["source line of every attention instruction", "<code>wan/modules/attention.py:802</code>, F.scaled_dot_product_attention"],
-                                   ["demo pair (one core, attention only)", "<code>pairs/demo_sdpa</code>: Tensor idle 0.71 → 1.88 ms while Vector/Scalar run the softmax"],
-                                   ["script", "<code>demo/sdpa_vs_nki.py --mode sdpa</code>"]]),
-           "Map the profile back to your code.", ["Open pairs/demo_sdpa/sdpa.neff + sdpa.ntff in Neuron Explorer; demo/README.md says what to point at."]))
-
-pair("S5d", "Wan2.2: 39% / 36% / 16%",
-     after("S5d", "Measured: Tensor waits, engines take turns",
-           stats([("45.3%", "", "Tensor busy"), ("28.5%", "", "exactly one engine busy"), ("16.6%", "", "every engine idle"),
-                  ("2.93 / 1.87", "ms", "softmax on Vector / Scalar")], 4),
-           "Engines taking turns is time a kernel can win back.", ["engine_overlap.py on pairs/1_sdpa_math_rank1."]))
-
-pair("S5f", "Wan2.2: 18.2 → 5.3 ms per call",
-     after("S5f", "Attention: the operator that dominates",
-           race({"unit": "ms", "lanes": [
-               {"name": "F.scaled_dot_product_attention", "sub": "matmul → softmax → matmul", "color": RED,
-                "segs": [[1.275, RED, "Tensor idle"], [1.412, GRY, "rest"]], "end": "2.69 ms", "note": "1.17 ms Tensor gap"},
-               {"name": "nkilib attention_cte", "sub": "NKI flash attention", "color": GRN,
-                "segs": [[0.202, RED, ""], [1.372, GRY, ""]], "end": "1.57 ms", "note": "softmax overlaps nc_matmul"}]},
-                "SDPA vs attention_cte, one call") ,
-           "nkilib first: production kernels, called like any torch op.",
-           ["One LingBot rank's shape on one core: q [1,10,640,128], k/v [1,10,17280,128]. demo/sdpa_vs_nki.py. Red = softmax work while Tensor is idle."]))
-
-pair("S5g", "Wan2.2: 16.2 → 13.2 s; for LingBot the result flips",
-     after("S5g", "Calling attention_cte yourself can be slower",
-           race({"unit": "s", "lanes": [
-               {"name": "our own cte call", "sub": "copies KV into a padded buffer", "color": RED,
-                "segs": [[2.91, RED, "the copy"], [6.07, DIT, "DiT"], [2.02, VAE, "VAE"]], "end": "11.0 s", "note": "error 0.034 (zeros in the softmax)"},
-               {"name": "native SDPA", "sub": "the compiler puts in attention_cte", "color": GRN,
-                "segs": [[6.07, DIT, "DiT"], [2.02, VAE, "VAE"]], "end": "8.09 s", "note": "error 0.012"}]},
-                "explicit cte vs compiler cte"),
-           "Check what the compiler already does before adding a kernel.",
-           ["4x8_compilecte vs 4x8_compile. The extra time is one block graph at 17.9 ms (Tensor 10.6%) spent in the KV copy at attention.py:449. Red segment = 8.98 − 6.07 s GEN."]))
-
-pair("S5h", "Wan2.2: 56.1 → 17.3 ms",
-     after("S5h", "The same block with the kernel: 8.98 → 4.37 ms",
-           race({"unit": "ms", "lanes": [
-               {"name": "matmul → softmax → matmul", "sub": "SDPA, NKI swap off", "color": RED,
-                "segs": [[2.32, RED, "softmax, Tensor idle"], [6.66, GRY, "rest of the block"]], "end": "8.98 ms", "note": ""},
-               {"name": "attention_cte", "sub": "nc_matmul in a K-tile loop", "color": GRN,
-                "segs": [[0.21, RED, ""], [4.16, GRY, "rest of the block"]], "end": "4.37 ms", "note": "2.1× faster"}]},
-                "one LingBot block, before and after the kernel"),
-           "Tile so the engines overlap.", ["Same rank, same shard: pairs/1_sdpa_math_rank1 and pairs/2_attention_cte_rank1."]))
-
-pair("S5i", "Wan2.2 table",
-     after("S5i", "Native SDPA vs attention_cte",
-           table(["", "matmul → softmax → matmul", "attention_cte"],
-                 [["block", "8.98 ms", "4.37 ms"], ["softmax while Tensor idle", "2.32 ms", "0.21 ms"],
-                  ["Tensor busy", "45.3%", "56.0%"], ["3+ engines busy", "22.1%", "28.1%"],
-                  ["every engine idle", "16.6%", '17.1% (collective waits and transposes stay)']], "tbl big"),
-           "The kernel removes the softmax gaps; collectives keep some idle time.", []))
-
-pair("S5j", "Wan2.2 nkilib conv3d",
-     after("S5j", "LingBot's VAE: compiled blocks, not conv3d",
-           stats([("2.03 → 1.38", "s", "whole decoder blocks compiled"), ("1.38 → 0.41", "s", "bf16, -O1, 2-D tiles, 6 frames per step")], 2),
-           "Where the compiler is strong, give it the whole block.", ["See B4h for every step."]))
-
-pair("S7a", "trn2: 18.64 and 25.02 fps",
-     after("S7a", "The frame rate decides how many chips",
-           stats([("19.8", "fps", "8 trn3 chips (best flags, no softmax shortcut)"), ("18.1", "fps", "8 trn3 chips, main (q20)"),
-                  ("not run", "", "16 chips (over the 8-chip budget)")], 3),
-           None, ["18.64 / 25.02 fps used chained kernel calls, which assert on trn3 (kernels/attention_cte_lb.py:767)."]))
-
-pair("S7d", "Wan2.2 VAE 9.0 → 6.0 s; 17.88 fps",
-     after("S7d", "Sequence parallelism: split the work across cores",
-           race({"unit": "s", "lanes": [
-               {"name": "VAE on one core", "sub": "eager", "color": RED, "segs": [[18.2, VAE, ""]], "end": "18.2 s", "note": ""},
-               {"name": "one tile per core, 32 cores", "sub": "eager", "color": GRN, "segs": [[2.03, VAE, ""]], "end": "2.03 s", "note": "9×"}]},
-                "VAE one core vs 32") +
-           stats([("17.88 → 18.08", "fps", "half a trn3, TP4 × CP8, q20: re-run confirms")], 1),
-           "Collectives are plain torch.distributed calls.", []))
-
-pair("S9a", "VAE 44.6 dB is Wan2.2",
-     after("S9a", "Validate every step against the eager reference",
-           table(["config", "step-0 vs fp32", "VAE vs fp32 decode"],
-                 [["eager, native SDPA", "0.0129", "56.4 dB"], ["compiled blocks", "0.0123", "56.4 dB"],
-                  ["q20 (main)", "0.0108", "52.7 dB"], ["best flags (8dev, no chain)", "0.0148", "52.7 dB"],
-                  ['<span style="color:#ff6b6b">our own cte call (S5g)</span>', '<span style="color:#ff6b6b">0.034</span>', "56.3 dB"]]),
-           "Put a number on correctness at every step.", []))
-
-journey = {"unit": "s", "lanes": [
-    {"name": "eager", "sub": "", "color": RED, "segs": [[19.59, DIT, "GEN"], [2.03, VAE, "VAE"]], "end": "21.6 s · 3.75 fps", "note": ""},
-    {"name": "+ compiled blocks", "sub": "", "color": YEL, "segs": [[6.07, DIT, "GEN"], [2.02, VAE, "VAE"]], "end": "8.09 s · 10.0 fps", "note": ""},
-    {"name": "+ q20 flags (main)", "sub": "", "color": BLU, "segs": [[4.07, DIT, "GEN"], [0.41, VAE, ""]], "end": "4.48 s · 18.1 fps", "note": ""},
-    {"name": "+ 8dev flags, no chain", "sub": "", "color": GRN, "segs": [[3.68, DIT, "GEN"], [0.39, VAE, ""]], "end": "4.07 s · 19.9 fps", "note": ""}]}
-pair("S9b", "the Wan2.2 journey",
-     after("S9b", "The journey: 21.6 → 4.07 s per video",
-           race(journey, "LingBot journey on 8 trn3 chips"), None,
-           ["Every row measured in the talk jobs. No A100 number exists for LingBot."]))
-pair("S9c", "16 and 8 trn2 devices",
-     after("S9c", "LingBot-World v2 on 8 trn3 chips: 19.9 fps",
-           race(journey, "LingBot journey on 8 trn3 chips"),
-           "With the softmax shortcut off; the shortcut needs chained calls, which do not run on trn3.",
-           ["16 devices not re-run (over budget). The 18.40 fps 'with the check' cannot run on trn3."]))
-
-pair("S9d", "17.3 fps / 1.07 s used a separate VAE deployment (more than 8 chips)",
-     after("S9d", "LingBot-World v2: a live stream",
-           race({"unit": "s", "lanes": [
-               {"name": "one chunk, VAE on the same 8 chips", "sub": "serve.py, today's main", "color": YEL,
-                "segs": [[0.554, DIT, "DiT"], [0.276, VAE, "VAE"], [0.179, GRY, ""]], "end": "1.01 s", "note": "11.8 fps · key press 2.05 s"}]},
-                "one live chunk") +
-           stats([("0.554", "s", "DiT per chunk (deck: ~0.58)"), ("2.05", "s", "key press → new frames, VAE inline"),
-                  ("11.8", "fps", "stream, VAE inline")], 3),
-           "In a stream, measure what the user waits for.",
-           ["17.3 fps / 1.07 s need the VAE on other chips (over the 8-chip budget): not measured. live_latency.py through kubectl port-forward."]))
-
-pair("S11c", "Wan2.2 VAE warm-up 186 / 21 / 3.6 s",
-     after("S11c", "Warm-up is part of deployment",
-           stats([("151.0", "s", "GEN pass 1 (compile, load)"), ("4.28", "s", "pass 2"), ("4.27", "s", "pass 3")], 3),
-           "Warm up until the timing settles, then report ready.", ["4x8_final, today's main flags."]))
-
-pair("B4h", "64 ranks on trn2",
-     after("B4h", "LingBot VAE, step by step (32 ranks, trn3)",
-           race({"unit": "s", "lanes": [
-               {"name": "upstream, per conv", "sub": "56.3 dB", "color": RED, "segs": [[2.03, VAE, ""]], "end": "2.03 s", "note": ""},
-               {"name": "whole blocks compiled", "sub": "56.3 dB", "color": YEL, "segs": [[1.38, VAE, ""]], "end": "1.38 s", "note": ""},
-               {"name": "bf16 convolutions", "sub": "52.7 dB", "color": YEL, "segs": [[0.86, VAE, ""]], "end": "0.86 s", "note": ""},
-               {"name": "-O1, norm as matmul", "sub": "52.7 dB", "color": BLU, "segs": [[0.65, VAE, ""]], "end": "0.65 s", "note": ""},
-               {"name": "2-D tiles", "sub": "52.7 dB", "color": BLU, "segs": [[0.46, VAE, ""]], "end": "0.46 s", "note": ""},
-               {"name": "6 frames per step", "sub": "52.7 dB", "color": GRN, "segs": [[0.41, VAE, ""]], "end": "0.41 s", "note": ""}]},
-                "VAE ladder"), "bf16 is where the 3.6 dB goes; the padding bug is not present at this tiling.", []))
-
-pair("B4i", "64 ranks on trn2",
-     after("B4i", "Where compiling whole VAE blocks won",
-           race({"unit": "s", "lanes": [
-               {"name": "upstream decoder", "sub": "per-conv graphs, eager ops", "color": RED, "segs": [[2.03, VAE, ""]], "end": "2.03 s", "note": ""},
-               {"name": "one graph per decoder block", "sub": "LINGBOT_VAE_FUSED=1", "color": GRN, "segs": [[1.38, VAE, ""]], "end": "1.38 s", "note": "→ 0.41 s after tuning"}]},
-                "VAE upstream vs compiled blocks"), "The graph's scope is the decision.", []))
-
-pair("B6a", "trn2, 16 devices",
-     after("B6a", "Attention over cached chunks: a copy before every call",
-           stats([("7.37 → 4.34", "s GEN", "read the cache in place (LINGBOT_CTE_MERGE)"),
-                  ("0.032 → 0.011", "", "error vs fp32: the zero keys are gone"),
-                  ("17.9", "ms", "the block graph that does the copy (Tensor 10.6%)")], 3),
-           "Don't copy data to fit a kernel.", ["Copy block from the explicit-cte profile (job 3). Per-block copy share at q20: pending job talk-b6-nomerge."]))
-
-b6b = cell_of("B6b")  # the BEFORE is the original; the AFTER is the edited slide in demo/talk-deck.html
-P.append(before("B6b", "trn2: 8.95 → 5.73 s, 3.28 → 2.88 ms"))
-cur = open(os.path.join(REPO, "demo", "talk-deck.html"), encoding="utf-8").read()
-i = cur.index('data-ref="B6b"'); st = cur.rfind("<", 0, i); nx = cur.find('<div class="cell" data-ref="', i)
-b6b_after = cur[st:nx]; b6b_after = b6b_after[:b6b_after.rfind("</div></div>") + 12]
-b6b_after = re.sub(r'(<section class="slide[^"]*">)', lambda m: m.group(1) + banner("after", "LingBot-World v2 · 8 trn3 chips"), b6b_after, count=1)
-P.append(b6b_after + "\n")
-
-pair("B6c", "trn2 numbers",
-     after("B6c", "The win was data movement, not new math",
-           stats([("7.37 → 4.34", "s", "1 no copies: read in place"), ("4.34 → 4.08", "s", "2 fewer calls: two chunks per call"),
-                  ("4.32 / 4.20 → 4.08", "s", "3 fewer DMAs: K layout / 8 V tiles per DMA")], 3), None,
-           ["q20 with one flag off at a time (talk-ladder job)."]))
-
-na = "cannot run on trn3: needs chained kernel calls (LINGBOT_CTE_CHAIN), which assert on trn3 (kernels/attention_cte_lb.py:767)"
-for ref, h in [("B6d", "A softmax shortcut that checks itself"), ("B6g", "Why one constant works in 34 of 40 layers"),
-               ("B6h", "The check's runtime branch in the kernel")]:
-    pair(ref, "trn2, branch loop_engineering_8dev",
-         after(ref, h, '<div class="card k2"><b>Not measurable on trn3 today</b><p>%s. The shortcut only switches on '
-               'with chaining (model_fast.py:1389 on loop_engineering_8dev).%s</p></div>'
-               % (na, " The code on this slide matches attention_cmax2_lb.py:389-403." if ref == "B6h" else ""),
-               "Keep as a trn2 result, or drop.", [], why="trn2 only · cannot run on trn3"))
-
-pair("B6e", "trn2: 3.94 → 3.74 → 3.66 s",
-     after("B6e", "Changes to a copy of the kernel, one at a time",
-           table(["q20 with one flag off", "GEN", "cost of turning it off"],
-                 [["8 V tiles per DMA (LINGBOT_CTE_VGROUP=8)", "4.20 s", "+0.12 s"],
-                  ["K in the all-gather's layout (LINGBOT_K_BLOCKED)", "4.32 s", "+0.24 s"],
-                  ["cross-attention cache in the kernel's layout (LINGBOT_CROSS_NMAJOR)", "4.12 s", "+0.04 s"],
-                  ["runtime-built DMA descriptors (LINGBOT_CTE_KV_DGE=none)", "pending", ""]]), None, ["q20 all on: 4.08 s."]))
-
-pair("B6f", "trn2, TP4 × CP16, 2.53-2.60 ms",
-     after("B6f", "One block now (q20, TP4 × CP8)",
-           stats([("2.92", "ms", "steady block (540 tokens per rank)"), ("64.5%", "", "Tensor busy"), ("8.1%", "", "every engine idle"),
-                  ("1.22 / 1.09", "ms", "attention kernel / projections + FFN")], 4), None,
-           ["Not 1:1 with the BEFORE: CP8 holds twice the tokens per rank of CP16. The 19.9 fps block: pending job talk-b6f-8dev."]))
-
-pair("B7c", "Wan2.2 layouts on one trn2 device",
-     after("B7c", "Layouts for LingBot on 8 trn3 chips",
-           race({"unit": "s", "lanes": [
-               {"name": "TP2 × CP16", "sub": "", "color": RED, "segs": [[5.05, DIT, "GEN"], [0.41, VAE, ""]], "end": "5.46 s · 14.9 fps", "note": ""},
-               {"name": "TP8 × CP4", "sub": "TP across two chips", "color": YEL, "segs": [[4.40, DIT, "GEN"], [0.41, VAE, ""]], "end": "4.81 s · 16.8 fps", "note": ""},
-               {"name": "TP4 × CP8", "sub": "TP inside a chip", "color": GRN, "segs": [[4.08, DIT, "GEN"], [0.42, VAE, ""]], "end": "4.50 s · 18.0 fps", "note": ""}]},
-                "LingBot layouts"), "Keep the chatty collective inside a chip.", []))
-
-cells = title + "".join(P)
-out = PREFIX.replace("</style>", CSS.replace("<style>", "").replace("</style>", "") + "</style>", 1)
-out = out.replace("<title>", "<title>[trn3 validated] ", 1) + cells + SUFFIX
-open(args.out, "w", encoding="utf-8").write(out)
-print("wrote", args.out, "slides:", cells.count('<div class="cell"'))
+         '(the original, Wan2.2 or trn2) then <b style="color:#4cd04c">AFTER</b> (the same slide, the same point, '
+         'LingBot numbers measured on 8 trn3 chips). Delete the BEFORE slides once reviewed.</p></section>'
+         '<div class="nt"><p>Built by docs/talk/validate/build_trn3_deck.py. Each AFTER slide\'s notes list what changed.</p></div></div>\n')
+cells = title + "\n".join(PAIRS)
+out = PREFIX.replace("</style>", CSS + "</style>", 1).replace("<title>", "<title>[trn3 BEFORE/AFTER] ", 1) + cells + SUFFIX
+open(OUT, "w", encoding="utf-8").write(out)
+print("wrote", OUT, "slides:", cells.count('<div class="cell"'))
