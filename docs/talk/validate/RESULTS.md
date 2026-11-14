@@ -306,5 +306,11 @@ For the slides:
 These come from branch `loop_engineering_8dev` (ad34d57), measured on trn2. **They do not run on trn3
 as written**: every run from q21 on uses chained kernel calls (`LINGBOT_CTE_CHAIN=1`), and the kernel
 asserts that path is not handled on trn3 (`kernels/attention_cte_lb.py:767`, `is_trn3_b1()`:
-"chained calls: the Vector-engine exp path is not handled"). Job 5 (`talk-8dev-job.yaml`) re-runs
-exact / shortcut / shortcut + check with chaining off: pending.
+"chained calls: the Vector-engine exp path is not handled"). The shortcut itself is only switched on
+together with chaining (`wan/modules/model_fast.py:1389` on that branch: `_c_off = ... if (_CTE_CHAIN and use_cmax)`),
+and `LINGBOT_V_TOKEN_MAJOR` asserts without chaining (`model_fast.py:222`). Job 5 tried; every
+shortcut config failed (logs on the node, `lbw-talk-8dev/`).
+
+**So on trn3 today: B6d, B6g, S7a's 18.64 / 25.02 fps and S9c's 18.40 / 25.02 fps cannot be measured.**
+They need a trn3 version of the chained-call path in `kernels/attention_cte_lb.py` first.
+Job 5's last run measures that branch's 8-device flags with chaining off: pending.

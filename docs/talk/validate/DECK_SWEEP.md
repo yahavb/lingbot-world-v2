@@ -38,7 +38,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | S5h | 56.1 -> 17.3 ms; self-attn ~5 ms (was ~32); pipeline 9.7 s / 8.7 s | WAN | 8.98 -> 4.37 ms; attention span 7.16 -> 2.52 ms |
 | S5i | 56.1/17.3 ms, idle 16% -> 1.1%, Tensor 39% -> 79%, 3+ engines 16% -> 34%; VAE conv3d 98%/95% | WAN | 8.98/4.37 ms, idle 16.6% -> 17.1%, Tensor 45% -> 56%, 3+ engines 22% -> 28% |
 | S5j | VAE 6.0 -> 2.6 s, nkilib conv3d | WAN | LingBot VAE is compiled blocks: 2.03 -> 1.39 -> 0.41 s |
-| S7a | 8 chips 18.64 fps, 16 chips 25.02 fps | TRN2 | 8 trn3 chips: 18.08 fps (q20), 17.3 (main). 16 chips over budget |
+| S7a | 8 chips 18.64 fps, 16 chips 25.02 fps | TRN2, and cannot run on trn3 (chained kernel calls assert) | 8 trn3 chips: 18.08 fps (q20), 17.3 (main). 16 chips over budget |
 | S7b | TP4 x CP16 (16 devices), TP4 x CP8 (half a trn3) | OK (layouts) | |
 | S7d | VAE 9.0 -> 6.0 s (`models/vae_tiled.py`); 17.88 fps half a trn3 | WAN; 17.88 OK | VAE 18.2 -> 2.03 s (1 -> 32 cores); 17.88 re-measured 18.08 |
 | S9a | step 0 within bf16 floor; VAE 44.6 dB | WAN (44.6) | c0s0 0.0108-0.0137; VAE 52.7 dB |
@@ -59,10 +59,10 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | B6a | copy 1.7 ms of a 10.4 ms block; heads scaled 0.94-0.99; CP16 3.1 s | TRN2 | `LINGBOT_CTE_MERGE` off/on at TP4 x CP8 (job 4) |
 | B6b | GEN 8.95 -> 5.73 s; 3.28 -> 2.88 ms/block; 4.88 -> 4.48 s (ATTN_PAIR) | TRN2 | job 4 flag ladder |
 | B6c | 1.7/10.4 ms; 3.28 -> 2.88 ms; GEN 3.94 -> 3.66 s | TRN2 | job 4 |
-| B6d | 0.70 -> 0.35-0.37 ms/call; 0 of 1.85 M blocks redone; 18.64 -> 18.40 fps on 8 devices | TRN2 | check on/off on 8 trn3 chips (job 4) |
+| B6d | 0.70 -> 0.35-0.37 ms/call; 0 of 1.85 M blocks redone; 18.64 -> 18.40 fps on 8 devices | TRN2, cannot run on trn3 | the shortcut needs chained calls, which assert on trn3 (RESULTS backups) |
 | B6e | GEN 3.94 -> 3.74 -> 3.66 s; -250 us/block; 4.26 vs 3.94 s | TRN2 | job 4 |
 | B6f | block 2.53-2.60 ms at TP4 x CP16 | TRN2 | block profile of main at TP4 x CP8 (job 1 profile is the compiled native-SDPA config; needs one for main) |
-| B6g | row max ranges, 0.70 -> 0.36 ms, GEN 3.30 -> 3.06 s, 22.49 -> 24.12 fps (16 devices) | TRN2 | job 4 (constant offset on/off at 8 chips) |
+| B6g | row max ranges, 0.70 -> 0.36 ms, GEN 3.30 -> 3.06 s, 22.49 -> 24.12 fps (16 devices) | TRN2, cannot run on trn3 | same as B6d |
 | B6h | code only | NONE | |
 | B7c | Wan2.2 layouts on one device, 29.4 -> 20.6 ms | WAN | LingBot layouts on 8 trn3 chips are in `kiro/LOOP_ENGINEERING.md` "Half an instance" (TP4xCP8 17.88, TP8xCP4 16.70, TP2xCP16 14.74 fps) |
 | B9e | none | NONE | |
