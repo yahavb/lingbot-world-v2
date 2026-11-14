@@ -74,15 +74,28 @@ LingBot, decode-only on the same latents:
 Deck: one block 56.1 ms; Tensor busy 39%, one engine busy 36%, all idle 16%. Three heads, 7,854
 tokens. **Wrong model** (Wan2.2 `models/fast_dit.py`, trn2).
 
-LingBot: profile of the `4x8_compile` config (`kiro/e2e/profile.sh`, pairs + engine overlap). Pending.
+**Finding: on SDK 2.33 the deck's "native SDPA" case does not exist by default.** When a block is
+compiled, torch-neuronx replaces `F.scaled_dot_product_attention` with nkilib attention_cte by itself
+(`neuron_dynamo_backend/decompositions.py`, `_can_use_nki_flash_attention`, on unless
+`TORCH_NEURONX_ENABLE_NKI_SDPA=0`). The profile below shows `attention_cte.py` instructions even with
+`ATTENTION_BACKEND=sdpa`.
+
+LingBot, `4x8_compile` (native SDPA in the code, so attention_cte from the compiler), rank 0, the
+heaviest DiT block graph (`prof/pairs/rankr0-6758ms-dit-f22a6c8d`, 1600 calls per pass,
+`engine_overlap.py`):
 
 | | Measured | Status |
 |---|---|---|
-| One block, native SDPA | | pending |
-| Tensor busy | | pending |
-| Exactly one engine busy | | pending |
-| Every engine idle | | pending |
-| Is there a Tensor gap during the softmax? | | pending |
+| One block | 4.37 ms (22.4% MFU) | measured |
+| Tensor busy | 56.0% | measured |
+| Exactly one engine busy | 23.4% | measured |
+| Every engine idle | 17.1% | measured |
+| 3+ engines busy | 28.1% | measured |
+| Tensor time spent on transposes | ~0.86 of 2.44 ms busy (`transpose.py:714` + unattributed) | measured |
+| Biggest serial item | GpSimd semaphore wait 0.24 ms | measured |
+
+The real "before the kernel" block, compiled with matmul -> softmax -> matmul
+(`TORCH_NEURONX_ENABLE_NKI_SDPA=0`): job `talk-sdpa-math-job.yaml`, pending.
 
 ## S5f / S5g: attention_cte
 
