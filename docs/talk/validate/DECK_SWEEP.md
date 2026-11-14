@@ -38,7 +38,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | S5h | 56.1 -> 17.3 ms; self-attn ~5 ms (was ~32); pipeline 9.7 s / 8.7 s | WAN | 8.98 -> 4.37 ms; attention span 7.16 -> 2.52 ms |
 | S5i | 56.1/17.3 ms, idle 16% -> 1.1%, Tensor 39% -> 79%, 3+ engines 16% -> 34%; VAE conv3d 98%/95% | WAN | 8.98/4.37 ms, idle 16.6% -> 17.1%, Tensor 45% -> 56%, 3+ engines 22% -> 28% |
 | S5j | VAE 6.0 -> 2.6 s, nkilib conv3d | WAN | LingBot VAE is compiled blocks: 2.03 -> 1.39 -> 0.41 s |
-| S7a | 8 chips 18.64 fps, 16 chips 25.02 fps | TRN2, and cannot run on trn3 (chained kernel calls assert) | 8 trn3 chips: 18.08 fps (q20), 17.3 (main). 16 chips over budget |
+| S7a | 8 chips 18.64 fps, 16 chips 25.02 fps | TRN2, and cannot run on trn3 (chained kernel calls assert) | 8 trn3 chips: 19.9 fps (8dev branch, no chaining), 18.08 (q20 on main), 17.3 (main flags). 16 chips over budget |
 | S7b | TP4 x CP16 (16 devices), TP4 x CP8 (half a trn3) | OK (layouts) | |
 | S7d | VAE 9.0 -> 6.0 s (`models/vae_tiled.py`); 17.88 fps half a trn3 | WAN; 17.88 OK | VAE 18.2 -> 2.03 s (1 -> 32 cores); 17.88 re-measured 18.08 |
 | S9a | step 0 within bf16 floor; VAE 44.6 dB | WAN (44.6) | c0s0 0.0108-0.0137; VAE 52.7 dB |

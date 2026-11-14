@@ -193,7 +193,7 @@ LingBot, 8 trn3 chips, 480x768:
 | today's `main` (`lbw-bench-job.yaml` flags, `4x8_final`) | 4.27 s | 0.41 s | 4.68 s | **17.3** | measured |
 | q20 (`4x8_q20`) | 4.07 s | 0.41 s | 4.48 s | **18.08** | measured |
 
-The 8-chip number for this slide on trn3 is 18.1 fps (q20). Today's `main` flags were tuned for 4 chips
+The 8-chip number for this slide on trn3 is **19.9 fps** (`loop_engineering_8dev` flags, no chaining; see Backups, B6d) and 18.1 fps on `main` (q20). Today's `main` flags were tuned for 4 chips
 and are 5% slower at 8. 16 chips not re-run (budget).
 
 ## S7d: Sequence parallelism, two functional collectives
@@ -313,4 +313,14 @@ shortcut config failed (logs on the node, `lbw-talk-8dev/`).
 
 **So on trn3 today: B6d, B6g, S7a's 18.64 / 25.02 fps and S9c's 18.40 / 25.02 fps cannot be measured.**
 They need a trn3 version of the chained-call path in `kernels/attention_cte_lb.py` first.
-Job 5's last run measures that branch's 8-device flags with chaining off: pending.
+**The best trn3 number for S7a / S9c (8 chips):** that branch's 8-device flags with chaining off (so the
+softmax shortcut is off too), `4x8_d8nochain` in `talk-8dev-job.yaml`:
+
+| | GEN | VAE | Total | fps | c0s0 vs fp32 | VAE vs fp32 decode |
+|---|---|---|---|---|---|---|
+| `4x8_d8nochain` (passes 3-5: 3.684 / 3.681 / 3.699 s) | 3.70 s | 0.39 s | 4.09 s | **19.81** | 0.0148 | 52.69 dB |
+| repeat, new process (passes 2-5: 3.685-3.676 s) | 3.68 s | 0.39 s | 4.07 s | **19.92** | | |
+
+Repeat bitwise identical (deterministic: True). Pass 2 of the first process still compiled (7.9 s).
+This beats q20 on `main` (18.08 fps) by 10% and is the number to put on S7a / S9c for 8 trn3 chips,
+labelled "without the softmax shortcut".
