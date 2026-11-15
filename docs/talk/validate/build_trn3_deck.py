@@ -195,8 +195,8 @@ def b6b_profile():
            '<img src="data:image/jpeg;base64,%s" alt="%s" style="width:560px;max-height:330px;object-fit:contain;object-position:top;border-radius:8px">'
            '<div style="font-size:19px;color:#c3c2b7">%s</div></div>')
     body = ('<div style="display:flex;gap:32px;justify-content:center;align-items:flex-start;width:100%%">%s%s</div>'
-            % (col % ("#ff6b6b", "COPY FIRST: 17.1 ms block", img("B6b_copy_first_marked.jpg"), "copy-first block: DMA busy ~14 ms, compute empty",
-                      "14.4 of 17.1 ms copying the memory; Tensor, Vector, Scalar empty"),
+            % (col % ("#ff6b6b", "COPY FIRST: 17.1 ms block", img("B6b_line448_marked.jpg"), "copy-first block: line 448 selected, its copy is the red bar on Sync",
+                      "line 448 alone: 7.4 ms of copies on Sync, then line 449; 14.4 of 17.1 ms copying"),
                col % ("#4cd04c", "READ IN PLACE: 2.92 ms block", img("B6b_read_in_place_marked.jpg"), "read-in-place block: compute engines busy the whole block",
                       "no copy: the compute engines work the whole block")))
     cell = ('<div class="cell" data-ref="B6b-PROFILE"><section class="slide"><h1>Backup: the copy, in the profile</h1>'
