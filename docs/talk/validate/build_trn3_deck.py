@@ -187,26 +187,35 @@ def kernel_side_by_side():
     return with_banner(cell, "S5a-KERNEL", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="S5a-KERNEL-AFTER"', 'data-ref="S5a-KERNEL"')
 
 
+def _b6b_one(ref, h1, color, label, jpg, alt, stats, takeaway, note):
+    img = base64.b64encode(open(os.path.join(HERE, "anim", jpg), "rb").read()).decode()
+    st = "".join('<div class="stat"><div class="v" style="color:%s">%s <small>%s</small></div><div class="l">%s</div></div>' % (c, v, u, l) for c, v, u, l in stats)
+    body = ('<div style="display:flex;gap:36px;align-items:center;width:100%%">'
+            '<img src="data:image/jpeg;base64,%s" alt="%s" style="max-height:455px;max-width:780px;width:auto;height:auto;border-radius:8px">'
+            '<div style="display:flex;flex-direction:column;gap:20px">'
+            '<div style="font-size:28px;font-weight:800;color:%s">%s</div>%s</div></div>') % (img, alt, color, label, st)
+    cell = ('<div class="cell" data-ref="%s"><section class="slide"><h1>%s</h1><div class="body">%s</div>'
+            '<p class="takeaway"><span class="k">Takeaway</span><span>%s</span></p></section><div class="nt">%s</div></div>\n'
+            % (ref, h1, body, takeaway, notes(["new slide after B6b-AFTER"], [note])))
+    return with_banner(cell, ref, "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="%s-AFTER"' % ref, 'data-ref="%s"' % ref)
+
+
 def b6b_profile():
-    """One slide right after B6b-AFTER: the copy-first block in the profile (the read-in-place block goes next to it)."""
-    img = lambda f: base64.b64encode(open(os.path.join(HERE, "anim", f), "rb").read()).decode()
-    col = ('<div style="display:flex;flex-direction:column;gap:8px;width:560px">'
-           '<div style="font-size:28px;font-weight:800;color:%s">%s</div>'
-           '<img src="data:image/jpeg;base64,%s" alt="%s" style="width:560px;max-height:330px;object-fit:contain;object-position:top;border-radius:8px">'
-           '<div style="font-size:19px;color:#c3c2b7">%s</div></div>')
-    body = ('<div style="display:flex;gap:32px;justify-content:center;align-items:flex-start;width:100%%">%s%s</div>'
-            % (col % ("#ff6b6b", "COPY FIRST: 17.1 ms block", img("B6b_line448_marked.jpg"), "copy-first block: line 448 selected, its copy is the red bar on Sync",
-                      "line 448 alone: 7.4 ms of copies on Sync, then line 449; 14.4 of 17.1 ms copying"),
-               col % ("#4cd04c", "READ IN PLACE: 2.92 ms block", img("B6b_read_in_place_marked.jpg"), "read-in-place block: compute engines busy the whole block",
-                      "no copy: the compute engines work the whole block")))
-    cell = ('<div class="cell" data-ref="B6b-PROFILE"><section class="slide"><h1>Backup: the copy, in the profile</h1>'
-            '<div class="body">%s</div>'
-            '<p class="takeaway"><span class="k">Takeaway</span><span>Copying the memory first leaves the chip idle; reading it in place keeps it working.</span></p>'
-            '</section><div class="nt">%s</div></div>\n') % (body, notes(
-                ["new slide right after B6b-AFTER: copy-first and read-in-place blocks in Neuron Explorer, marked, side by side"],
-                ["Profile: pairs/copy_first_17.1ms (B6b), job lbw-talk-b6-nomerge (LINGBOT_CTE_MERGE=0), rank 0, the chunk position where the copy is worst. "
-                 "The copy is the loop at attention.py:444-450 (_cte_attention_chunks). The read-in-place block: pairs/read_in_place_2.92ms (B6b)."]))
-    return with_banner(cell, "B6b-PROFILE", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="B6b-PROFILE-AFTER"', 'data-ref="B6b-PROFILE"')
+    return (_b6b_one("B6b-COPY", "Backup: the copy, in the profile", "#ff6b6b", "COPY FIRST: 17.1 ms block", "B6b_line448_marked.jpg",
+                     "copy-first block: line 448 selected, its copy is the red bar on Sync",
+                     [("#ff6b6b", "7.4", "ms", "line 448 alone: copies of K on the Sync engine"),
+                      ("#ff6b6b", "14.4", "of 17.1 ms", "copying K and V (lines 448-449)"),
+                      ("#ffffff", "~0", "compute", "Tensor, Vector, Scalar idle meanwhile")],
+                     "While the memory is copied, the chip computes nothing.",
+                     "Profile: pairs/copy_first_17.1ms (B6b), job lbw-talk-b6-nomerge (LINGBOT_CTE_MERGE=0), rank 0. Line 448/449 of wan/modules/attention.py "
+                     "become HLO scatter ops, run on Sync as DMA_DIRECT2D + EVENT_SEMAPHORE.")
+            + _b6b_one("B6b-INPLACE", "Backup: read in place, in the profile", "#4cd04c", "READ IN PLACE: 2.92 ms block", "B6b_read_in_place_marked.jpg",
+                       "read-in-place block: compute engines busy the whole block",
+                       [("#4cd04c", "2.92", "ms", "the same block, no copy"),
+                        ("#ffffff", "busy", "", "Tensor, Vector, Scalar work across the whole block"),
+                        ("#ff8c00", "~0.3", "ms", "one short wait, not a 14 ms copy")],
+                       "Read the memory where it is, and the chip keeps working.",
+                       "Profile: pairs/read_in_place_2.92ms (B6b), job lbw-talk-b6-layouts (q20, LINGBOT_CTE_MERGE=1), rank 0, the steady block."))
 
 
 # ───────────── edit machinery ─────────────
