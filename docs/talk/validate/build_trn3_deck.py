@@ -348,7 +348,8 @@ pair("S5g", "Wan2.2: 16.2 → 13.2 s; for LingBot calling it yourself is slower"
 
 pair("S5h", "Wan2.2: 56.1 → 17.3 ms, Explorer screenshot",
      [("r", "The same block with the kernel: 56.1 → 17.3 ms", "The same block with the kernel: 8.98 → 4.37 ms"),
-      ("img", timeline("iv_blk_cte.json", 730, 480, "attention_cte instructions")),
+      ("img", '<img src="data:image/jpeg;base64,%s" alt="LingBot block with the attention kernel in Neuron Explorer; the kernel region and the remaining pause marked" style="width:730px;height:auto">'
+              % base64.b64encode(open(os.path.join(HERE, "anim", "S5h_kernel_marked.jpg"), "rb").read()).decode()),
       ("r", "<b>Self-attention ~5 ms</b> (was ~32)", "<b>Attention 2.52 ms</b> (was 7.16)"),
       ("r", "<b>No Tensor gaps:</b> the softmax overlaps the matmuls", "<b>Softmax with Tensor idle 0.21 ms</b> (was 2.32)")],
      ["56.1 → 17.3 ms → 8.98 → 4.37 ms (same rank, same shard: pairs/1_sdpa_math_rank1 vs pairs/2_attention_cte_rank1)",
