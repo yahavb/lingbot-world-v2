@@ -42,7 +42,7 @@ spec:
                 [ -s "$d/$m.ntff" ] || { f=$(ls -S "$d"/*.ntff 2>/dev/null | head -1); [ -n "$f" ] && mv "$f" "$d/$m.ntff"; }
                 [ -s "$d/$m.ntff" ] || { echo "$m: capture failed"; tail -5 "$d/capture.log"; continue; }
                 timeout 3600 "$PROF" view -n "$d/$m.neff" -s "$d/$m.ntff" --output-format summary-json > "$d/summary.json" 2>/dev/null
-                # the parquet writer idles after writing: stop it once Instruction.parquet is readable (kiro/e2e/tools/neuron_pairs.sh)
+                # the parquet writer idles after writing: stop it once Instruction.parquet is readable (perf/e2e/tools/neuron_pairs.sh)
                 timeout 3600 "$PROF" view -n "$d/$m.neff" -s "$d/$m.ntff" --output-format parquet --output-file "$d/pq" --ignore-event-trace > "$d/view.log" 2>&1 &
                 pid=$!
                 for _ in $(seq 1 700); do sleep 5; kill -0 $pid 2>/dev/null || break

@@ -1,9 +1,9 @@
 # 4-DEVICE TEST variant (l-lnc2, 16 ranks, TP4 x CP4, 448x704, VAE inline on the same ranks), the
-# kiro/e2e/LEDGER.md flags. Service lbw (ClusterIP). The web
+# docs/perf/e2e/LEDGER.md flags. Service lbw (ClusterIP). The web
 # front end is lbw-web-deploy.yaml.
 # Original header follows.
 # DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
-# with the q20_kbnw flags -- the half-instance row of kiro/LOOP_ENGINEERING.md (17.88 fps with an
+# with the q20_kbnw flags -- the half-instance row of docs/perf/LOOP_ENGINEERING.md (17.88 fps with an
 # inline VAE); streaming with lbw-v2-vae it measured 17.3 fps and ~1.1 s from a control press to
 # its frames at the browser. Latent chunks go to
 # lbw-v2-vae (VAE_URL). The converted checkpoint and compiled NEFFs live on the node
@@ -204,7 +204,7 @@ spec:
               value: "1"
             - name: ATTENTION_BACKEND
               value: "cte"
-            # loop_engineering (kiro/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
+            # loop_engineering (docs/perf/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
             # on the non-streaming path
             - name: LINGBOT_HOT_ATTN
               value: "cte"
@@ -248,7 +248,7 @@ spec:
               value: "4"
             - name: LINGBOT_IMG_BLOCK
               value: "1"
-            # q20_kbnw (kiro/k8s_sweep.sh)
+            # q20_kbnw (perf/k8s_sweep.sh)
             - name: LINGBOT_CTE_LOCAL
               value: "1"
             - name: LINGBOT_CTE_VGROUP

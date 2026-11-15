@@ -1,5 +1,5 @@
 # Talk deck numbers re-measured on LingBot-World v2 only (docs/talk/validate/README.md). 8 trn3 chips, xl-lnc2.
-# e2e latency push (kiro/e2e/LEDGER.md): one Job = kiro/k8s_sweep.sh over LAYOUTS in one pod.
+# e2e latency push (docs/perf/e2e/LEDGER.md): one Job = perf/k8s_sweep.sh over LAYOUTS in one pod.
 # Generate per experiment with scripts/k8s_mkjob.py (name, node pin, env); claim xl-lnc2 = 8 devices,
 # l-lnc2 = 4 devices (sed). Outputs persist on the node: /opt/lingbot-world-v2/e2e/<job name>/.
 apiVersion: batch/v1
@@ -61,11 +61,11 @@ spec:
               echo "FLASH_ATTN_LAYERS=$FLASH_ATTN_LAYERS"
 
               neuron-ls 2>/dev/null | head -20 || true
-              if [ -n "${PAIRS_MANIFEST:-}" ]; then   # device-profile capture only (kiro/e2e/pairs.sh)
-                bash kiro/e2e/pairs.sh "$NODE/e2e/$PAIRS_MANIFEST" "$NODE/e2e/$PAIRS_NEFFS" "$OUT/pairs" "$NPROC" 2>&1 | tee "$OUT/pairs.txt"
+              if [ -n "${PAIRS_MANIFEST:-}" ]; then   # device-profile capture only (perf/e2e/pairs.sh)
+                bash perf/e2e/pairs.sh "$NODE/e2e/$PAIRS_MANIFEST" "$NODE/e2e/$PAIRS_NEFFS" "$OUT/pairs" "$NPROC" 2>&1 | tee "$OUT/pairs.txt"
                 exit 0
               fi
-              OUT=$OUT bash kiro/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
+              OUT=$OUT bash perf/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
               ( export NEURON_LOGICAL_NC_CONFIG=2; d=$OUT/vae_1rank_eager; mkdir -p $d
                 for i in 1 2; do torchrun --nproc_per_node=1 --master_port=29745 decode_latents_width_sharded.py --task i2v-A14B --ckpt_dir $CKPT --latents_path $OUT/lnc2_4x8_eager/latents.pt --save_file $d/out.mp4 --timing --warmup > $d/dec$i.log 2>&1; echo "1rank dec$i exit=$?"; done
                 grep -hE "steady-state|Error" $d/dec*.log | tail -4 ) || true

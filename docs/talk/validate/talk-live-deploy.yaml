@@ -198,7 +198,7 @@ spec:
               value: "1"
             - name: ATTENTION_BACKEND
               value: "cte"
-            # loop_engineering (kiro/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
+            # loop_engineering (docs/perf/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
             # on the non-streaming path
             - name: LINGBOT_HOT_ATTN
               value: "cte"
@@ -242,7 +242,7 @@ spec:
               value: "4"
             - name: LINGBOT_IMG_BLOCK
               value: "1"
-            # q20_kbnw (kiro/k8s_sweep.sh)
+            # q20_kbnw (perf/k8s_sweep.sh)
             - name: LINGBOT_CTE_LOCAL
               value: "1"
             - name: LINGBOT_CTE_VGROUP

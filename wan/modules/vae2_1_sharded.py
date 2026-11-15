@@ -81,7 +81,7 @@ _VAE_GROUP = None
 # LINGBOT_VAE_HALO=hier: exchange width halos hierarchically instead of all-gathering every
 # rank's edges over the whole VAE group. At 64 ranks the decode issues 693 halo exchanges;
 # as world all-gathers they cost ~1.1 s of a ~2.95 s decode (measured by skipping them,
-# kiro/vae_bench.py VAE_DIAG=halo), while each rank needs only 2 of the 64 edges it gets.
+# perf/vae_bench.py VAE_DIAG=halo), while each rank needs only 2 of the 64 edges it gets.
 #   step 1: all-gather the edges over the ranks of one device (a TP4-shaped group), which
 #           gives every rank its neighbours on the same device and the device's two
 #           boundary edges;

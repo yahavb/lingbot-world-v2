@@ -1,6 +1,6 @@
 # Talk S7a 18.64 / S9c 18.40 fps / B6d softmax check, re-measured on 8 trn3 chips (branch loop_engineering_8dev). RESULTS.md.
 # LINGBOT_CTE_CHAIN=0, V_TOKEN_MAJOR=0 (needs CHAIN), CMAX off (only active with CHAIN, model_fast.py:1389): the chained-call kernel path asserts on trn3 (kernels/attention_cte_lb.py:767, is_trn3_b1).
-# e2e latency push (kiro/e2e/LEDGER.md): one Job = kiro/k8s_sweep.sh over LAYOUTS in one pod.
+# e2e latency push (docs/perf/e2e/LEDGER.md): one Job = perf/k8s_sweep.sh over LAYOUTS in one pod.
 # Generate per experiment with scripts/k8s_mkjob.py (name, node pin, env); claim xl-lnc2 = 8 devices,
 # l-lnc2 = 4 devices (sed). Outputs persist on the node: /opt/lingbot-world-v2/e2e/<job name>/.
 apiVersion: batch/v1
@@ -33,8 +33,8 @@ spec:
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
               echo "commit: $(git log --oneline -1)"
-              # this branch predates the k8s harness: take kiro/k8s_sweep.sh and kiro/e2e from main
-              git fetch -q origin main && git checkout origin/main -- kiro/k8s_sweep.sh kiro/e2e && echo "harness from main: $(git log --oneline -1 origin/main)"
+              # this branch predates the k8s harness: take perf/k8s_sweep.sh and perf/e2e from main
+              git fetch -q origin main && git checkout origin/main -- perf/k8s_sweep.sh perf/e2e && echo "harness from main: $(git log --oneline -1 origin/main)"
               NODE=/node-cache; mkdir -p "$NODE"
               OUT=$NODE/e2e/$JOB_TAG; mkdir -p "$OUT"
               trap 'echo "results: node:/opt/lingbot-world-v2/e2e/$JOB_TAG"; sleep "$KEEP_ALIVE_SECONDS"' EXIT
@@ -64,11 +64,11 @@ spec:
               echo "FLASH_ATTN_LAYERS=$FLASH_ATTN_LAYERS"
 
               neuron-ls 2>/dev/null | head -20 || true
-              if [ -n "${PAIRS_MANIFEST:-}" ]; then   # device-profile capture only (kiro/e2e/pairs.sh)
-                bash kiro/e2e/pairs.sh "$NODE/e2e/$PAIRS_MANIFEST" "$NODE/e2e/$PAIRS_NEFFS" "$OUT/pairs" "$NPROC" 2>&1 | tee "$OUT/pairs.txt"
+              if [ -n "${PAIRS_MANIFEST:-}" ]; then   # device-profile capture only (perf/e2e/pairs.sh)
+                bash perf/e2e/pairs.sh "$NODE/e2e/$PAIRS_MANIFEST" "$NODE/e2e/$PAIRS_NEFFS" "$OUT/pairs" "$NPROC" 2>&1 | tee "$OUT/pairs.txt"
                 exit 0
               fi
-              OUT=$OUT bash kiro/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
+              OUT=$OUT bash perf/k8s_sweep.sh 2>&1 | tee "$OUT/sweep.txt"
               echo "SWEEP COMPLETE"
           resources:
             claims:

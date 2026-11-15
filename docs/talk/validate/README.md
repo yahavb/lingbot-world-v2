@@ -11,7 +11,7 @@ Wan2.2-TI2V-5B on one trn2 device (`models/fast_dit.py`, 30 blocks). That is not
 The 16-device rows on S9c, and the 8-device 18.64 and 18.40 fps on S7a and S9c, are trn2.
 Every number below is re-measured on LingBot's own T5 encoder, 40-block DiT and VAE.
 
-## Job 1: `talk-pipeline-job.yaml` (kiro/k8s_sweep.sh, one pod)
+## Job 1: `talk-pipeline-job.yaml` (perf/k8s_sweep.sh, one pod)
 
 | Config | What it is | Slides |
 |---|---|---|

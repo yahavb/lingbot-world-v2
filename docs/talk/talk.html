@@ -1602,7 +1602,7 @@ same softmax over their union, so it is exact. Block 3.28 → 2.88 ms, GEN 4.88 
 <p>nkilib <code>attention_cte</code> copied into the repo
 (<a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/kernels/attention_cte_lb.py"><code>kernels/attention_cte_lb.py</code></a>), every change marked <code>lingbot:</code>
 behind its own flag, and checked bitwise against nkilib at every DiT call shape
-(<a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/kiro/attn_bitcmp.py"><code>kiro/attn_bitcmp.py</code></a>).
+(<a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/kiro/attn_bitcmp.py"><code>perf/attn_bitcmp.py</code></a>).
 1. <strong>V tiles 8 per DMA</strong> (<code>LINGBOT_CTE_VGROUP=8</code>). Each software-DGE <code>dma_copy</code> costs ~0.75 µs of
    GpSimd time whatever its size, and there were ~800 per call. GEN 3.94 → 3.74 s.
    <a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/kernels/attention_cte_lb.py#L172-L177"><code>#L172-L177</code></a>

@@ -128,7 +128,7 @@ _KV_WRITE_LATE = os.environ.get("LINGBOT_KV_WRITE_LATE", "0") == "1"
 # and all-gather that, so the gathered chunk needs only large contiguous copies instead of an
 # element-wise L<->d transpose of the whole 4320-token chunk. Data movement only and the same merge
 # order, but the compiled graph fuses differently and the result is NOT bit-exact: block output rel
-# RMS 1.6e-4 vs the default path (kiro/block_bench.py, seeded cache).
+# RMS 1.6e-4 vs the default path (perf/block_bench.py, seeded cache).
 # =2 issues the new chunk's all-gathers BEFORE the leading calls (so the collectives can run under
 # them), =1 after them.
 _ATTN_EARLY = int(os.environ.get("LINGBOT_ATTN_EARLY", "0"))

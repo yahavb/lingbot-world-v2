@@ -305,7 +305,7 @@ pair("S2c", "the 4 × 4 torus was read off neuron-ls on a trn2.48xlarge",
       "figure: 4 × 4 torus, 4 neighbours (read on a trn2.48xlarge) → the links neuron-ls lists on trn3-dev1: chip 0 → 1, 2, 4, 6, 8, 10, 12, 14; chip 1 → 0, 3, 5, …, 15",
       "4 neighbours per chip → 8 linked chips per chip; 144 GB HBM per chip confirmed"],
      ["neuron-ls printed rows 0-6 in the job logs (head -20); every row follows the pattern partner + same parity. Check rows 7-15 on the box before re:Invent.",
-      "This also explains kiro/core_order.py: each CP8 group must sit on chips that are all linked."])
+      "This also explains perf/core_order.py: each CP8 group must sit on chips that are all linked."])
 
 pair("S3a", "Wan2.2-TI2V-5B, one trn2 device: 76.6 s",
      [("code", 0, code_panel("Move the model to the device", "generate.py", 663,
@@ -364,7 +364,7 @@ pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
      ["screenshot of the Wan2.2 block → Neuron Explorer screenshot of the LingBot block (pairs/block_WITHOUT_kernel_8.98ms (S5a)), attention.py:802 selected in the code view, the five gaps marked (anim/S5a_code_view_marked.png)",
       "56.1 ms → 8.98 ms; three gaps ~22 ms → five softmax gaps of ~0.3 ms, 1.46 ms in all (1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms from the block start; Vector 93-99% and Scalar 87-97% busy in them, all from attention.py:802). A sixth 85 us gap at 7.83 ms is not softmax.", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
      ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself.",
-      "<b>Profile:</b> docs/talk/validate/pairs/block_WITHOUT_kernel_8.98ms (S5a)/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/block_WITHOUT_kernel_8.98ms (S5a)/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (kiro/e2e/profile.sh)."])
+      "<b>Profile:</b> docs/talk/validate/pairs/block_WITHOUT_kernel_8.98ms (S5a)/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/block_WITHOUT_kernel_8.98ms (S5a)/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (perf/e2e/profile.sh)."])
 
 PAIRS.append(kernel_side_by_side())
 

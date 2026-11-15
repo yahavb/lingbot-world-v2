@@ -4,7 +4,7 @@ Deck: `demo/talk-deck.html` on `riv26-demo` (identical to `~/Downloads/talk-deck
 Tags:
 - **OK**: already LingBot on trn3, or a trn3 hardware spec from the AWS docs.
 - **WAN**: a Wan2.2-TI2V-5B number (often trn2). Replace with the LingBot row named here.
-- **TRN2**: a LingBot number measured on trn2 (`kiro/LOOP_ENGINEERING.md` 16-device tables). Re-measure on trn3, at most 8 chips.
+- **TRN2**: a LingBot number measured on trn2 (`docs/perf/LOOP_ENGINEERING.md` 16-device tables). Re-measure on trn3, at most 8 chips.
 - **NONE**: no number to check.
 
 Replacement numbers are in `RESULTS.md`, same slide ids.
@@ -47,7 +47,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | S9d | 17.3 fps, ~1.07 s key press, ~0.58 s per chunk, half a trn3 | OK (trn3), needs > 8 chips (separate VAE deploy) | per chunk 0.554 s confirmed on 8 chips; inline VAE: 11.8 fps, 2.05 s (RESULTS S9d) |
 | S11b | `serve_ti2v.py`, 8 ranks, T5 on CPU | WAN | LingBot `serve.py` / `lbw-deploy.yaml` |
 | S11c | VAE warm-up 186 / 21 / 3.6 s | WAN | LingBot main: GEN pass 1 151.0 s, pass 2 4.28 s; VAE first decode still compiles (job 1 `dec1.log`) |
-| S11d | device busy 96.9% -> 99.5% (`device_unipc.py`); ffmpeg vfork 90 ms; `wan2-ti2v-5b-deploy.yaml` | WAN | LingBot host fixes: `LINGBOT_VAE_GATHER1` frames 0.32 s sooner (kiro/e2e/LEDGER.md, 4 devices) |
+| S11d | device busy 96.9% -> 99.5% (`device_unipc.py`); ffmpeg vfork 90 ms; `wan2-ti2v-5b-deploy.yaml` | WAN | LingBot host fixes: `LINGBOT_VAE_GATHER1` frames 0.32 s sooner (docs/perf/e2e/LEDGER.md, 4 devices) |
 
 ## Backups
 
@@ -64,7 +64,7 @@ Replacement numbers are in `RESULTS.md`, same slide ids.
 | B6f | block 2.53-2.60 ms at TP4 x CP16 | TRN2 | block profile of main at TP4 x CP8 (job 1 profile is the compiled native-SDPA config; needs one for main) |
 | B6g | row max ranges, 0.70 -> 0.36 ms, GEN 3.30 -> 3.06 s, 22.49 -> 24.12 fps (16 devices) | TRN2, cannot run on trn3 | same as B6d |
 | B6h | code only | NONE | |
-| B7c | Wan2.2 layouts on one device, 29.4 -> 20.6 ms | WAN | LingBot layouts on 8 trn3 chips are in `kiro/LOOP_ENGINEERING.md` "Half an instance" (TP4xCP8 17.88, TP8xCP4 16.70, TP2xCP16 14.74 fps) |
+| B7c | Wan2.2 layouts on one device, 29.4 -> 20.6 ms | WAN | LingBot layouts on 8 trn3 chips are in `docs/perf/LOOP_ENGINEERING.md` "Half an instance" (TP4xCP8 17.88, TP8xCP4 16.70, TP2xCP16 14.74 fps) |
 | B9e | none | NONE | |
 | B10 | 44.6 dB, 76.6 -> 36.8 s, 56.1 -> 17.3 ms, 29.4 -> 20.6 ms | WAN | use the RESULTS rows |
 | B11e | "A Trainium2 device" | WAN/TRN2 | say Trainium3 |

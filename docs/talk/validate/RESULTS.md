@@ -8,7 +8,7 @@ Setup for every number here, unless a row says otherwise:
 - cluster KEEP-trn3-dev1, node ip-192-168-192-229, one `xl-lnc2` claim (8 trn3 chips, 32 ranks, TP4 x CP8)
 - 81 frames, 480x768, chunk 3, window 12, sink 1, 4 denoise steps, `examples/03`, seed 42
 - image torch-neuronx 2.14.0 / SDK 2.33
-- job `talk-pipeline-job.yaml` (kiro/k8s_sweep.sh); raw logs on the node in `/opt/lingbot-world-v2/e2e/lbw-talk-pipeline/<config>/`
+- job `talk-pipeline-job.yaml` (perf/k8s_sweep.sh); raw logs on the node in `/opt/lingbot-world-v2/e2e/lbw-talk-pipeline/<config>/`
 
 How the numbers are taken:
 - GEN is the last pass in one process. Pass 1 includes compiling and is not a latency number.
@@ -139,7 +139,7 @@ LingBot, both compiled one graph per block, everything else off:
 **Finding: on LingBot the deck's S5g claim is reversed.** Calling attention_cte ourselves is slower than
 leaving native SDPA in the code (8.98 vs 6.07 s GEN), because on SDK 2.33 the compiler already uses
 attention_cte for SDPA. Our `cte` path also copies every KV chunk into a zero-filled, 512-aligned
-buffer before each call (`kiro/LOOP_ENGINEERING.md`, "Merged attention"). The LingBot win from the
+buffer before each call (`docs/perf/LOOP_ENGINEERING.md`, "Merged attention"). The LingBot win from the
 kernel came later, from changing how the kernel reads the cache (`LINGBOT_CTE_MERGE` and the q20 flags; S7d row).
 The per-call times (deck: 18.2 -> 5.3 ms) come from the block profiles of jobs 2 and 3: pending.
 
@@ -199,7 +199,7 @@ and are 5% slower at 8. 16 chips not re-run (budget).
 ## S7d: Sequence parallelism, two functional collectives
 
 Deck: VAE 9.0 -> 6.0 s (one spatial tile per core). **Wrong model** (Wan2.2 `models/vae_tiled.py`).
-Deck: 17.88 fps on half a trn3, TP4 x CP8. **LingBot, trn3**: from `kiro/LOOP_ENGINEERING.md` (q20 flags).
+Deck: 17.88 fps on half a trn3, TP4 x CP8. **LingBot, trn3**: from `docs/perf/LOOP_ENGINEERING.md` (q20 flags).
 
 | | Measured | Status |
 |---|---|---|
@@ -213,7 +213,7 @@ LingBot version of the slide's VAE line: **18.2 -> 2.03 s** (one core -> one wid
 
 Deck: step-0 within the bf16 floor; VAE 44.6 dB vs an fp32 decode. The 44.6 dB is Wan2.2.
 
-LingBot (job 1): chunk-0 step-0 noise prediction vs an fp32 CPU forward (`kiro/ref_fp32_c0s0.py`),
+LingBot (job 1): chunk-0 step-0 noise prediction vs an fp32 CPU forward (`perf/ref_fp32_c0s0.py`),
 VAE frames vs an fp32 CPU decode of the same latents.
 
 | Config | c0s0 rel-RMS vs fp32 | VAE vs fp32 decode |

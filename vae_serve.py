@@ -15,7 +15,7 @@ background thread; every rank decodes its shard on its main thread.
 
 LINGBOT_VAE_FUSED=1 decodes with wan/modules/vae2_1_fused.py (compiled decoder blocks,
 halos inside the graphs; LINGBOT_VAE_2D=1 for height x width tiles), the decoder
-kiro/LOOP_ENGINEERING.md measured; otherwise the per-conv width-sharded decoder.
+docs/perf/LOOP_ENGINEERING.md measured; otherwise the per-conv width-sharded decoder.
 """
 
 import argparse

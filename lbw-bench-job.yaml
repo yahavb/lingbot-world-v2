@@ -1,4 +1,4 @@
-# Batch benchmark, 4 trn3 devices (l-lnc2, TP4 x CP4), 448x704: 16.0 fps (kiro/e2e/LEDGER.md).
+# Batch benchmark, 4 trn3 devices (l-lnc2, TP4 x CP4), 448x704: 16.0 fps (docs/perf/e2e/LEDGER.md).
 apiVersion: batch/v1
 kind: Job
 metadata:

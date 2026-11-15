@@ -1331,7 +1331,7 @@ class WanI2VCausal:
             # LINGBOT_DUMP_ROLLOUT=<dir> (gate): rank 0 of the FIRST generation in the process saves
             # every input of the rollout (initial noise, condition y, camera embedding, text context,
             # timesteps, each per-step noise draw in use order) and each chunk's x0, so the CPU fp32
-            # reference (kiro/ref_fp32_rollout.py) replays the identical rollout. The draws are kept
+            # reference (perf/ref_fp32_rollout.py) replays the identical rollout. The draws are kept
             # as device references (no sync in the loop) and copied to the host after it.
             _roll_dir = os.environ.get("LINGBOT_DUMP_ROLLOUT", "")
             _roll = ([] if _roll_dir and chunk_control is None and max_chunks is None
@@ -1347,7 +1347,7 @@ class WanI2VCausal:
                     torch.save(t_.detach().float().cpu(), os.path.join(_dump_dir, f"{tag}.pt"))
 
             def _maybe_dump_inputs(x_, t_, kw_):
-                # c0s0 inputs for the fp32 CPU reference (kiro/ref_fp32_c0s0.py): chunk 0, step 0
+                # c0s0 inputs for the fp32 CPU reference (perf/ref_fp32_c0s0.py): chunk 0, step 0
                 # runs on zeroed KV caches, so these tensors and scalars define it completely.
                 p_ = os.path.join(_dump_dir, "c0s0_inputs.pt")
                 if _dump_dir and "c0s0" in _dump_tags and (not dist.is_initialized() or dist.get_rank() == 0) \
