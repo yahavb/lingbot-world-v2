@@ -330,11 +330,12 @@ pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
 PAIRS.append(kernel_side_by_side())
 
 pair("S5b", "Wan2.2 Explorer screenshot",
-     [("img", timeline("iv_demo_sdpa.json", 726, 478, "every instruction of F.scaled_dot_product_attention")),
-      ("r", "red from ~5 to ~34 ms", "red from 0 to 2.7 ms"),
-      ("r", "short red bursts with gaps", "idle from 0.71 to 1.88 ms (dashed)")],
-     ["screenshot → timeline drawn from pairs/demo_sdpa (one LingBot rank's attention, one core, demo/sdpa_vs_nki.py)",
-      "Vector, Scalar red ~5-34 ms → 0-2.7 ms", "Tensor: one 1.17 ms gap, 0.71-1.88 ms"],
+     [("img", '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="Neuron Explorer: F.scaled_dot_product_attention selected in the code view; every instruction it made is red" style="width:726px;height:auto"></a>'
+              % (S5A_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5a_code_view_marked.jpg"), "rb").read()).decode())),
+      ("r", "red from ~5 to ~34 ms", "red through the whole attention, ~1 to 7 ms"),
+      ("r", "short red bursts with gaps", "red bursts with 5 gaps (yellow)")],
+     ["screenshot → your Neuron Explorer screenshot of the LingBot block (pairs/block_WITHOUT_kernel_8.98ms (S5a)), line 802 selected in the code view (blue box)",
+      "Vector, Scalar red ~5-34 ms → red through the attention, ~1-7 ms", "Tensor: red bursts with 5 gaps (yellow boxes)"],
      ["<b>Profile:</b> docs/talk/validate/pairs/attention_only_WITHOUT_kernel_2.69ms (S5b)/s5b_lingbot_attention_sdpa_2.69ms.neff + .ntff (one LingBot rank's self-attention, one trn3 core, q [1,10,640,128], k/v [1,10,17280,128]), source pairs/attention_only_WITHOUT_kernel_2.69ms (S5b)/source.tar.gz. Select the F.scaled_dot_product_attention line of sdpa_vs_nki.py in the code view. Job demo/demo_job.yaml; script demo/sdpa_vs_nki.py --mode sdpa."])
 
 pair("S5d", "Wan2.2: 39% / 36% / 16%",
