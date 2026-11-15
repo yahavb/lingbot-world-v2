@@ -67,9 +67,6 @@
   <p>Keys: <kbd>W</kbd>/<kbd>↑</kbd> forward, <kbd>S</kbd>/<kbd>↓</kbd> back, <kbd>A</kbd>/<kbd>←</kbd> left,
     <kbd>D</kbd>/<kbd>→</kbd> right, <kbd>R</kbd> up, <kbd>F</kbd> down, <kbd>Space</kbd> hold, <kbd>P</kbd> scene path.</p>
 
-  <label for="prompt">Prompt (sent with Start; "Send prompt" switches it live)</label>
-  <textarea id="prompt" rows="4"></textarea>
-  <div class="row"><button id="sendPrompt">Send prompt</button></div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -89,7 +86,6 @@ async function loadScenes() {
 }
 function pickScene() {
   const s = scenes.find((x) => x.id === $("scene").value);
-  $("prompt").value = s.prompt;
   img.src = `api/scenes/${s.id}/image.jpg`;
 }
 
@@ -163,7 +159,7 @@ function tick(now) {
 
 async function start() {
   await stop();
-  const scene = $("scene").value, prompt = $("prompt").value;
+  const scene = $("scene").value;
   buffer = []; arrivals = []; shown = []; lastChunk = -1; total = 0; playing = false; latencyMs = null;
   const ctl = new AbortController();
   abort = ctl;
@@ -171,7 +167,7 @@ async function start() {
   say("Starting. The first frames take a few seconds.");
   try {
     const r = await fetch("api/session", { method: "POST", signal: ctl.signal,
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene, prompt }) });
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene }) });
     if (!r.ok) { say(`Could not start: ${(await r.json()).detail || r.status}`); return; }
     const current = document.querySelector('[aria-pressed="true"]');
     if (current && current.dataset.action !== "auto") control({ action: current.dataset.action });
@@ -217,10 +213,6 @@ for (const b of document.querySelectorAll("[data-action]")) b.addEventListener("
 $("scene").addEventListener("change", pickScene);
 $("start").addEventListener("click", start);
 $("stopBtn").addEventListener("click", stop);
-$("sendPrompt").addEventListener("click", async () => {
-  if (!abort) { say("Start a session first."); return; }
-  say((await control({ prompt: $("prompt").value })) ? "Prompt sent; it applies from the next chunk." : "Prompt not sent.");
-});
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || e.repeat) return;
   const a = KEYS[e.key.toLowerCase()];
