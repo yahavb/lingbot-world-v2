@@ -302,7 +302,7 @@ pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
      ["screenshot of the Wan2.2 block → engine timeline drawn from the LingBot block's profile (pairs/1_sdpa_math_rank1, rank 1)",
       "56.1 ms → 8.98 ms; three gaps ~22 ms → five softmax gaps of ~0.3 ms, 1.46 ms in all (1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms from the block start; Vector 93-99% and Scalar 87-97% busy in them, all from attention.py:802). A sixth 85 us gap at 7.83 ms is not softmax.", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
      ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself.",
-      "<b>Profile:</b> docs/talk/validate/pairs/S5a-AFTER/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/S5a-AFTER/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (kiro/e2e/profile.sh)."])
+      "<b>Profile:</b> docs/talk/validate/pairs/block_WITHOUT_kernel_8.98ms (S5a)/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/block_WITHOUT_kernel_8.98ms (S5a)/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (kiro/e2e/profile.sh)."])
 
 pair("S5b", "Wan2.2 Explorer screenshot",
      [("img", timeline("iv_demo_sdpa.json", 726, 478, "every instruction of F.scaled_dot_product_attention")),
@@ -310,7 +310,7 @@ pair("S5b", "Wan2.2 Explorer screenshot",
       ("r", "short red bursts with gaps", "idle from 0.71 to 1.88 ms (dashed)")],
      ["screenshot → timeline drawn from pairs/demo_sdpa (one LingBot rank's attention, one core, demo/sdpa_vs_nki.py)",
       "Vector, Scalar red ~5-34 ms → 0-2.7 ms", "Tensor: one 1.17 ms gap, 0.71-1.88 ms"],
-     ["<b>Profile:</b> docs/talk/validate/pairs/S5b-AFTER/s5b_lingbot_attention_sdpa_2.69ms.neff + .ntff (one LingBot rank's self-attention, one trn3 core, q [1,10,640,128], k/v [1,10,17280,128]), source pairs/S5b-AFTER/source.tar.gz. Select the F.scaled_dot_product_attention line of sdpa_vs_nki.py in the code view. Job demo/demo_job.yaml; script demo/sdpa_vs_nki.py --mode sdpa."])
+     ["<b>Profile:</b> docs/talk/validate/pairs/attention_only_WITHOUT_kernel_2.69ms (S5b)/s5b_lingbot_attention_sdpa_2.69ms.neff + .ntff (one LingBot rank's self-attention, one trn3 core, q [1,10,640,128], k/v [1,10,17280,128]), source pairs/attention_only_WITHOUT_kernel_2.69ms (S5b)/source.tar.gz. Select the F.scaled_dot_product_attention line of sdpa_vs_nki.py in the code view. Job demo/demo_job.yaml; script demo/sdpa_vs_nki.py --mode sdpa."])
 
 pair("S5d", "Wan2.2: 39% / 36% / 16%",
      [("r", "One native-SDPA block, 56.1 ms, measured from the profile", "One LingBot block, SDPA as matmul → softmax → matmul, 8.98 ms, measured from the profile"),
