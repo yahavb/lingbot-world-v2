@@ -187,13 +187,16 @@ def kernel_side_by_side():
     return with_banner(cell, "S5a-KERNEL", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="S5a-KERNEL-AFTER"', 'data-ref="S5a-KERNEL"')
 
 
-def _b6b_one(ref, h1, color, label, jpg, alt, stats, takeaway, note):
+def _b6b_one(ref, h1, color, label, jpg, alt, stats, takeaway, note, url=None):
     img = base64.b64encode(open(os.path.join(HERE, "anim", jpg), "rb").read()).decode()
     st = "".join('<div class="stat"><div class="v" style="color:%s">%s <small>%s</small></div><div class="l">%s</div></div>' % (c, v, u, l) for c, v, u, l in stats)
     body = ('<div style="display:flex;gap:36px;align-items:center;width:100%%">'
             '<img src="data:image/jpeg;base64,%s" alt="%s" style="max-height:455px;max-width:780px;width:auto;height:auto;border-radius:8px">'
             '<div style="display:flex;flex-direction:column;gap:20px">'
-            '<div style="font-size:28px;font-weight:800;color:%s">%s</div>%s</div></div>') % (img, alt, color, label, st)
+            '<div style="font-size:28px;font-weight:800;color:%s">%s</div>%s%s</div></div>') % (img, alt, color, label, st,
+            ('<p><a class="xlink" href="%s" target="_blank" rel="noopener">Open this profile in Neuron Explorer</a></p>' % url) if url else "")
+    if url:
+        body = body.replace('<img src=', '<a href="%s" target="_blank" rel="noopener"><img src=' % url, 1).replace('border-radius:8px">', 'border-radius:8px"></a>', 1)
     cell = ('<div class="cell" data-ref="%s"><section class="slide"><h1>%s</h1><div class="body">%s</div>'
             '<p class="takeaway"><span class="k">Takeaway</span><span>%s</span></p></section><div class="nt">%s</div></div>\n'
             % (ref, h1, body, takeaway, notes(["new slide after B6b-AFTER"], [note])))
@@ -208,14 +211,17 @@ def b6b_profile():
                       ("#ffffff", "~0", "compute", "Tensor, Vector, Scalar idle meanwhile")],
                      "While the memory is copied, the chip computes nothing.",
                      "Profile: pairs/copy_first_17.1ms (B6b), job lbw-talk-b6-nomerge (LINGBOT_CTE_MERGE=0), rank 0. Line 448/449 of wan/modules/attention.py "
-                     "become HLO scatter ops, run on Sync as DMA_DIRECT2D + EVENT_SEMAPHORE.")
+                     "become HLO scatter ops, run on Sync as DMA_DIRECT2D + EVENT_SEMAPHORE.",
+                     url="https://neuron-explorer.harmony.a2z.com/profile/copy_first_17.1ms_B6b?shared=H4sIAN0c-WoAA6tWSs4vqIxPyywqLok3NNczzC2OdzJLUrKqViouSSwqCcnMTVWyMtBRSs1LgbANzQ0sDcxMDGprASegFG48AAAA")
             + _b6b_one("B6b-INPLACE", "Backup: read in place, in the profile", "#4cd04c", "READ IN PLACE: 2.92 ms block", "B6b_read_in_place_marked.jpg",
                        "read-in-place block: compute engines busy the whole block",
                        [("#4cd04c", "2.92", "ms", "the same block, no copy"),
                         ("#ffffff", "busy", "", "Tensor, Vector, Scalar work across the whole block"),
                         ("#ff8c00", "~0.3", "ms", "one short wait, not a 14 ms copy")],
                        "Read the memory where it is, and the chip keeps working.",
-                       "Profile: pairs/read_in_place_2.92ms (B6b), job lbw-talk-b6-layouts (q20, LINGBOT_CTE_MERGE=1), rank 0, the steady block."))
+                       "Profile: pairs/read_in_place_2.92ms (B6b), job lbw-talk-b6-layouts (q20, LINGBOT_CTE_MERGE=1), rank 0, the steady block. "
+                       "The read in place: kernels/attention_cte_lb.py:210 (_kv_dma, called for K at 3090 and V at 3207), on the GpSimd engine, ~0.25 ms.",
+                       url="https://neuron-explorer.harmony.a2z.com/profile/read_in_place_2.92ms_B6b?shared=H4sIANcZ-WoAA33MsQ6CMBSF4XfpTAiWtlhGJ50cxDjeFLjRhnJr4C7G9N1t4sDGdobz_V-x6hcET88-MvQhDhM4ZiT2kWBgBFXWzbyKNj_ZLdz5GUVbFQJp_G9VN7LSKhVig5HCBx6X7ny9dzDhQhhAlsbOK9x0vxOT5mh0ZXNsQTeCJ3gHN2DGVmZ8MrvYHpS2NqUfWhj5KNYAAAA"))
 
 
 # ───────────── edit machinery ─────────────
