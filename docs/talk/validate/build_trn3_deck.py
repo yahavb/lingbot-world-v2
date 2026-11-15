@@ -229,6 +229,7 @@ def notes(changes, extra=()):
 
 
 PAIRS = []
+S5F_URL = "https://neuron-explorer.harmony.a2z.com/profile/attention_only_WITH_kernel_1.57ms_S5f?shared=H4sIABYU-WoAA33MvQqDMBAA4He5WYJRLj8-QTt1aErHENsUxHgBvaVI3r1g6VLE7Zu-FfqUH6O_n93pcnN-jDPF5I2wZlr8FQN0KywcZnbDFKGrK4j0_NpYjRbbUkFgjsRDJp8pvf-zRii7Zf1B1iijsLb72W-SAvU2vQ4mibpV0pTyAVkbucjcAAAA"
 S5B_URL = "https://neuron-explorer.harmony.a2z.com/profile/attention_only_WITHOUT_kernel_2.69ms_S5b?shared=H4sIAKwS-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWt1lBJLSlLzSjLz8-Lz83Iq0Q0z0jOzBBuWhMcwIzMLM1MDy9paACJ_RF6SAAAA"
 S5A_URL = "https://neuron-explorer.harmony.a2z.com/profile/block_WITHOUT_kernel_8.98ms_S5a?shared=H4sIAFoF-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWtrAdB7B0lFAAAA"
 
@@ -349,15 +350,20 @@ pair("S5d", "Wan2.2 numbers · no AFTER: same point as S5a",
 PAIRS.pop()   # S5d-AFTER removed: it repeats S5a in numbers
 
 pair("S5f", "Wan2.2: 18.2 → 5.3 ms per call, 7,854 tokens",
-     [("svg", 0, '<div style="display:flex;gap:36px;align-items:center;width:100%%">'
-                 '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="attention alone without the kernel in Neuron Explorer: one 1.17 ms Tensor pause" style="width:760px;height:auto;border-radius:8px"></a>'
-                 '<div style="display:flex;flex-direction:column;gap:22px">'
-                 '<div class="stat"><div class="v" style="color:#ff6b6b">2.69 <small>ms</small></div><div class="l">Native SDPA: the matmul engine waits 1.17 ms</div></div>'
-                 '<div class="stat g" data-step="1"><div class="v">1.57 <small>ms</small></div><div class="l">nkilib attention_cte: no long wait</div></div>'
-                 '<p><a class="xlink" href="%s" target="_blank" rel="noopener">Open this profile in Neuron Explorer</a></p>'
-                 '<p style="font-size:15px;color:#898781">attention alone, one call over 17,280 keys: a simplified test, not the block\'s exact attention</p>'
-                 '</div></div>' % (S5B_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5f_without_code_marked.jpg"), "rb").read()).decode(), S5B_URL))],
-     ["chart → your Neuron Explorer screenshot of attention alone without the kernel (line 55 selected), linked to the shared profile; with-kernel screenshot to come",
+     [("svg", 0, '<div style="display:flex;gap:32px;justify-content:center;align-items:flex-start;width:100%%">'
+                 '<div style="display:flex;flex-direction:column;gap:8px;width:560px">'
+                 '<div style="font-size:28px;font-weight:800;color:#ff6b6b">WITHOUT the kernel: 2.69 ms</div>'
+                 '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="attention alone without the kernel: one 1.17 ms Tensor pause" style="width:560px;height:auto;border-radius:8px"></a>'
+                 '<div style="font-size:19px;color:#c3c2b7">the matmul engine stops for 1.17 ms · <a class="xlink" href="%s" target="_blank" rel="noopener">open in Neuron Explorer</a></div></div>'
+                 '<div style="display:flex;flex-direction:column;gap:8px;width:560px" data-step="1">'
+                 '<div style="font-size:28px;font-weight:800;color:#4cd04c">WITH the kernel: 1.57 ms</div>'
+                 '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="attention alone with the NKI kernel: Tensor never stops for the softmax" style="width:560px;height:auto;border-radius:8px"></a>'
+                 '<div style="font-size:19px;color:#c3c2b7">the matmuls never stop for the softmax · <a class="xlink" href="%s" target="_blank" rel="noopener">open in Neuron Explorer</a></div>'
+                 '<div style="font-size:14px;color:#898781">attention alone, one call over 17,280 keys: a simplified test, not the block\'s exact attention</div></div>'
+                 '</div>'
+                 % (S5B_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5f_without_code_marked.jpg"), "rb").read()).decode(), S5B_URL,
+                    S5F_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5f_with_kernel_marked.jpg"), "rb").read()).decode(), S5F_URL))],
+     ["chart → your Neuron Explorer screenshot of attention alone without the kernel (line 55 selected), linked to the shared profile; next to it the with-kernel screenshot (attention_only_WITH_kernel_1.57ms (S5f))",
       "7,854 tokens (Wan2.2) → one LingBot rank: 640 queries × 17,280 keys, 10 heads",
       "18.2 → 5.3 ms → 2.69 → 1.57 ms device time per call (demo/sdpa_vs_nki.py, one core)"])
 
