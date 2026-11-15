@@ -93,7 +93,7 @@ async def session(request: Request):
     if body.get("scene") not in dict(SCENES):
         raise HTTPException(status_code=400, detail="unknown scene")
     body["live"] = True
-    state["prompt"] = body.get("prompt") or scene_prompt(body["scene"])
+    body["prompt"] = state["prompt"] = body.get("prompt") or scene_prompt(body["scene"])
     req = client.build_request("POST", "/session", json=body)
     r = await client.send(req, stream=True)
     if r.status_code != 200:
