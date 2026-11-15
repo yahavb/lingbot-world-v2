@@ -47,6 +47,8 @@ CSS = """
 .bab small{display:block;font-size:11px;letter-spacing:.04em;font-weight:600;opacity:.92}
 .tl-lbl{font-size:15px;fill:#c3c2b7;font-weight:600}
 .tl-ax{font-size:12px;fill:#898781}
+.slide a{pointer-events:auto;cursor:pointer}
+.xlink{color:#4da3ff;text-decoration:underline;font-weight:700}
 """
 
 
@@ -211,6 +213,7 @@ def notes(changes, extra=()):
 
 
 PAIRS = []
+S5A_URL = "https://neuron-explorer.harmony.a2z.com/profile/block_WITHOUT_kernel_8.98ms_S5a?shared=H4sIAFoF-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWtrAdB7B0lFAAAA"
 
 
 def pair(ref, why_before, ops, changes, extra=(), why_after="LingBot-World v2 · 8 trn3 chips", src=None):
@@ -297,10 +300,12 @@ pair("S4e", "Wan2.2 VAE; for LingBot the result is the opposite",
 pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
      [("r", "One compiled DiT block, native SDPA, one core: 56.1 ms",
        "One compiled LingBot DiT block, SDPA as matmul → softmax → matmul, one core: 8.98 ms"),
-      ("img", '<img src="data:image/jpeg;base64,%s" alt="LingBot block without the kernel in Neuron Explorer, attention.py:802 selected; five Tensor gaps marked" style="width:726px;height:auto">'
-              % base64.b64encode(open(os.path.join(HERE, "anim", "S5a_code_view_marked.jpg"), "rb").read()).decode()),
+      ("img", '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="LingBot block without the kernel in Neuron Explorer, attention.py:802 selected; five Tensor gaps marked" style="width:726px;height:auto"></a>'
+              % (S5A_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5a_code_view_marked.jpg"), "rb").read()).decode())),
       ("r", "<b>Three long Tensor gaps:</b> ~22 of 56 ms", "<b>Five Tensor gaps:</b> ~0.3 ms each, 1.46 of 8.98 ms (yellow)"),
-      ("r", "<b>Three times,</b> once per head", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle")],
+      ("r", "<b>Three times,</b> once per head", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle"),
+      ("r", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle</p></div>",
+       '<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle</p></div><div class="o"><span class="n">↗</span><p><a class="xlink" href="%s" target="_blank" rel="noopener">Open this profile in Neuron Explorer</a></p></div>' % S5A_URL)],
      ["screenshot of the Wan2.2 block → Neuron Explorer screenshot of the LingBot block (pairs/block_WITHOUT_kernel_8.98ms (S5a)), attention.py:802 selected in the code view, the five gaps marked (anim/S5a_code_view_marked.png)",
       "56.1 ms → 8.98 ms; three gaps ~22 ms → five softmax gaps of ~0.3 ms, 1.46 ms in all (1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms from the block start; Vector 93-99% and Scalar 87-97% busy in them, all from attention.py:802). A sixth 85 us gap at 7.83 ms is not softmax.", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
      ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself.",
