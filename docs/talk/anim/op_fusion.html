@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Operation fusion: eager vs torch.compile</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Eager: six operations (norm, scale, shift, matmul, SiLU, add) run one after another. Each one is launched, reads its input from HBM, computes on one engine, and writes its result back to HBM, so the timeline fills with launch and memory time. Fused with torch.compile: the same six operations are one graph with one launch; the data is read from HBM once, passes from operation to operation in on-chip SBUF while the engines overlap, and is written back once. Its timeline is much shorter.">
+  <defs>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  // ---- helpers ----
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return "rgba("+(n>>16&255)+","+(n>>8&255)+","+(n&255)+","+a+")"; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+
+      '" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'middle')+'"'+
+      ' style="'+(fill?'fill:'+fill+';':'')+'"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+
+  // ---- the six operations of a block fragment, and the engine each runs on ----
+  var VEC = "#2fd39a", TEN = "#3d9bff", SCA = "#ffcc33";
+  var OPS = [
+    {n:"norm",   e:"Vector", c:VEC}, {n:"scale",  e:"Vector", c:VEC}, {n:"shift", e:"Vector", c:VEC},
+    {n:"matmul", e:"Tensor", c:TEN}, {n:"SiLU",   e:"Scalar", c:SCA}, {n:"add",   e:"Vector", c:VEC}
+  ];
+  var LAUNCH = "#8a93a8", HBMC = "#8fa3c7", SBUFC = "#b48cff";
+  var OX0 = 250, OW = 180, OG = 34;                 // op boxes, x
+  function ox(i){ return OX0 + i*(OW+OG); }
+
+  // ---- eager schedule: per op, launch -> read from HBM -> compute -> write to HBM ----
+  var E0 = 0.8, EV = [], tt = E0;
+  for (var i=0;i<OPS.length;i++){
+    var L = 0.28, Rd = 0.32, C = (i===3 ? 0.45 : 0.24), W = 0.32;
+    EV.push({l:tt, r:tt+L, c:tt+L+Rd, w:tt+L+Rd+C, e:tt+L+Rd+C+W});
+    tt += L+Rd+C+W;
+  }
+  var EEND = tt;
+  // ---- fused schedule: one launch, one read, the ops overlap through SBUF, one write ----
+  var F0 = EEND + 0.9, FL = F0 + 0.6, FR = FL + 0.3, OP0 = FR + 0.4, OSTEP = 0.14, ODUR = 0.42;
+  var FW = OP0 + (OPS.length-1)*OSTEP + ODUR, FEND = FW + 0.4;
+  var LOOP = FEND + 3.5;
+
+  // ---- timeline: the same seconds-to-pixels scale for both bars ----
+  var TX = 330, TWID = 1180, SEC = TWID / (EEND - E0);
+  function seg(y,a,b,t,col){ if (t<=a) return ''; var x1 = TX+(a-E0)*SEC, x2 = TX+(Math.min(b,t)-E0)*SEC;
+    return R(x1,y,Math.max(0,x2-x1),34,4,col); }
+  function fseg(y,a,b,t,col){ if (t<=a) return ''; var x1 = TX+(a-F0-0.6)*SEC, x2 = TX+(Math.min(b,t)-F0-0.6)*SEC;
+    return R(x1,y,Math.max(0,x2-x1),34,4,col); }
+
+  function opBox(x,y,w,h,o,on,fs){
+    return R(x,y,w,h,16, on?o.c:hexA(o.c,.14), o.c, on?8:4, on?' filter="url(#glow)"':'') +
+           T(x+w/2,y+h/2+fs*0.12,fs,o.n,on?'#0b0d12':'#ffffff') +
+           T(x+w/2,y+h/2+fs*0.12+fs*0.8,fs*0.55,o.e,on?'#0b0d12':'#aab3c5');
+  }
+  function packet(x,y,col){ return R(x-16,y-16,32,32,7,col,'#0b0d12',3,' filter="url(#glow)"'); }
+
+  function render(t){
+    var s = '';
+    // ================= eager =================
+    s += T(60,72,40,'Eager','#ffffff',null,'start');
+    s += R(OX0,262,OPS.length*(OW+OG)-OG,46,12,hexA(HBMC,.18),HBMC,4) + T(OX0-24,294,28,'HBM',HBMC,null,'end');
+    for (i=0;i<OPS.length;i++){
+      var ev = EV[i], x = ox(i), on = t>=ev.c && t<ev.w;
+      s += opBox(x,110,OW,110,OPS[i],on,34);
+      if (t>=ev.l && t<ev.r) s += R(x+OW/2-52,62,104,34,17,LAUNCH) + T(x+OW/2,86,20,'launch','#0b0d12');
+      var pr = prog(t,ev.r,ev.c-ev.r); if (pr>0 && pr<1) s += packet(x+OW/2, lerp(262,222,ease(pr)), HBMC);
+      var pw = prog(t,ev.w,ev.e-ev.w); if (pw>0 && pw<1) s += packet(x+OW/2, lerp(222,262,ease(pw)), HBMC);
+    }
+
+    // ================= fused =================
+    var fb = ease(prog(t,F0,0.5));
+    if (fb>0){
+      s += '<g opacity="'+fb+'">';
+      s += T(60,392,40,'Fused','#ffffff',null,'start') + T(220,392,28,'torch.compile: one graph','#aab3c5',null,'start');
+      s += R(OX0-20,420,OPS.length*(OW+OG)-OG+40,200,22,hexA('#ffffff',.04),'#ffffff',4,' stroke-dasharray="16 10"');
+      s += R(OX0,560,OPS.length*(OW+OG)-OG,44,12,hexA(SBUFC,.20),SBUFC,4) + T(OX0-34,592,28,'SBUF',SBUFC,null,'end');
+      s += R(OX0,668,OPS.length*(OW+OG)-OG,46,12,hexA(HBMC,.18),HBMC,4) + T(OX0-24,700,28,'HBM',HBMC,null,'end');
+      for (i=0;i<OPS.length;i++){
+        var a0 = OP0+i*OSTEP, onf = t>=a0 && t<a0+ODUR;
+        s += opBox(ox(i),440,OW,100,OPS[i],onf,30);
+      }
+      if (t>=FL && t<FR) s += R(800-52,404,104,34,17,LAUNCH) + T(800,428,20,'launch','#0b0d12');
+      var fr = prog(t,FR,OP0-FR); if (fr>0 && fr<1) s += packet(ox(0)+OW/2, lerp(668,604,ease(fr)), HBMC);
+      // the intermediate hops from op to op inside SBUF
+      for (i=0;i<OPS.length-1;i++){
+        var ph = prog(t,OP0+i*OSTEP+0.12,OSTEP+0.1);
+        if (ph>0 && ph<1) s += packet(lerp(ox(i)+OW/2, ox(i+1)+OW/2, ease(ph)), 582, SBUFC);
+      }
+      var fw = prog(t,FW,FEND-FW); if (fw>0 && fw<1) s += packet(ox(OPS.length-1)+OW/2, lerp(604,668,ease(fw)), HBMC);
+      s += '</g>';
+    }
+
+    // ================= timelines (same scale) =================
+    s += T(TX-20,792,26,'eager','#ffffff',null,'end') + R(TX,766,TWID,34,4,'#141a26');
+    for (i=0;i<OPS.length;i++){
+      var e2 = EV[i];
+      s += seg(766,e2.l,e2.r,t,LAUNCH) + seg(766,e2.r,e2.c,t,HBMC) + seg(766,e2.c,e2.w,t,OPS[i].c) + seg(766,e2.w,e2.e,t,HBMC);
+    }
+    if (fb>0){
+      s += '<g opacity="'+fb+'">' + T(TX-20,846,26,'fused','#ffffff',null,'end') + R(TX,820,TWID,34,4,'#141a26');
+      s += fseg(820,FL,FR,t,LAUNCH) + fseg(820,FR,OP0,t,HBMC);
+      // overlapping engines: three thin lanes inside the compute span
+      var lanes = [TEN,VEC,SCA];
+      for (i=0;i<OPS.length;i++){
+        var b0 = OP0+i*OSTEP, ln = lanes.indexOf(OPS[i].c);
+        if (t>b0){ var x1 = TX+(b0-F0-0.6)*SEC, x2 = TX+(Math.min(b0+ODUR,t)-F0-0.6)*SEC;
+          s += R(x1,820+ln*11.3,Math.max(0,x2-x1),11,2,OPS[i].c); }
+      }
+      s += fseg(820,FW,FEND,t,HBMC) + '</g>';
+    }
+    // legend
+    s += R(TX,872,22,16,3,LAUNCH)+T(TX+30,887,18,'launch','#aab3c5',null,'start') +
+         R(TX+130,872,22,16,3,HBMC)+T(TX+160,887,18,'HBM read / write','#aab3c5',null,'start') +
+         R(TX+340,872,22,16,3,TEN)+R(TX+364,872,22,16,3,VEC)+R(TX+388,872,22,16,3,SCA)+T(TX+418,887,18,'compute','#aab3c5',null,'start');
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  // ---- loop: hold the final picture, then play again; click or Space restarts ----
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = FEND + 0.1;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t >= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener('click', start);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); start(); } });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attention over the KV cache</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+  text.m{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Both paths produce the same output; only space and time differ. Before: on every attention call the cache chunks are copied into a new zero-padded buffer in HBM, and one attention call reads it; the extra HBM written grows call after call. After: one call per chunk reads the cache in place, the small partial results merge exactly into the same output, and no extra HBM is written.">
+  <defs>
+    <pattern id="hatch" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="10" height="10" fill="#2a2f3b"/><line x1="0" y1="0" x2="0" y2="10" stroke="#ff6b6b" stroke-width="3"/>
+    </pattern>
+    <marker id="aw" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto"><path d="M0,0 L14,7 L0,14 z" fill="#d6dbe6"/></marker>
+    <marker id="ag" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto"><path d="M0,0 L14,7 L0,14 z" fill="#4cd6a0"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+h+'" rx="'+rx+'" fill="'+fill+'"'+
+      (stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor,cls){ return '<text'+(cls?' class="'+cls+'"':'')+' x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'start')+'"'+
+      ' style="fill:'+fill+';white-space:pre;"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+  function A(x1,y1,x2,y2,col,mk,op){ return '<path d="M'+x1+','+y1+' L'+x2+','+y2+'" stroke="'+col+'" stroke-width="3" fill="none" marker-end="url(#'+mk+')"'+(op!=null?' opacity="'+op+'"':'')+'/>'; }
+
+  var MUTED = "#aab3c5", RED = "#ff6b6b", GREEN = "#4cd6a0", KERN = "#ffcc33";
+  var CH = [{n:'sink', w:100, c:'#8a93a8'}, {n:'chunk 1', w:190, c:'#3d9bff'}, {n:'chunk 2', w:190, c:'#b48cff'}, {n:'chunk 3', w:150, c:'#ff9f43'}];
+  var X0 = 90, GAP = 16, H = 50, TILE = 240;          // TILE: one kernel K tile (512 keys), drawn to scale with the chunks
+  function cx(i){ var x = X0; for (var k=0;k<i;k++) x += CH[k].w + GAP; return x; }   // in the cache: separate tensors
+  function bxp(i){ var x = X0; for (var k=0;k<i;k++) x += CH[k].w; return x; }        // in the buffer: packed end to end
+  var USED = bxp(CH.length) - X0, FULL = Math.ceil(USED / TILE) * TILE;
+  var B0 = 0.6, A0 = 9.4, END = 15.8;
+
+  function chunks(y, lit){
+    var s = '';
+    for (var i=0;i<CH.length;i++){
+      var on = lit === i;
+      s += R(cx(i), y, CH[i].w, H, 8, on ? CH[i].c : 'rgba(255,255,255,0.06)', CH[i].c, on ? 4 : 2) +
+           T(cx(i)+CH[i].w/2, y+32, 19, CH[i].n, on ? '#0b0d12' : '#ffffff', null, 'middle');
+    }
+    return s;
+  }
+  // HBM usage bar: the cache (its chunks, to scale) plus, in Before, the per-call copy and its padding
+  var MS = 0.18;
+  // extra HBM written: starts empty; every attention call adds one copy of the cache plus its zero padding
+  var MW = 250, SEG = MW / 3;
+  function hbm(x, y, done, copyP, padP){
+    var s = T(x, y-10, 18, 'HBM written', MUTED) + R(x, y, MW, 30, 4, 'rgba(255,255,255,0.04)', '#5a6070', 2);
+    var cw = SEG * USED / FULL, pw = SEG - cw;
+    for (var i=0;i<done;i++){ s += R(x+i*SEG, y, cw, 30, 0, '#ffb347', '#0b0d12', 1) + R(x+i*SEG+cw, y, pw, 30, 0, 'url(#hatch)', RED, 1); }
+    if (copyP > 0) s += R(x+done*SEG, y, cw*copyP, 30, 0, '#ffb347', '#0b0d12', 1);
+    if (padP > 0) s += R(x+done*SEG+cw, y, pw*padP, 30, 0, 'url(#hatch)', RED, 1);
+    return s;
+  }
+  function hbmAfter(x, y, calls){
+    var s = T(x, y-10, 18, 'HBM written', MUTED) + R(x, y, MW, 30, 4, 'rgba(255,255,255,0.04)', '#5a6070', 2), sw = MW / 4 / CH.length;
+    for (var i=0;i<calls;i++) s += R(x + i*sw, y, sw, 30, 0, CH[i].c, '#0b0d12', 1);
+    return s;
+  }
+  function panel(y, h, title, col, code){
+    return R(30, y, 1540, h, 20, 'rgba(255,255,255,0.03)', '#3a4256', 2) + T(60, y+46, 30, title, col) +
+           T(200, y+46, 21, code, '#d6dbe6', null, 'start', 'm');
+  }
+
+  function render(t){
+    var s = '';
+
+    // ================= BEFORE =================
+    // every attention call rebuilds the buffer from scratch: copy the cache, pad, then the kernel reads the copy
+    var Y = 30, yc = Y+100, yb = Y+260, C = 2.4, NCALL = 3;
+    s += panel(Y, 410, 'Before', RED, 'out = attention_cte(q, pad(cat(chunks)))');
+    var tc = t - B0, call = Math.min(NCALL - 1, Math.max(0, Math.floor(tc / C))), u = tc - call*C;
+    var last = tc >= NCALL*C; if (last) u = C - 0.01;
+    s += T(X0, yc-14, 18, 'KV cache (HBM)', MUTED) + T(X0, yb-26, 18, 'new buffer (HBM)', MUTED);
+    var lit = -1;
+    for (var i=0;i<CH.length;i++) if (tc >= 0 && u >= i*0.3 && u < i*0.3 + 0.5 && !last) lit = i;
+    s += chunks(yc, lit);
+    s += T(cx(CH.length)+20, yc+33, 26, 'copied on every attention call', '#ffb347', ease(prog(t, B0+0.2, 0.5)));
+    if (tc >= 0) s += T(1520, Y+46, 24, 'attention call ' + (call + 1), '#ffffff', null, 'end');
+    for (var j=0;j<CH.length;j++){
+      var p = tc < 0 ? 0 : ease(clamp((u - j*0.3) / 0.5));
+      if (p <= 0) continue;
+      var x = lerp(cx(j), bxp(j), p), y = lerp(yc, yb, p);
+      s += R(x, y, CH[j].w, H, 0, CH[j].c, '#0b0d12', 1) + T(x+CH[j].w/2, y+32, 19, CH[j].n, '#0b0d12', null, 'middle');
+    }
+    var tl = ease(prog(t, B0 + 1.2, 0.5));
+    s += '<g opacity="'+tl+'">';
+    for (var k=0;k<=FULL/TILE;k++) s += '<line x1="'+(X0+k*TILE)+'" y1="'+(yb-14)+'" x2="'+(X0+k*TILE)+'" y2="'+(yb+H+14)+'" stroke="#d6dbe6" stroke-width="2" stroke-dasharray="6 5"/>';
+    for (var k2=0;k2<FULL/TILE;k2++) s += T(X0+k2*TILE+TILE/2, yb+H+36, 18, 'tile', MUTED, null, 'middle');
+    s += '</g>';
+    var pz = tc < 0 ? 0 : ease(clamp((u - 1.2) / 0.3));
+    s += '<g opacity="'+pz+'">' + R(X0+USED, yb, FULL-USED, H, 0, 'url(#hatch)', RED, 3) +
+         T(X0+USED+(FULL-USED)/2, yb+33, 22, '0', '#ffffff', null, 'middle') +
+         '</g>';
+    var KX = 1270, kr = tc < 0 ? 0 : ease(clamp((u - 1.6) / 0.3));
+    var cp = tc < 0 ? 0 : clamp(u / 1.2);
+    s += last ? hbm(1270, Y+120, NCALL, 0, 0) : hbm(1270, Y+120, tc < 0 ? 0 : call, cp, pz);
+    s += R(KX, yb-14, 250, 78, 12, 'rgba(255,204,51,0.15)', KERN, 3) + T(KX+125, yb+33, 23, 'attention_cte', KERN, null, 'middle');
+    s += A(X0+FULL+40, yb+H/2, KX-8, yb+H/2, '#d6dbe6', 'aw', kr);
+    var ko = tc < 0 ? 0 : (last ? 1 : ease(clamp((u - 1.9) / 0.3)));
+    s += '<g opacity="'+ko+'">' + A(KX+125, yb+66, KX+125, yb+96, GREEN, 'ag') + R(KX+75, yb+100, 100, 40, 8, GREEN, GREEN, 2) +
+         T(KX+125, yb+127, 20, 'out', '#0b0d12', null, 'middle') + '</g>';
+    // the kernel could have read the cache where it was
+    var gh = ease(prog(t, B0 + NCALL*C, 0.6));
+    s += '<g opacity="'+gh+'">' + '<path d="M'+(cx(CH.length)-GAP+6)+','+(yc+H/2+40)+' C1100,'+(yc+60)+' 1300,'+(yc+40)+' '+(KX+125)+','+(yb-20)+'" stroke="'+GREEN+'" stroke-width="3" stroke-dasharray="10 8" fill="none" marker-end="url(#ag)"/>' +
+         T(980, yc+118, 22, 'could read here', GREEN) + '</g>';
+
+    // ================= AFTER =================
+    var Y2 = 460, yc2 = Y2+90, yk = Y2+190, yp = Y2+270;
+    var a = ease(prog(t, A0-0.5, 0.6));
+    s += '<g opacity="'+a+'">' + panel(Y2, 410, 'After', GREEN, 'for chunk in cache:  partial = attention_cte(q, chunk)');
+    var cur = -1;
+    for (var q=0;q<CH.length;q++) if (t >= A0 + q*0.8 && t < A0 + 0.8 + q*0.8) cur = q;
+    s += T(X0, yc2-14, 18, 'KV cache (HBM)', MUTED) + chunks(yc2, cur);
+    s += T(cx(CH.length)+20, yc2+33, 22, 'no copy, no padding', GREEN, ease(prog(t, A0+0.4, 0.5)));
+    var callsDone = 0; for (var cc=0;cc<CH.length;cc++) if (t >= A0 + cc*0.8 + 0.3) callsDone = cc + 1;
+    s += hbmAfter(1270, Y2+120, callsDone);
+    for (var r=0;r<CH.length;r++){
+      var on = ease(prog(t, A0 + r*0.8, 0.4)), mid = cx(r) + CH[r].w/2;
+      if (on <= 0) continue;
+      s += '<g opacity="'+on+'">' + A(mid, yc2+H+4, mid, yk-4, KERN, 'aw') +
+        R(mid-62, yk, 124, 40, 10, r === cur ? KERN : 'rgba(255,204,51,0.15)', KERN, 2) +
+        T(mid, yk+26, 15, 'attention_cte', r === cur ? '#0b0d12' : KERN, null, 'middle') +
+        A(mid, yk+42, mid, yp-4, GREEN, 'ag') + R(mid-22, yp, 44, 28, 6, 'rgba(76,214,160,0.35)', GREEN, 2) + '</g>';
+    }
+    var mOn = ease(prog(t, A0 + 3.6, 0.6)), MX = 1120, MY = yk - 4, BUS = yp + 70;
+    s += '<g opacity="'+mOn+'">';
+    for (var r2=0;r2<CH.length;r2++){ var m2 = cx(r2) + CH[r2].w/2; s += '<path d="M'+m2+','+(yp+30)+' L'+m2+','+BUS+'" stroke="'+GREEN+'" stroke-width="2.5" fill="none"/>'; }
+    s += '<path d="M'+(cx(0)+CH[0].w/2)+','+BUS+' L'+(MX+120)+','+BUS+'" stroke="'+GREEN+'" stroke-width="2.5" fill="none"/>' + A(MX+120, BUS, MX+120, MY+86, GREEN, 'ag') +
+         R(MX, MY, 240, 80, 12, 'rgba(76,214,160,0.18)', GREEN, 3) + T(MX+120, MY+36, 24, 'merge', GREEN, null, 'middle') +
+         T(MX+120, MY+64, 18, 'exact', MUTED, null, 'middle') + '</g>';
+    var oOn = ease(prog(t, A0 + 4.4, 0.5));
+    s += '<g opacity="'+oOn+'">' + A(MX+242, MY+40, MX+286, MY+40, GREEN, 'ag') + R(MX+290, MY+20, 100, 40, 8, GREEN, GREEN, 2) +
+         T(MX+340, MY+47, 20, 'out', '#0b0d12', null, 'middle') + '</g>';
+    s += '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = END;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t >= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener('click', start);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); start(); } });
+})();
+</script>
+</body>
+</html>

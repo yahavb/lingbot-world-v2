@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tensor parallel first, then context parallel</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="The DiT has 40 attention heads and a device holds 4 ranks. TP4: 10 heads per rank, the gather stays inside one device, but devices 2 to 8 sit idle. TP8: 5 heads per rank, but the per-block gather of activations crosses devices. TP16, 32, 64: the heads do not split. TP4 times CP8: tensor parallel inside each device, and the tokens split eight ways across the eight devices; only attention exchanges keys and values between devices.">
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+'" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'middle')+'" style="fill:'+fill+';"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+  function L(x1,y1,x2,y2,col,w,op){ return '<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+col+'" stroke-width="'+w+'"'+(op!=null?' opacity="'+op+'"':'')+'/>'; }
+
+  var WCOL = "#3d9bff", TCOL = "#ffcc33", KV = "#ff9f43", MUTED = "#aab3c5", GHOST = "#232937";
+  var NT = 8;                                    // tokens of the video (illustrative)
+  // the three steps: ranks, TP size, CP size
+  var HEADS = 40, PERDEV = 4;                    // LingBot DiT: 40 attention heads; 4 ranks per device at LNC2
+  var STEPS = [
+    {name:'TP4',       ranks:4, tp:4,  cp:1, cap:'TP4: 10 heads per rank, the gather stays inside one device'},
+    {name:'TP8',       ranks:8, tp:8,  cp:1, cap:'TP8: 5 heads per rank, but the gather crosses devices every block'},
+    {name:'TP16',      ranks:0, tp:16, cp:1, cap:'TP stops at 8; to use more devices we need another split'},
+    {name:'TPx × CPy', ranks:8, tp:4,  cp:2, cap:'back to TP4, and add CP: each device takes a slice of the tokens'},
+    {name:'TP4 × CP8', ranks:8, tp:4,  cp:8, cap:'CP: each device takes a slice of the tokens; only attention exchanges K/V'},
+    {name:'TP2 × CP16', ranks:8, tp:2, cp:16, nt:16, cap:'TP2 × CP16: 20 heads per rank, 32 ranks on 8 devices: it fits'},
+    {name:'TP4 × CP8', ranks:8, tp:4,  cp:8, final:true, cap:'so back to TP4 × CP8: TP inside each device, CP across the 8 devices, the fastest'}
+  ];
+  var DUR = 9.0, END = STEPS.length*DUR + 0.5;
+  var RW = 150, RH = 320, GAP = 18, GGAP = 140, Y0 = 220;
+
+  function rankX(st, i){
+    var nd = Math.ceil(st.ranks / PERDEV), d = Math.floor(i / PERDEV);
+    var total = st.ranks*RW + (st.ranks - nd)*GAP + (nd - 1)*GGAP;
+    return 800 - total/2 + i*(RW+GAP) - d*GAP + d*GGAP;
+  }
+
+  // half a trn3 = 8 devices; the ones this layout uses are lit, the rest sit idle
+  function strip(lit, op, label, link){
+    var w = 120, g = 22, x0 = 800 - (8*w + 7*g)/2, y = 670;
+    var s = '<g opacity="'+op+'">' + T(800, 782, 22, label, MUTED);
+    // the device drawn above IS the first box here
+    if (link) s += L(800, 592, x0 + w/2, y - 4, WCOL, 3);
+    for (var i=0;i<8;i++){
+      var on = i < lit, x = x0 + i*(w+g);
+      s += R(x, y, w, 76, 12, on ? 'rgba(61,155,255,0.35)' : 'rgba(255,255,255,0.03)', on ? WCOL : '#3a4256', on ? 3 : 2) +
+           T(x+w/2, y+32, 19, 'device ' + (i+1), on ? '#ffffff' : '#8a93a8') +
+           T(x+w/2, y+60, 18, on ? 'in use' : 'idle', on ? WCOL : '#5a6070');
+    }
+    return s + '</g>';
+  }
+  function scene(st, t0, t){
+    var s = '', lt = t - t0, gs = [];
+    if (st.ranks === 0){
+      var rows = [['TP16', '40 heads ÷ 16 = 2.5'], ['TP32', '40 heads ÷ 32 = 1.25'], ['TP64', '40 heads ÷ 64 = 0.625']], o = '';
+      for (var r=0;r<rows.length;r++){
+        var op = ease(prog(lt, 0.2 + r*0.5, 0.3)), y = 260 + r*120;
+        o += '<g opacity="'+op+'">' + T(560, y, 44, rows[r][0], MUTED, null, 'end') + T(600, y, 52, rows[r][1], '#ffffff', null, 'start') +
+             T(1260, y, 52, '✗', '#ff6b6b', null, 'start') + '</g>';
+      }
+      return o + T(800, 640, 30, 'past TP8 a rank would get a fraction of a head', '#ff6b6b', ease(prog(lt, 1.8, 0.4)));
+    }
+    // devices: dashed outline around every 4 ranks
+    for (var d=0; d<Math.ceil(st.ranks/PERDEV); d++){
+      var dx1 = rankX(st, d*PERDEV) - 14, dx2 = rankX(st, d*PERDEV + PERDEV - 1) + RW + 14;
+      var more = '';
+      s += R(dx1, Y0-12, dx2-dx1, RH+24, 16, 'none', '#5a6070', 2, ' stroke-dasharray="10 7"') + T((dx1+dx2)/2, Y0+RH+46, 20, 'device ' + (d+1) + more, MUTED);
+    }
+    for (var g=0; g<st.cp; g++) gs.push(g);
+    // one TP group = one gather bar above its ranks
+    for (var g2=0; g2<st.ranks/st.tp; g2++){
+      var x1 = rankX(st, g2*st.tp), x2 = rankX(st, g2*st.tp + st.tp - 1) + RW;
+      var pulse = 0.4 + 0.6*Math.abs(Math.sin(lt*3));
+      s += L(x1+10, Y0-26, x2-10, Y0-26, WCOL, 5, ease(prog(lt, 0.4, 0.3))*pulse);
+      if (st.tp > PERDEV){
+        var cx1 = rankX(st, PERDEV-1) + RW, cx2 = rankX(st, PERDEV);
+        s += L(cx1-6, Y0-26, cx2+6, Y0-26, '#ff6b6b', 8, ease(prog(lt, 0.8, 0.3))) + T((cx1+cx2)/2, Y0-40, 18, 'per-block gather of activations', '#ff6b6b', ease(prog(lt, 0.8, 0.3)));
+      }
+    }
+    s += T(800, Y0-80, 24, 'TP gather, every block', WCOL, ease(prog(lt, 0.4, 0.3)));
+    for (var i=0;i<st.ranks;i++){
+      var x = rankX(st, i), g3 = Math.floor(i / st.tp), slice = i % st.tp;
+      s += R(x, Y0, RW, RH, 12, 'rgba(255,255,255,0.03)', '#3a4256', 2) + T(x+RW/2, Y0+30, 18, 'rank ' + (i+1), MUTED);
+      // weights: the full matrix, this rank's slice lit
+      var wy = Y0 + 50, wh = 130, sw = (RW-30) / st.tp;
+      s += T(x+RW/2, wy+wh+24, 17, (HEADS/st.tp) + ' heads', WCOL);
+      for (var k=0;k<st.tp;k++) s += R(x+15 + k*sw, wy, sw-2, wh, 2, k === slice ? WCOL : GHOST);
+      // tokens: the ones this rank processes are lit
+      var nt = st.nt || NT, ty = Y0 + 218, ts = Math.min(15, (RW-30) / nt);
+      s += T(x+RW/2, ty+42, 17, 'tokens', TCOL);
+      for (var n=0;n<nt;n++){
+        var mine = st.cp === 1 ? true : (Math.floor(n / (nt/st.cp)) === g3);
+        var was = st.cp === 8 && !st.final ? (Math.floor(n / (nt/2)) === g3) : !st.final;          // CP8 starts from the CP2 split
+        var lit = mine ? 1 : (st.cp > 1 ? (was ? 1 - ease(prog(lt, 0.3, 0.7)) : 0) : 1);
+        s += R(x+15 + n*ts, ty, ts-2, 20, 2, GHOST) + R(x+15 + n*ts, ty, ts-2, 20, 2, TCOL, null, 0, ' opacity="'+lit+'"');
+      }
+      // K/V this rank must receive from the other CP groups, every attention layer (same scale in every step)
+      if (st.cp > 1){
+        var kin = (HEADS/st.tp) * (1 - 1/st.cp), kmax = (HEADS/2) * (15/16), kc = st.cp === 16 ? '#ff3b3b' : '#ffb347';
+        var kp = ease(prog(lt, st.cp === 16 ? 1.8 : 1.2, 0.6));
+        s += R(x+15, Y0+268, RW-30, 16, 4, GHOST) + R(x+15, Y0+268, (RW-30)*kin/kmax*kp, 16, 4, kc) +
+             T(x+RW/2, Y0+304, 17, 'K/V in', kc, kp);
+      }
+    }
+    if (st.name === 'TP4') s += strip(1, ease(prog(lt, 1.5, 0.5)), 'the machine: 8 devices, TP4 uses only device 1', true);
+    if (st.cp === 2) s += strip(2, ease(prog(lt, 2.0, 0.5)), 'CP2: 2 devices, half the tokens each', false);
+    if (st.cp === 8) s += strip(8, ease(prog(lt, 0.6, 0.5)), 'CP8: all 8 devices, 1/8 of the tokens each', false);
+    if (st.cp === 16){
+      // the waste: K/V each rank must receive per attention layer = its heads x the share held by other groups
+      var bo = ease(prog(lt, 1.8, 0.5)), U = 40, bx0 = 470;
+      var a8 = (HEADS/4) * (7/8), a16 = (HEADS/2) * (15/16);           // 8.75 vs 18.75 head-slices of K/V
+      s += '<g opacity="'+bo+'">' + T(800, 664, 22, 'K/V in, per rank (the bar inside each rank)', MUTED) +
+           T(bx0-20, 707, 22, 'TP4 × CP8', '#ffffff', null, 'end') + R(bx0, 688, a8*U*ease(prog(lt, 1.9, 0.6)), 28, 6, '#ffb347') +
+           T(bx0-20, 755, 22, 'TP2 × CP16', '#ff6b6b', null, 'end') + R(bx0, 736, a16*U*ease(prog(lt, 2.3, 0.8)), 28, 6, '#ff3b3b') +
+           T(bx0 + a16*U + 16, 757, 26, (a16/a8).toFixed(1) + '×', '#ff6b6b', ease(prog(lt, 3.0, 0.4)), 'start') + '</g>';
+    }
+    // CP: only attention talks across groups -- K/V exchange between every pair of neighboring groups
+    if (st.cp > 1){
+      var on = st.cp >= 8 ? 1 : ease(prog(lt, 1.4, 0.3)), ng = st.ranks / st.tp;
+      if (st.cp === 16) on = ease(prog(lt, 1.6, 0.4));
+      var KC = st.cp === 16 ? '#ff3b3b' : KV;     // CP16: the exchange is the problem, draw it red
+      s += '<g opacity="'+on+'">';
+      for (var gg=0; gg<ng-1; gg++){
+        var xa = rankX(st, gg*st.tp + st.tp - 1) + RW, xb = rankX(st, (gg+1)*st.tp), mid = (xa + xb)/2;
+        s += L(xa+2, Y0+RH/2, xb-2, Y0+RH/2, KC, 4, 0.6);
+        if (xb - xa > 60) s += T(mid, Y0+RH/2-22, 18, 'K/V', KC);
+        for (var dd=0; dd<3; dd++){
+          var f = ((lt*0.7) + dd/3) % 1, span = Math.max(4, xb-xa-12);
+          s += R(xa + span*f, Y0+RH/2-12, 8, 8, 2, KC) + R(xb - 8 - span*f, Y0+RH/2+4, 8, 8, 2, KC);
+        }
+      }
+      s += '</g>';
+    }
+    return s;
+  }
+
+  // k = the step on screen, lt = seconds since that step started (steps advance on click, not on a timer)
+  function render(k, lt){
+    lt = Math.max(0, lt);
+    var st = STEPS[k], fade = k === 4 ? 1 : ease(prog(lt, 0, 0.25));
+    var s = '';
+    // step tabs
+    var TABS = ['TP4', 'TP8', 'TP16', k === 3 ? 'TPx × CPy' : (k === 5 ? 'TP2 × CP16' : 'TP4 × CP8')], tab = Math.min(k, 3);
+    for (var i=0;i<TABS.length;i++){
+      var on = i === tab, x = 800 + (i-1.5)*300;
+      var win = on && st.final;
+      s += R(x-130, 30, 260, 50, 25, win ? 'rgba(76,214,160,0.22)' : (on ? 'rgba(61,155,255,0.18)' : 'rgba(255,255,255,0.03)'), win ? '#4cd6a0' : (on ? '#ffffff' : '#3a4256'), on ? 3 : 1) +
+           T(x, 64, 24, TABS[i], on ? '#ffffff' : MUTED);
+    }
+    var cap = (st.name === 'TP4' && lt >= 1.5) ? 'TP4 fills one device; devices 2 to 8 sit idle'
+            : (st.cp === 16 && lt >= 1.8) ? 'each rank owns twice the heads, so it receives about twice the K/V from the other groups' : st.cap;
+    s += '<g opacity="'+fade+'">' + scene(st, 0, lt) + T(800, 850, 28, cap, '#ffffff', ease(prog(lt, 0.3, 0.3))) + '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)(?:,k=(\d))?/.exec(location.hash);          // e.g. #t=7,k=0 freezes step k at 7 s
+  if (hm){ render(hm[2] ? parseInt(hm[2]) : 0, parseFloat(hm[1])); return; }
+  // click, Space or Right arrow: next step; Left arrow: previous; after the last step, back to the first
+  var step = 0, t0 = performance.now(), started = false;   // waits on the first frame until the first click
+  function go(k){ step = (k + STEPS.length) % STEPS.length; t0 = performance.now(); }
+  function tick(now){ render(step, reduce ? DUR : (started ? (now - t0)/1000 : 0)); requestAnimationFrame(tick); }
+  requestAnimationFrame(tick);
+  function next(){ if (!started){ started = true; go(0); } else go(step + 1); }
+  document.addEventListener('click', next);
+  document.addEventListener('keydown', function(ev){
+    if (ev.code === 'Space' || ev.code === 'ArrowRight'){ ev.preventDefault(); next(); }
+    else if (ev.code === 'ArrowLeft'){ ev.preventDefault(); go(step - 1); }
+  });
+})();
+</script>
+</body>
+</html>

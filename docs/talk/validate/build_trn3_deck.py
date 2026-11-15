@@ -213,11 +213,11 @@ def b6b_profile():
                      "Profile: pairs/copy_first_17.1ms (B6b), job lbw-talk-b6-nomerge (LINGBOT_CTE_MERGE=0), rank 0. Line 448/449 of wan/modules/attention.py "
                      "become HLO scatter ops, run on Sync as DMA_DIRECT2D + EVENT_SEMAPHORE.",
                      url="https://neuron-explorer.harmony.a2z.com/profile/copy_first_17.1ms_B6b?shared=H4sIAN0c-WoAA6tWSs4vqIxPyywqLok3NNczzC2OdzJLUrKqViouSSwqCcnMTVWyMtBRSs1LgbANzQ0sDcxMDGprASegFG48AAAA")
-            + _b6b_one("B6b-INPLACE", "Backup: read in place, in the profile", "#4cd04c", "READ IN PLACE: 2.92 ms block", "B6b_read_in_place_marked.jpg",
-                       "read-in-place block: compute engines busy the whole block",
+            + _b6b_one("B6b-INPLACE", "Backup: read in place, in the profile", "#4cd04c", "READ IN PLACE: 2.92 ms block", "B6b_line210_marked.jpg",
+                       "read-in-place block: line 210 selected, short loads on GpSimd, compute busy",
                        [("#4cd04c", "2.92", "ms", "the same block, no copy"),
-                        ("#ffffff", "busy", "", "Tensor, Vector, Scalar work across the whole block"),
-                        ("#ff8c00", "~0.3", "ms", "one short wait, not a 14 ms copy")],
+                        ("#ff6b6b", "~0.25", "ms", "line 210: K and V read in place, short loads on GpSimd"),
+                        ("#ffffff", "busy", "", "Tensor, Vector, Scalar keep working")],
                        "Read the memory where it is, and the chip keeps working.",
                        "Profile: pairs/read_in_place_2.92ms (B6b), job lbw-talk-b6-layouts (q20, LINGBOT_CTE_MERGE=1), rank 0, the steady block. "
                        "The read in place: kernels/attention_cte_lb.py:210 (_kv_dma, called for K at 3090 and V at 3207), on the GpSimd engine, ~0.25 ms.",

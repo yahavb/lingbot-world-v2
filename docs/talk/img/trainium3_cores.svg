@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" role="img"
+     aria-label="Left: a Trainium3 device with four NeuronCores, HBM on both sides, DMA engines below, and NeuronLink connecting the four cores. Right: one NeuronCore magnified, showing its on-chip SBUF memory, Tensor engine, Vector engine, Scalar engine and GpSimd engine.">
+  <style>
+    text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff;text-anchor:middle;dominant-baseline:central}
+    .box{fill:#151a25;stroke:#8fa3c7;stroke-width:3}
+    .core{fill:#1b2130;stroke:#c9d1e0;stroke-width:4}
+    .link{fill:#2fd3c9}
+  </style>
+  <defs>
+    <marker id="dm" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#ffcc33"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+
+  <!-- ===== Trainium3 device ===== -->
+  <rect x="30" y="40" width="740" height="820" rx="26" fill="#10141d" stroke="#3d9bff" stroke-width="5"/>
+  <text x="400" y="90" font-size="40">Trainium3</text>
+
+  <!-- magnify lines (behind the HBM) -->
+  <line x1="660" y1="150" x2="840" y2="40"  stroke="#ffcc33" stroke-width="3" stroke-dasharray="10 8"/>
+  <line x1="660" y1="380" x2="840" y2="860" stroke="#ffcc33" stroke-width="3" stroke-dasharray="10 8"/>
+  <!-- one HBM stack beside each core -->
+  <rect class="box" x="55"  y="150" width="60" height="230" rx="10"/>
+  <rect class="box" x="55"  y="450" width="60" height="230" rx="10"/>
+  <rect class="box" x="685" y="150" width="60" height="230" rx="10"/>
+  <rect class="box" x="685" y="450" width="60" height="230" rx="10"/>
+  <text font-size="28" transform="translate(85,265) rotate(-90)">HBM</text>
+  <text font-size="28" transform="translate(85,565) rotate(-90)">HBM</text>
+  <text font-size="28" transform="translate(715,265) rotate(-90)">HBM</text>
+  <text font-size="28" transform="translate(715,565) rotate(-90)">HBM</text>
+
+  <!-- NeuronLink between the four cores -->
+  <rect class="link" x="360" y="252" width="80" height="26" rx="13"/>
+  <rect class="link" x="360" y="552" width="80" height="26" rx="13"/>
+  <rect class="link" x="242" y="370" width="26" height="90" rx="13"/>
+  <rect class="link" x="532" y="370" width="26" height="90" rx="13"/>
+  <text x="400" y="415" font-size="24" style="fill:#2fd3c9">NeuronLink</text>
+
+  <rect class="core" x="140" y="150" width="230" height="230" rx="18"/>
+  <rect x="430" y="150" width="230" height="230" rx="18" fill="rgba(255,204,51,.12)" stroke="#ffcc33" stroke-width="6"/>
+  <rect class="core" x="140" y="450" width="230" height="230" rx="18"/>
+  <rect class="core" x="430" y="450" width="230" height="230" rx="18"/>
+  <text x="255" y="230" font-size="30">Core</text>
+  <rect x="160" y="300" width="190" height="60" rx="10" fill="#2a3245" stroke="#8fa3c7" stroke-width="3"/>
+  <text x="255" y="330" font-size="24">SBUF</text>
+  <text x="545" y="230" font-size="30">Core</text>
+  <rect x="450" y="300" width="190" height="60" rx="10" fill="#2a3245" stroke="#8fa3c7" stroke-width="3"/>
+  <text x="545" y="330" font-size="24">SBUF</text>
+  <text x="255" y="530" font-size="30">Core</text>
+  <rect x="160" y="600" width="190" height="60" rx="10" fill="#2a3245" stroke="#8fa3c7" stroke-width="3"/>
+  <text x="255" y="630" font-size="24">SBUF</text>
+  <text x="545" y="530" font-size="30">Core</text>
+  <rect x="450" y="600" width="190" height="60" rx="10" fill="#2a3245" stroke="#8fa3c7" stroke-width="3"/>
+  <text x="545" y="630" font-size="24">SBUF</text>
+
+  <rect class="box" x="140" y="755" width="520" height="85" rx="14"/>
+  <text x="400" y="783" font-size="32">DMA engines</text>
+  <text x="400" y="818" font-size="24" style="fill:#ffcc33">HBM &#8644; SBUF</text>
+  <!-- data paths through the DMA engines: HBM <-> DMA <-> each core's SBUF -->
+  <g fill="none" stroke="#ffcc33" stroke-width="6" marker-start="url(#dm)" marker-end="url(#dm)">
+    <path d="M85 690 V797 H130"/>
+    <path d="M715 690 V797 H670"/>
+    <path d="M255 690 V745"/>
+    <path d="M545 690 V745"/>
+  </g>
+
+
+  <!-- ===== one NeuronCore, magnified ===== -->
+  <rect x="840" y="40" width="730" height="820" rx="26" fill="#10141d" stroke="#ffcc33" stroke-width="5"/>
+  <text x="1205" y="90" font-size="40">NeuronCore</text>
+
+  <!-- SBUF: on-chip SRAM -->
+  <rect class="box" x="865" y="130" width="320" height="320" rx="16"/>
+  <text x="1025" y="168" font-size="30">SBUF</text>
+  <g fill="#2a3245" stroke="#8fa3c7" stroke-width="4">
+    <path d="M945 380 v-40 a80 22 0 0 0 160 0 v40 a80 22 0 0 1 -160 0 z"/>
+    <path d="M945 330 v-40 a80 22 0 0 0 160 0 v40 a80 22 0 0 1 -160 0 z"/>
+    <path d="M945 280 v-40 a80 22 0 0 0 160 0 v40 a80 22 0 0 1 -160 0 z"/>
+    <ellipse cx="1025" cy="240" rx="80" ry="22"/>
+  </g>
+
+  <!-- Tensor: systolic array -->
+  <rect class="box" x="1205" y="130" width="340" height="320" rx="16" style="stroke:#3d9bff"/>
+  <text x="1375" y="168" font-size="30">Tensor</text>
+  <g fill="rgba(61,155,255,.25)" stroke="#3d9bff" stroke-width="2.5"><rect x="1470" y="200" width="26" height="26" rx="3"/><rect x="1440" y="230" width="26" height="26" rx="3"/><rect x="1470" y="230" width="26" height="26" rx="3"/><rect x="1410" y="260" width="26" height="26" rx="3"/><rect x="1440" y="260" width="26" height="26" rx="3"/><rect x="1470" y="260" width="26" height="26" rx="3"/><rect x="1380" y="290" width="26" height="26" rx="3"/><rect x="1410" y="290" width="26" height="26" rx="3"/><rect x="1440" y="290" width="26" height="26" rx="3"/><rect x="1470" y="290" width="26" height="26" rx="3"/><rect x="1350" y="320" width="26" height="26" rx="3"/><rect x="1380" y="320" width="26" height="26" rx="3"/><rect x="1410" y="320" width="26" height="26" rx="3"/><rect x="1440" y="320" width="26" height="26" rx="3"/><rect x="1470" y="320" width="26" height="26" rx="3"/><rect x="1320" y="350" width="26" height="26" rx="3"/><rect x="1350" y="350" width="26" height="26" rx="3"/><rect x="1380" y="350" width="26" height="26" rx="3"/><rect x="1410" y="350" width="26" height="26" rx="3"/><rect x="1440" y="350" width="26" height="26" rx="3"/><rect x="1470" y="350" width="26" height="26" rx="3"/><rect x="1290" y="380" width="26" height="26" rx="3"/><rect x="1320" y="380" width="26" height="26" rx="3"/><rect x="1350" y="380" width="26" height="26" rx="3"/><rect x="1380" y="380" width="26" height="26" rx="3"/><rect x="1410" y="380" width="26" height="26" rx="3"/><rect x="1440" y="380" width="26" height="26" rx="3"/><rect x="1470" y="380" width="26" height="26" rx="3"/><rect x="1260" y="410" width="26" height="26" rx="3"/><rect x="1290" y="410" width="26" height="26" rx="3"/><rect x="1320" y="410" width="26" height="26" rx="3"/><rect x="1350" y="410" width="26" height="26" rx="3"/><rect x="1380" y="410" width="26" height="26" rx="3"/><rect x="1410" y="410" width="26" height="26" rx="3"/><rect x="1440" y="410" width="26" height="26" rx="3"/><rect x="1470" y="410" width="26" height="26" rx="3"/></g>
+
+  <!-- Vector -->
+  <rect class="box" x="865" y="470" width="320" height="190" rx="16" style="stroke:#2fd39a"/>
+  <text x="960" y="565" font-size="30">Vector</text>
+  <g fill="rgba(47,211,154,.30)" stroke="#2fd39a" stroke-width="3">
+    <rect x="1050" y="510" width="70" height="100" rx="8"/>
+    <rect x="1066" y="524" width="70" height="100" rx="8"/>
+    <rect x="1082" y="538" width="70" height="100" rx="8"/>
+  </g>
+
+  <!-- Scalar -->
+  <rect class="box" x="1205" y="470" width="340" height="190" rx="16" style="stroke:#ff7a3d"/>
+  <text x="1300" y="565" font-size="30">Scalar</text>
+  <path d="M1400 505 V630 H1520" fill="none" stroke="#c9d1e0" stroke-width="3"/>
+  <path d="M1405 620 C1450 620 1450 515 1515 515" fill="none" stroke="#ff7a3d" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- GpSimd -->
+  <rect class="box" x="865" y="680" width="680" height="160" rx="16" style="stroke:#e36bff"/>
+  <text x="990" y="760" font-size="30">GpSimd</text>
+  <g fill="rgba(227,107,255,.25)" stroke="#e36bff" stroke-width="3"><rect x="1110" y="715" width="70" height="90" rx="8"/><line x1="1122" y1="805" x2="1122" y2="821"/><line x1="1137" y1="805" x2="1137" y2="821"/><line x1="1152" y1="805" x2="1152" y2="821"/><line x1="1167" y1="805" x2="1167" y2="821"/><circle cx="1145" cy="747" r="9"/><rect x="1215" y="715" width="70" height="90" rx="8"/><line x1="1227" y1="805" x2="1227" y2="821"/><line x1="1242" y1="805" x2="1242" y2="821"/><line x1="1257" y1="805" x2="1257" y2="821"/><line x1="1272" y1="805" x2="1272" y2="821"/><circle cx="1250" cy="747" r="9"/><rect x="1320" y="715" width="70" height="90" rx="8"/><line x1="1332" y1="805" x2="1332" y2="821"/><line x1="1347" y1="805" x2="1347" y2="821"/><line x1="1362" y1="805" x2="1362" y2="821"/><line x1="1377" y1="805" x2="1377" y2="821"/><circle cx="1355" cy="747" r="9"/><rect x="1425" y="715" width="70" height="90" rx="8"/><line x1="1437" y1="805" x2="1437" y2="821"/><line x1="1452" y1="805" x2="1452" y2="821"/><line x1="1467" y1="805" x2="1467" y2="821"/><line x1="1482" y1="805" x2="1482" y2="821"/><circle cx="1460" cy="747" r="9"/></g>
+
+</svg>

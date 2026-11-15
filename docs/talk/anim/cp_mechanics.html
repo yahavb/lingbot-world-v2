@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Context parallel: split the tokens</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Context parallel. The video's tokens are split into four slices, one per CP group; every group has the same weights. Linear and feed-forward layers work token by token, so each group computes its slice alone. Attention needs every query to see every key, so the groups share their keys and values; then each group attends its own queries over all the keys. Each group outputs its own slice: a quarter of the work per group.">
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+'" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'start')+'" style="fill:'+fill+';"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+
+  var MUTED = "#aab3c5", W = "#8a93a8", KV = "#ff9f43";
+  var G = 4, PER = 4, N = G*PER;                       // 4 CP groups, 4 tokens each
+  var COL = ["#3d9bff", "#b48cff", "#4cd6a0", "#ffcc33"];   // one color per slice of the video
+  var TS = 56, SX = 800 - N*TS/2;                      // token strip
+  var BW = 340, BG = 36, BX0 = (1600 - (G*BW + (G-1)*BG)) / 2, BY = 220, BH = 560;
+  function bx(g){ return BX0 + g*(BW+BG); }
+  function tokX(g, k){ return bx(g) + 30 + k*(TS+10); }
+  var P1 = 0.5, P2 = 3.0, P3 = 5.6, P4 = 9.6, END = 12.0;
+
+  function tok(x, y, col, op, sz){ sz = sz || TS-8; return R(x, y, sz, sz, 6, col, '#0b0d12', 1, op!=null?' opacity="'+op+'"':''); }
+
+  function render(t){
+    var s = T(800, 50, 36, 'Context parallel: split the tokens', '#ffffff', null, 'middle');
+
+    // the video's tokens, then each CP group takes a slice
+    s += T(SX, 96, 18, 'tokens of the video', MUTED);
+    var sp = ease(prog(t, P1+0.6, 1.4));
+    for (var i=0;i<N;i++){
+      var g = Math.floor(i/PER), k = i%PER, x = lerp(SX + i*TS, tokX(g,k), sp), y = lerp(110, BY+70, sp);
+      s += tok(x, y, COL[g], 1 - 0.75*ease(prog(t, P1+0.6, 0.3)) * (sp < 1 ? 0 : 0));
+    }
+    // ghost of the full strip once it has split
+    if (sp >= 1) for (var i2=0;i2<N;i2++) s += tok(SX + i2*TS, 110, COL[Math.floor(i2/PER)], 0.18);
+
+    // the groups: same weights in each, own slice of tokens
+    var bo = ease(prog(t, P1, 0.5));
+    for (var g2=0;g2<G;g2++){
+      var x0 = bx(g2);
+      s += '<g opacity="'+bo+'">' + R(x0, BY, BW, BH, 16, 'rgba(255,255,255,0.03)', '#3a4256', 2) +
+           T(x0+20, BY+40, 22, 'CP group ' + (g2+1), '#ffffff') +
+           R(x0+30, BY+150, BW-60, 60, 10, 'rgba(138,147,168,0.18)', W, 2) + T(x0+BW/2, BY+188, 22, 'weights', W, null, 'middle') + '</g>';
+    }
+
+    // phase 2: linear / FFN -- every group alone, token by token
+    var lin = t >= P2 && t < P3, lp = (t - P2) / 0.6;
+    if (lin) for (var g3=0;g3<G;g3++){
+      var kk = Math.floor(lp) % PER;
+      s += R(tokX(g3,kk)-4, BY+66, TS, TS, 8, 'none', '#ffffff', 3) + R(bx(g3)+30, BY+150, BW-60, 60, 10, 'none', '#ffffff', 2, ' opacity="0.6"');
+    }
+
+    // phase 3: attention -- each group's K/V goes to every other group
+    var kvOn = ease(prog(t, P3, 0.6));
+    for (var g4=0;g4<G;g4++){
+      var x4 = bx(g4);
+      s += T(x4+20, BY+262, 18, 'K/V', KV, kvOn) + T(x4+20, BY+306, 18, '+', KV, ease(prog(t, P3+1.4, 0.4)));
+      // own K/V
+      for (var k4=0;k4<PER;k4++) s += tok(x4+70 + k4*24, BY+244, COL[g4], kvOn, 20);
+      // shared K/V from the other groups, arriving one group at a time
+      for (var src=0, slot=1; src<G; src++){
+        if (src === g4) continue;
+        var ap = ease(prog(t, P3 + 0.9 + slot*0.7, 0.7));
+        if (ap > 0){
+          var tx = x4 + 70 + slot*PER*24 - 0, ty = BY + 244 + 0;
+          for (var k5=0;k5<PER;k5++){
+            var fx = lerp(bx(src)+70 + k5*24, x4+70 + (slot%2? 0:0) + (slot)*0 + k5*24, ap);
+          }
+          // draw arrived tiles in a second row block
+          for (var k6=0;k6<PER;k6++){
+            var sx2 = lerp(bx(src)+70 + k6*24, x4+70 + ((slot-1)*PER + k6)*20, ap), sy2 = lerp(BY+244, BY+292, ap);
+            s += tok(sx2, sy2, COL[src], 1, 16);
+          }
+        }
+        slot++;
+      }
+    }
+
+    // phase 4: each group outputs its own slice
+    var oo = ease(prog(t, P4, 0.6));
+    for (var g5=0;g5<G;g5++){
+      s += '<g opacity="'+oo+'">' + T(bx(g5)+20, BY+430, 18, 'output', MUTED);
+      for (var k7=0;k7<PER;k7++) s += tok(tokX(g5,k7), BY+446, COL[g5], 1);
+      s += '</g>';
+    }
+
+    // one caption per phase
+    var cap = '', cc = '#ffffff';
+    if (t >= P1+0.6 && t < P2) cap = 'each CP group takes a slice of the tokens';
+    else if (t >= P2 && t < P3) cap = 'linear and FFN: token by token, each group alone, no talking';
+    else if (t >= P3 && t < P4) { cap = 'attention: queries need every key, so the groups share K/V'; cc = KV; }
+    else if (t >= P4) cap = 'each group did a quarter of the tokens';
+    s += T(800, 850, 28, cap, cc, null, 'middle');
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END); return; }
+  var t0 = performance.now(), running = true;
+  // play once, then hold the final frame (click or Space replays)
+  function tick(now){ var t = (now - t0)/1000;
+    if (t >= END){ render(END); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>

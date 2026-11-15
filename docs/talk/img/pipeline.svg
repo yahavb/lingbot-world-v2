@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 520" width="1600" height="520" role="img"
+     aria-label="Text goes to T5, which feeds the DiT. The image goes through the VAE encoder to a latent, which goes into the DiT. The DiT runs N denoising steps, then the VAE decoder turns the result into video.">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8fa3c7"/>
+    </marker>
+  </defs>
+  <style>
+    text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff;text-anchor:middle}
+    .in{fill:#1e2533;stroke:#e8ecf4;stroke-width:5}
+    .ar{stroke:#8fa3c7;stroke-width:8;fill:none;marker-end:url(#ah)}
+    .sub{font-size:26px;font-weight:600;fill:#c3c8d4}
+  </style>
+  <rect width="1600" height="520" fill="#0b0d12"/>
+
+  <!-- inputs -->
+  <rect class="in" x="30" y="60" width="150" height="110" rx="16"/>
+  <rect x="55" y="88" width="100" height="13" rx="6" fill="#e8ecf4"/>
+  <rect x="55" y="112" width="75" height="13" rx="6" fill="#e8ecf4"/>
+  <rect x="55" y="136" width="100" height="13" rx="6" fill="#e8ecf4"/>
+  <text x="105" y="210" font-size="34">text</text>
+
+  <rect class="in" x="30" y="300" width="150" height="110" rx="16"/>
+  <circle cx="145" cy="335" r="16" fill="#fff4b8"/>
+  <polygon points="45,398 95,345 145,398" fill="#2fd39a"/>
+  <text x="105" y="450" font-size="34">image</text>
+
+  <!-- components -->
+  <rect x="250" y="60" width="200" height="110" rx="20" fill="rgba(47,211,201,.15)" stroke="#2fd3c9" stroke-width="6"/>
+  <text x="350" y="130" font-size="50">T5</text>
+
+  <rect x="250" y="300" width="200" height="110" rx="20" fill="rgba(227,107,255,.15)" stroke="#e36bff" stroke-width="6"/>
+  <text x="350" y="350" font-size="36">VAE</text>
+  <text x="350" y="388" class="sub">encode</text>
+
+  <rect x="520" y="310" width="150" height="90" rx="14" fill="#151a25" stroke="#8fa3c7" stroke-width="4" stroke-dasharray="10 7"/>
+  <text x="595" y="366" font-size="30">latent</text>
+
+  <rect x="760" y="200" width="320" height="220" rx="24" fill="rgba(61,155,255,.15)" stroke="#3d9bff" stroke-width="7"/>
+  <text x="920" y="300" font-size="72">DiT</text>
+  <text x="920" y="360" class="sub" style="font-size:32px">× N steps</text>
+
+  <rect x="1160" y="250" width="200" height="120" rx="20" fill="rgba(255,204,51,.15)" stroke="#ffcc33" stroke-width="6"/>
+  <text x="1260" y="305" font-size="36">VAE</text>
+  <text x="1260" y="343" class="sub">decode</text>
+
+  <!-- video output: a small filmstrip -->
+  <rect x="1420" y="240" width="160" height="140" rx="12" fill="#1b1f29"/>
+  <rect x="1434" y="262" width="40" height="96" rx="6" fill="rgba(61,155,255,.35)" stroke="#3d9bff" stroke-width="3"/>
+  <rect x="1480" y="262" width="40" height="96" rx="6" fill="rgba(255,122,61,.35)" stroke="#ff7a3d" stroke-width="3"/>
+  <rect x="1526" y="262" width="40" height="96" rx="6" fill="rgba(47,211,154,.35)" stroke="#2fd39a" stroke-width="3"/>
+  <text x="1500" y="430" font-size="34">video</text>
+
+  <!-- flow -->
+  <path class="ar" d="M180 115 L240 115"/>
+  <path class="ar" d="M450 115 L920 115 L920 190"/>
+  <path class="ar" d="M180 355 L240 355"/>
+  <path class="ar" d="M450 355 L510 355"/>
+  <path class="ar" d="M670 355 L750 355"/>
+  <path class="ar" d="M1080 310 L1150 310"/>
+  <path class="ar" d="M1360 310 L1410 310"/>
+</svg>

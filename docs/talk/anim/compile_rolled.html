@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Roll the loop: compile one block, reuse it</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+  text.m{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Roll the loop. Left, unrolled: decoder = torch.compile(self.decoder). torch.compile sees the whole decoder including its loop over 14 ResidualBlocks, so it builds all 14 blocks into one graph: 58 minutes to compile, 11.5 to 12.9 seconds per warm decode. Right, rolled: G = torch.compile(block_body). torch.compile sees one block body and builds one graph G; the decoder loop stays plain Python and every block calls G with its own weights: about 3 minutes to compile, 4.4 seconds per warm decode.">
+  <defs>
+    <marker id="ar" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto"><path d="M0,0 L14,7 L0,14 z" fill="#ff6b6b"/></marker>
+    <marker id="ag" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" refX="12" refY="7" orient="auto"><path d="M0,0 L14,7 L0,14 z" fill="#4cd6a0"/></marker>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+h+'" rx="'+rx+'" fill="'+fill+'"'+
+      (stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor,cls){ return '<text'+(cls?' class="'+cls+'"':'')+' x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'middle')+'"'+
+      ' style="fill:'+fill+';white-space:pre;"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+  function L(x1,y1,x2,y2,col,w){ return '<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+col+'" stroke-width="'+w+'"/>'; }
+
+  var RED = "#ff6b6b", GREEN = "#4cd6a0", MUTED = "#aab3c5", GRAY = "#8a93a8", CODE = "#d6dbe6";
+  // Measured 2026-11-05, trn2 LNC1, Wan2.2 VAE 368x480x21. Unrolled: commit 1b18e22 VAE_COMPILE=1,
+  // first-run VAE 3476.8 s, warm 12.9 / 11.5 s. Rolled: commit 0ae83b3 VAE_COMPILE_ROLLED=1,
+  // first-run VAE 178.1 s, warm 4.4 / 4.4 s. The decoder has 14 ResidualBlocks (2 middle + 4 x 3).
+  var NB = 14, BW = 41, BH = 34, GAP = 5;
+  var A_L = 0.5, A_R = 6.2, A_SUM = 11.2, END = A_SUM + 1.2;
+
+  // code panel; `cover` = rows inside the dashed "torch.compile sees this" box; loop body rows highlight
+  function code(x, y, lines, cover, col, label, t, aBox, loopOn){
+    var s = R(x, y, 680, 22 + lines.length*32, 10, '#141a26', '#2a3142', 2);
+    for (var i=0;i<lines.length;i++){
+      var ly = y + 34 + i*32;
+      if (loopOn && i >= 2) s += R(x+8, ly-23, 664, 30, 6, 'rgba(255,255,255,0.10)');
+      s += T(x+20, ly, 20, lines[i].replace(/&/g,'&amp;').replace(/</g,'&lt;'), i === 0 ? '#ffffff' : CODE, null, 'start', 'm');
+    }
+    var b = ease(prog(t, aBox, 0.5));
+    if (b > 0){
+      var top = y + 34 + cover[0]*32 - 26, h = (cover[1]-cover[0]+1)*32 + 6;
+      s += '<g opacity="'+b+'">' + R(x+3, top, 674, h, 8, 'none', col, 3, ' stroke-dasharray="12 7"') +
+           T(x+676, y-8, 18, label, col, null, 'end') + '</g>';
+    }
+    return s;
+  }
+  function box(x, y, txt, fill, stroke, dark){
+    return R(x, y, BW, BH, 6, fill, stroke, 2) + T(x+BW/2, y+23, 15, txt, dark ? '#0b0d12' : '#ffffff');
+  }
+
+  function render(t){
+    var s = T(800,56,40,'Roll the loop: compile one block, reuse it','#ffffff') +
+            T(800,94,22,'Same Wan2.2 VAE decoder on trn2. The only change is what you put inside torch.compile.',MUTED);
+
+    // ===== unrolled =====
+    var l = ease(prog(t,A_L,0.6)), BX = 80;
+    var j = Math.floor((t - A_L - 1.4) / 0.2), loopL = j >= 0 && j < NB;
+    s += '<g opacity="'+l+'">' + R(40,116,740,534,20,'rgba(255,255,255,0.03)','#3a4256',2) +
+      T(60,160,28,'Unrolled','#ffffff',null,'start') +
+      code(60, 182, ['decoder = torch.compile(self.decoder)', 'out = decoder(x)   # runs decoder.forward:', '  for block in blocks:   # 14 ResidualBlocks', '      x = block(x, cache)'],
+           [0,3], RED, 'inside torch.compile: all of this', t, A_L+0.8, loopL);
+    s += T(BX, 356, 18, 'compile time: torch.compile walks the loop and traces block 1, 2 … 14', MUTED, null, 'start');
+    for (var i=0;i<NB;i++){
+      var on = loopL && i === j;
+      s += box(BX + i*(BW+GAP), 366, ''+(i+1), on ? RED : 'rgba(255,107,107,0.15)', RED, on);
+    }
+    var built = Math.max(0, Math.min(NB, Math.floor((t - A_L - 1.4) / 0.2) + 1));
+    s += T(BX, 506, 18, 'torch.compile builds ONE graph with a copy of all 14', MUTED, null, 'start');
+    for (var c=0;c<built;c++) s += box(BX + c*(BW+GAP), 446, ''+(c+1), 'rgba(255,107,107,0.9)', RED, true);
+    s += R(BX-8, 440, NB*(BW+GAP)-GAP+16, BH+12, 10, 'none', RED, 2, ' stroke-dasharray="10 7"');
+    var aL = ease(prog(t,A_L+1.2,0.5));
+    s += '<g opacity="'+(l*aL)+'">' + '<path d="M738,300 C770,300 770,463 730,463" fill="none" stroke="'+RED+'" stroke-width="3" marker-end="url(#ar)"/>' +
+         T(752,428,17,'becomes',RED,null,'end') + '</g>';
+    s += T(70,540,20,'Compile, first run',MUTED,null,'start') + R(70,548,640,26,8,'#141a26') + R(70,548,640*built/NB,28,8,RED) +
+         T(70,598,20,'Warm decode',MUTED,null,'start') + R(70,606,640,26,8,'#141a26') +
+         R(70,606,640*(12.2/13)*ease(prog(t,A_L+4.4,0.8)),28,8,RED) + '</g>';
+    s += T(700,568,21,'58 min','#0b0d12',ease(prog(t,A_L+4.2,0.4)),'end');
+    s += T(70+640*(12.2/13)-12,626,21,'11.5–12.9 s','#0b0d12',ease(prog(t,A_L+5.0,0.4)),'end');
+
+    // ===== rolled =====
+    var r = ease(prog(t,A_R,0.6)), BX2 = 860, gOn = t > A_R + 1.3;
+    var done = t >= END - 0.05;   // final frame: every block has called G
+    var k = !done && t > A_R + 1.9 ? Math.floor(((t - A_R - 1.9) / 0.2) % NB) : -1;
+    s += '<g opacity="'+r+'">' + R(820,116,740,534,20,'rgba(255,255,255,0.03)','#3a4256',2) +
+      T(840,160,28,'Rolled','#ffffff',null,'start') +
+      code(840, 182, ['G = torch.compile(block_body)', 'out = self.decoder(x)   # NOT compiled:', '  for block in blocks:   # 14 ResidualBlocks', '      x = G(x, cache, block.weights)'],
+           [0,0], GREEN, 'inside torch.compile: only this', t, A_R+0.8, k >= 0);
+    s += T(BX2, 356, 18, 'run time: the Python loop calls G for block 1, 2 … 14', MUTED, null, 'start');
+    for (var i2=0;i2<NB;i2++){
+      var on2 = done || i2 === k;
+      s += box(BX2 + i2*(BW+GAP), 366, ''+(i2+1), on2 ? GREEN : 'rgba(76,214,160,0.15)', GREEN, on2);
+    }
+    s += T(BX2, 506, 18, 'torch.compile builds ONE block: graph G', MUTED, null, 'start');
+    if (gOn){
+      s += box(BX2, 446, 'G', 'rgba(76,214,160,0.9)', GREEN, true) + R(BX2-8, 440, BW+16, BH+12, 10, 'none', GREEN, 2, ' stroke-dasharray="10 7"');
+      if (k >= 0) s += L(BX2+BW/2, 446, BX2 + k*(BW+GAP) + BW/2, 366+BH, GREEN, 3);
+      if (done) for (var q=0;q<NB;q++) s += '<g opacity="0.45">' + L(BX2+BW/2, 446, BX2 + q*(BW+GAP) + BW/2, 366+BH, GREEN, 2) + '</g>';
+      s += T(BX2+BW+24, 469, 18, 'every block calls G with its own weights', GREEN, ease(prog(t,A_R+1.9,0.4)), 'start');
+    }
+    var aR = ease(prog(t,A_R+1.1,0.5));
+    s += '<g opacity="'+(r*aR)+'">' + '<path d="M842,212 C822,212 822,463 850,463" fill="none" stroke="'+GREEN+'" stroke-width="3" marker-end="url(#ag)"/>' +
+         T(836,428,17,'becomes',GREEN,null,'start') + '</g>';
+    s += T(850,540,20,'Compile, first run',MUTED,null,'start') + R(850,548,640,26,8,'#141a26') + R(850,548,640*(3/58)*(gOn?1:0),28,8,GREEN) +
+         T(850,598,20,'Warm decode',MUTED,null,'start') + R(850,606,640,26,8,'#141a26') +
+         R(850,606,640*(4.4/13)*ease(prog(t,A_R+2.4,0.8)),28,8,GREEN) + '</g>';
+    s += T(850+640*(3/58)+14,568,21,'~3 min',GREEN,ease(prog(t,A_R+1.5,0.4)),'start');
+    s += T(850+640*(4.4/13)+14,626,21,'4.4 s',GREEN,ease(prog(t,A_R+3.2,0.4)),'start');
+
+    // ===== summary =====
+    var m = ease(prog(t,A_SUM,0.8));
+    s += '<g opacity="'+m+'">' + R(40,680,1520,180,20,'rgba(255,255,255,0.04)','#3a4256',3) +
+      T(70,728,27,'Rolled: compile 58 min → ~3 min, warm decode 11.5–12.9 s → 4.4 s.','#ffffff',null,'start') +
+      T(70,772,23,'Put the repeated block inside torch.compile, not the loop. One small graph, called many times.','#d6dbe6',null,'start') +
+      T(70,830,17,'Measured 2026-11-05, trn2, 368x480x21. Unrolled: commit 1b18e22, VAE_COMPILE=1. Rolled: commit 0ae83b3, VAE_COMPILE_ROLLED=1. Code simplified.',GRAY,null,'start') +
+      '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = END;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t >= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener('click', start);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); start(); } });
+})();
+</script>
+</body>
+</html>

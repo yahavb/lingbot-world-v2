@@ -1,0 +1,1654 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Serving world models on AWS Trainium</title>
+<style>body{font:20px/1.5 system-ui,sans-serif;max-width:1100px;margin:2em auto;padding:0 1em;background:#0b0f17;color:#e5e7eb}
+a{color:#7dd3fc} code,pre{background:#1e293b;border-radius:6px} pre{padding:1em;overflow:auto} code{padding:0 .3em}
+table{border-collapse:collapse} td,th{border:1px solid #334155;padding:.4em .8em} img{border:1px solid #334155;margin:1em 0}</style>
+<style>.say{font-size:1.25em;font-weight:600}.lbl{font-weight:700;color:#aab3c5;margin-bottom:.2em}.refs{font-size:.9em}</style>
+</head><body>
+<h1>AIM323 - Serving World Model at scale with AWS Trainium and Native PyTorch</h1>
+<h2>1. From video diffusion to world models</h2>
+<p class="say">World models like LingBot-World, Self Forcing, Rolling Forcing and StreamDiffusion build on this video diffusion pipeline.</p>
+<p><img src="img/pipeline.png" alt="text and image in, T5, VAE encode, DiT for N steps, VAE decode, video out" style="max-width:100%"></p>
+<h2>2. A world model is this pipeline, streaming</h2>
+<p class="say">It runs chunk by chunk, steered by actions, reading a KV cache of a sink and a rolling window.</p>
+<iframe title="anim/world_model_streaming.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;World model streaming&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;Text feeds T5. Before each chunk the latest action (forward, up, down, forward, hold) lights up and goes into the DiT. The DiT makes the chunk, reading a KV cache that keeps a sink chunk and rolls the oldest out; each cache slot keeps the colour of the action it was made with. Before the fourth chunk a new prompt goes through T5 again, while the KV cache is kept. Each chunk streams to the VAE and becomes frames whose camera follows the action, while the DiT works on the next chunk.&quot;&gt;
+  &lt;defs&gt;
+    &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
+      &lt;feGaussianBlur stdDeviation=&quot;9&quot; result=&quot;b&quot;/&gt;
+      &lt;feMerge&gt;&lt;feMergeNode in=&quot;b&quot;/&gt;&lt;feMergeNode in=&quot;SourceGraphic&quot;/&gt;&lt;/feMerge&gt;
+    &lt;/filter&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;static&quot;&gt;&lt;/g&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  var LOOP = 24;                       // seconds per loop
+  // one action per chunk (the latest /control when the chunk starts); a chunk takes its action&#x27;s colour
+  var ACT  = [&quot;W&quot;, &quot;\u2191&quot;, &quot;\u2193&quot;, &quot;W&quot;, &quot;\u25A0&quot;];      // forward, up, down, forward, hold
+  var ACOL = {&quot;W&quot;:&quot;#3d9bff&quot;, &quot;\u2191&quot;:&quot;#ff7a3d&quot;, &quot;\u2193&quot;:&quot;#2fd39a&quot;, &quot;\u25A0&quot;:&quot;#c9d1e0&quot;};
+  var KEYS = [&quot;W&quot;, &quot;\u2191&quot;, &quot;\u2193&quot;, &quot;\u25A0&quot;];
+  var C = ACT.map(function(a){ return ACOL[a]; });
+  var NEWP = 3;                         // a new prompt arrives before this chunk
+  var N = 5, FPC = 3, CAP = 4;          // chunks, frames per chunk, cache slots
+  var GRAY = &quot;#5f6880&quot;;
+
+  // ---- timing (seconds) ----
+  var S0 = 3, PITCH = 3, DIT = 2.4, TRAVEL = 0.8, VAE = 1.5, FGAP = 0.25, FLY = 0.6;
+  function sC(c){ return S0 + c*PITCH; }        // DiT start for chunk c
+  function eC(c){ return sC(c) + DIT; }         // DiT done, chunk emitted, cache grows
+  function aC(c){ return eC(c) + TRAVEL; }      // chunk arrives at VAE
+  function fK(c,j){ return aC(c) + VAE + j*FGAP; } // frame j of chunk c leaves VAE
+
+  // camera per output frame: up/down move the horizon, forward zooms, hold freezes
+  var CAM = [], pitch = 0, zoom = 0;
+  for (var ci=0; ci&lt;5; ci++) for (var fj=0; fj&lt;3; fj++){
+    var a = ACT[ci];
+    if (a===&quot;W&quot;) zoom += 0.12; else if (a===&quot;\u2191&quot;) pitch += 9; else if (a===&quot;\u2193&quot;) pitch -= 9;
+    CAM.push({pitch:pitch, zoom:zoom, snow: ci&gt;=NEWP});
+  }
+
+  // ---- helpers ----
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return &quot;rgba(&quot;+(n&gt;&gt;16&amp;255)+&quot;,&quot;+(n&gt;&gt;8&amp;255)+&quot;,&quot;+(n&amp;255)+&quot;,&quot;+a+&quot;)&quot;; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+Math.max(0,h)+&#x27;&quot; rx=&quot;&#x27;+rx+
+      &#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+(stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill){ return &#x27;&lt;text x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;middle&quot;&#x27;+
+      (fill?&#x27; style=&quot;fill:&#x27;+fill+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+  // thick horizontal / vertical arrow
+  function arrowH(x1,x2,y,col){ return R(x1,y-7,x2-x1-26,14,7,col)+
+      &#x27;&lt;polygon points=&quot;&#x27;+(x2-30)+&#x27;,&#x27;+(y-22)+&#x27; &#x27;+x2+&#x27;,&#x27;+y+&#x27; &#x27;+(x2-30)+&#x27;,&#x27;+(y+22)+&#x27;&quot; fill=&quot;&#x27;+col+&#x27;&quot;/&gt;&#x27;; }
+  function arrowV(x,y1,y2,col){ // y2 is the tip; works both up and down
+    var d = y2&gt;y1 ? 1 : -1, base = y2 - d*30;
+    return R(x-7,Math.min(y1,base),14,Math.abs(base-y1),7,col)+
+      &#x27;&lt;polygon points=&quot;&#x27;+(x-22)+&#x27;,&#x27;+base+&#x27; &#x27;+x+&#x27;,&#x27;+y2+&#x27; &#x27;+(x+22)+&#x27;,&#x27;+base+&#x27;&quot; fill=&quot;&#x27;+col+&#x27;&quot;/&gt;&#x27;; }
+
+  // ---- geometry ----
+  var DOC = {x:50,y:150,w:150,h:150};
+  var T5  = {x:280,y:150,w:200,h:150};
+  var DT  = {x:590,y:90,w:360,h:220};
+  var KV  = {x:590,y:390,w:360,h:80};
+  var VA  = {x:1180,y:110,w:240,h:180};
+  var FS  = {x:70,y:595,w:1460,h:210};
+  var KP  = {x:270,y:400,w:220,h:62};       // action keys, under T5
+  var FW = 88, FH = 140, FY = 630, FX0 = 80, FP = 96;
+  var SLOT = (KV.w - 24 - (CAP-1)*8)/CAP;
+
+  // ---- static layer ----
+  var st = &#x27;&#x27;;
+  st += arrowH(210,272,225,GRAY);                 // text -&gt; T5
+  st += arrowH(488,582,225,GRAY);                 // T5 -&gt; DiT
+  st += arrowH(962,1172,200,GRAY);                // DiT -&gt; VAE
+  st += arrowV(770,385,318,GRAY);                 // KV cache -&gt; DiT (read)
+  st += arrowV(1300,298,588,GRAY);                // VAE -&gt; frames
+  st += &#x27;&lt;line x1=&quot;495&quot; y1=&quot;420&quot; x2=&quot;566&quot; y2=&quot;322&quot; stroke=&quot;&#x27;+GRAY+&#x27;&quot; stroke-width=&quot;14&quot; stroke-linecap=&quot;round&quot;/&gt;&#x27;+
+        &#x27;&lt;polygon points=&quot;556,300 592,286 584,324&quot; fill=&quot;&#x27;+GRAY+&#x27;&quot;/&gt;&#x27;;   // keys -&gt; DiT
+  st += T(1067,300,44,&#x27;chunk&#x27;);
+  st += T(770,535,44,&#x27;KV cache&#x27;);
+  // filmstrip
+  st += R(FS.x,FS.y,FS.w,FS.h,12,&#x27;#1b1f29&#x27;);
+  for (var sx = FS.x+14; sx &lt; FS.x+FS.w-24; sx += 48){
+    st += R(sx,FS.y+8,24,14,4,&#x27;#6b7489&#x27;) + R(sx,FS.y+FS.h-22,24,14,4,&#x27;#6b7489&#x27;);
+  }
+  for (var k=0;k&lt;N*FPC;k++) st += R(FX0+k*FP,FY,FW,FH,8,&#x27;#0b0d12&#x27;);
+  st += T(800,875,44,&#x27;frames&#x27;);
+  document.getElementById(&#x27;static&#x27;).innerHTML = st;
+
+  // ---- dynamic pieces ----
+  function box(b,col,active,label,fs){
+    var s = R(b.x,b.y,b.w,b.h,22, active?hexA(col,.30):&#x27;#151a25&#x27;, col, active?10:6,
+              active?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27; opacity=&quot;0.75&quot;&#x27;);
+    return s + T(b.x+b.w/2, b.y+b.h/2 + fs*0.18 - (b===DT||b===VA?22:0), fs, label);
+  }
+  function bar(x,y,w,h,p,col){ return R(x,y,w,h,h/2,&#x27;#0b0d12&#x27;,&#x27;#3a4256&#x27;,4) + (p&gt;0?R(x,y,w*p,h,h/2,col):&#x27;&#x27;); }
+  function token(cx,cy,col,sc,op){ // a stack of 3 latent frames
+    var s=&#x27;&#x27;, z=56*sc;
+    for (var m=2;m&gt;=0;m--) s += R(cx-z/2+m*10*sc, cy-z/2-m*10*sc, z, z, 8*sc, col, &#x27;#0b0d12&#x27;, 4,
+                                 &#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;);
+    return s;
+  }
+  function frame(x,y,w,h,k,col,op){
+    var cam = CAM[k], sc = h/FH, z = 1+cam.zoom, py = cam.pitch*sc;
+    var sunX = x + w*0.5 + (k/(N*FPC-1)-0.5)*w*0.3;   // one consistent scene
+    var s = &#x27;&lt;g opacity=&quot;&#x27;+op+&#x27;&quot;&gt;&#x27;+R(x,y,w,h,8,hexA(col,.22),col,6)+
+      &#x27;&lt;clipPath id=&quot;fc&#x27;+k+&#x27;&quot;&gt;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+w+&#x27;&quot; height=&quot;&#x27;+h+&#x27;&quot; rx=&quot;8&quot;/&gt;&lt;/clipPath&gt;&#x27;+
+      &#x27;&lt;g clip-path=&quot;url(#fc&#x27;+k+&#x27;)&quot;&gt;&#x27;+
+      &#x27;&lt;circle cx=&quot;&#x27;+sunX+&#x27;&quot; cy=&quot;&#x27;+(y+h*0.28+py)+&#x27;&quot; r=&quot;&#x27;+(w*0.15*z)+&#x27;&quot; fill=&quot;#fff4b8&quot;/&gt;&#x27;+
+      &#x27;&lt;ellipse cx=&quot;&#x27;+(x+w*0.5)+&#x27;&quot; cy=&quot;&#x27;+(y+h-h*0.24+py)+&#x27;&quot; rx=&quot;&#x27;+(w*0.36*z)+&#x27;&quot; ry=&quot;&#x27;+(h*0.17*z)+&#x27;&quot; fill=&quot;&#x27;+col+&#x27;&quot;/&gt;&#x27;;
+    if (cam.snow) for (var i=0;i&lt;5;i++)          // the new prompt&#x27;s event appears in the scene
+      s += &#x27;&lt;circle cx=&quot;&#x27;+(x+w*(0.15+0.17*i))+&#x27;&quot; cy=&quot;&#x27;+(y+h*(0.15+0.12*(i%3)))+&#x27;&quot; r=&quot;&#x27;+(4*sc)+&#x27;&quot; fill=&quot;#ffffff&quot;/&gt;&#x27;;
+    return s+&#x27;&lt;/g&gt;&lt;/g&gt;&#x27;;
+  }
+  function dot(x,y,r,col){ return &#x27;&lt;circle cx=&quot;&#x27;+x+&#x27;&quot; cy=&quot;&#x27;+y+&#x27;&quot; r=&quot;&#x27;+r+&#x27;&quot; fill=&quot;&#x27;+(col||&#x27;#fff&#x27;)+&#x27;&quot; filter=&quot;url(#glow)&quot;/&gt;&#x27;; }
+
+  function render(t){
+    var s = &#x27;&#x27;;
+    // --- text block, fed to T5 once ---
+    var tP = sC(NEWP) - 2.4;                     // the new prompt arrives
+    var swap = ease(prog(t,tP,0.5)), lc = swap&gt;0.5 ? &#x27;#ffcc33&#x27; : &#x27;#e8ecf4&#x27;;
+    var dOp = ease(prog(t,0,0.6)) * (swap&gt;0 &amp;&amp; swap&lt;1 ? Math.abs(1-2*swap) : 1);
+    s += &#x27;&lt;g opacity=&quot;&#x27;+dOp+&#x27;&quot;&gt;&#x27;+R(DOC.x,DOC.y,DOC.w,DOC.h,16,&#x27;#1e2533&#x27;,lc,6);
+    (swap&gt;0.5 ? [90,110,60,100] : [110,90,110,70]).forEach(function(w,i){ s += R(DOC.x+20,DOC.y+28+i*28,w,14,7,lc); });
+    s += &#x27;&lt;/g&gt;&#x27;;
+    var p1 = prog(t,0.6,0.8); if (p1&gt;0 &amp;&amp; p1&lt;1) s += dot(lerp(205,275,ease(p1)),225,18);
+    var q1 = prog(t,tP+0.5,0.6); if (q1&gt;0 &amp;&amp; q1&lt;1) s += dot(lerp(205,275,ease(q1)),225,18,&#x27;#ffcc33&#x27;);
+    var t5on = (t&gt;=1.4 &amp;&amp; t&lt;2.6) || (t&gt;=tP+1.1 &amp;&amp; t&lt;tP+1.9);
+    s += box(T5,&#x27;#2fd3c9&#x27;,t5on,&#x27;T5&#x27;,64);
+    var p2 = prog(t,2.2,0.8); if (p2&gt;0 &amp;&amp; p2&lt;1) s += dot(lerp(485,585,ease(p2)),225,18,&#x27;#7ff5ec&#x27;);
+    var q2 = prog(t,tP+1.7,0.6); if (q2&gt;0 &amp;&amp; q2&lt;1) s += dot(lerp(485,585,ease(q2)),225,18,&#x27;#ffcc33&#x27;);
+
+    // --- action keys: the latest action goes into the DiT just before each chunk ---
+    var on = -1;
+    for (var c0=0;c0&lt;N;c0++) if (t&gt;=sC(c0)-0.7 &amp;&amp; t&lt;sC(c0)+0.3) on = c0;
+    KEYS.forEach(function(k,i){
+      var lit = on&gt;=0 &amp;&amp; ACT[on]===k, kx = KP.x+i*56;
+      s += R(kx,KP.y,48,KP.h,10, lit?ACOL[k]:&#x27;#151a25&#x27;, lit?&#x27;#ffffff&#x27;:&#x27;#8fa3c7&#x27;, lit?6:4, lit?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;) +
+           T(kx+24,KP.y+44,34,k,lit?&#x27;#0b0d12&#x27;:null);
+    });
+    for (c0=0;c0&lt;N;c0++){ var pa = prog(t,sC(c0)-0.5,0.5);
+      if (pa&gt;0 &amp;&amp; pa&lt;1) s += dot(lerp(500,575,ease(pa)), lerp(415,315,ease(pa)), 16, C[c0]); }
+
+    // --- DiT ---
+    var cur = -1, dp = 0;
+    for (var c=0;c&lt;N;c++) if (t&gt;=sC(c) &amp;&amp; t&lt;eC(c)){ cur=c; dp=(t-sC(c))/DIT; }
+    s += box(DT, cur&gt;=0?C[cur]:&#x27;#8fa3c7&#x27;, cur&gt;=0, &#x27;DiT&#x27;, 76);
+    s += bar(DT.x+40, DT.y+DT.h-62, DT.w-80, 34, cur&gt;=0?dp:0, cur&gt;=0?C[cur]:&#x27;#000&#x27;);
+
+    // --- KV cache: grows each chunk; chunk 0 is a pinned sink, oldest other entry rolls out ---
+    var reading = cur&gt;=1;
+    s += R(KV.x,KV.y,KV.w,KV.h,14,&#x27;#0f141e&#x27;, reading?&#x27;#ffffff&#x27;:&#x27;#8fa3c7&#x27;, reading?8:6, reading?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;);
+    var cx = KV.x+12;
+    for (c=0;c&lt;N;c++){
+      var a = ease(prog(t,eC(c),0.5));
+      var ev = 0; if (c&gt;=1 &amp;&amp; c+CAP&lt;=N) ev = ease(prog(t,eC(c+CAP-1),0.5)); // chunk 1 evicted when chunk 4 lands
+      var f = a*(1-ev);
+      // the evicted chunk drops out of the cache, so the roll is visible
+      if (ev &gt; 0 &amp;&amp; ev &lt; 1) s += &#x27;&lt;g opacity=&quot;&#x27;+(1-ev)+&#x27;&quot;&gt;&#x27; + R(cx, KV.y+12 - 70*ev, SLOT*0.8, KV.h-24, 8, C[c], null, 0) + &#x27;&lt;/g&gt;&#x27; +
+                               &#x27;&lt;g opacity=&quot;&#x27;+(1-ev)+&#x27;&quot;&gt;&#x27; + T(cx + SLOT*0.4 - 60, KV.y - 44, 20, &#x27;rolls out&#x27;, &#x27;#ff9f43&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+      if (f&gt;0.001) s += R(cx, KV.y+12, SLOT*f, KV.h-24, 8, C[c], c===0?&#x27;#ffffff&#x27;:null, 5);
+      cx += (SLOT+8)*f;
+    }
+    // labels: the first slot is the pinned sink, the rest is a rolling window
+    var lab = ease(prog(t, eC(0), 0.5)), lab2 = ease(prog(t, eC(1), 0.5));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+lab+&#x27;&quot;&gt;&#x27; + T(KV.x+12+SLOT/2, KV.y-12, 20, &#x27;sink&#x27;, &#x27;#ffffff&#x27;) + &#x27;&lt;/g&gt;&#x27; +
+         &#x27;&lt;g opacity=&quot;&#x27;+lab2+&#x27;&quot;&gt;&#x27; + T(KV.x+300, KV.y-12, 20, &#x27;rolling window&#x27;, &#x27;#aab3c5&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    if (reading){ var ph = ((t-sC(cur))/0.55)%1; s += dot(770, lerp(380,322,ph), 15); }
+
+    // --- chunk tokens travelling DiT -&gt; VAE ---
+    for (c=0;c&lt;N;c++){
+      var tp = prog(t,eC(c),TRAVEL);
+      if (tp&gt;0 &amp;&amp; tp&lt;1) s += token(lerp(990,1150,ease(tp)), 196, C[c], 1, tp&gt;0.85?(1-tp)/0.15:1);
+    }
+
+    // --- VAE ---
+    var vc = -1, vp = 0;
+    for (c=0;c&lt;N;c++) if (t&gt;=aC(c) &amp;&amp; t&lt;fK(c,FPC-1)+0.2){ vc=c; vp=clamp((t-aC(c))/VAE); }
+    s += box(VA, vc&gt;=0?C[vc]:&#x27;#8fa3c7&#x27;, vc&gt;=0, &#x27;VAE&#x27;, 64);
+    s += bar(VA.x+30, VA.y+VA.h-58, VA.w-60, 30, vc&gt;=0?vp:0, vc&gt;=0?C[vc]:&#x27;#000&#x27;);
+
+    // --- frames fly from VAE to the filmstrip ---
+    for (c=0;c&lt;N;c++) for (var j=0;j&lt;FPC;j++){
+      var k = c*FPC+j, fp = prog(t,fK(c,j),FLY);
+      if (fp&lt;=0) continue;
+      var e = ease(fp), sc = lerp(0.45,1,e);
+      var x = lerp(1300-FW*sc/2, FX0+k*FP, e), y = lerp(300, FY, e);
+      s += frame(x, y, FW*sc, FH*sc, k, C[c], 1);
+    }
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
+  }
+
+  // ---- loop / restart / reduced motion ----
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = LOOP - 0.01;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<h2>3. Why Trainium: the hardware</h2>
+<p class="say">Each NeuronCore has its own SBUF and four engines, and DMA moves data between HBM and SBUF.</p>
+<p><img src="img/trainium3_cores.png" alt="Trainium3 with four NeuronCores; one NeuronCore magnified" style="max-width:100%"></p>
+<h2>4. Why Trainium: the software stack</h2>
+<p class="say">You write native PyTorch, the Neuron SDK compiles it, and EKS places it on the devices.</p>
+<iframe title="anim/neuron_sdk.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;The Neuron SDK&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;The Neuron SDK, layer by layer: TorchNeuron runs PyTorch on Trainium, NKI writes custom kernels, the compiler turns graphs into NEFFs, the runtime runs them and the collectives, and the tools profile them.&quot;&gt;
+  &lt;defs&gt;
+    &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
+      &lt;feGaussianBlur stdDeviation=&quot;9&quot; result=&quot;b&quot;/&gt;
+      &lt;feMerge&gt;&lt;feMergeNode in=&quot;b&quot;/&gt;&lt;feMergeNode in=&quot;SourceGraphic&quot;/&gt;&lt;/feMerge&gt;
+    &lt;/filter&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  var INTRO = 8;
+  var LOOP = INTRO;
+  // ---- helpers ----
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return &quot;rgba(&quot;+(n&gt;&gt;16&amp;255)+&quot;,&quot;+(n&gt;&gt;8&amp;255)+&quot;,&quot;+(n&amp;255)+&quot;,&quot;+a+&quot;)&quot;; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+Math.max(0,h)+&#x27;&quot; rx=&quot;&#x27;+rx+
+      &#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+(stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op){ return &#x27;&lt;text x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;middle&quot;&#x27;+
+      &#x27; style=&quot;&#x27;+(fill?&#x27;fill:&#x27;+fill+&#x27;;&#x27;:&#x27;&#x27;)+&#x27;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+
+  // ---- geometry ----
+  var CHIP = {x:100,y:380,w:820,h:480};
+  var CW = 150, CG = 50, CX0 = 135, CY = [478,688];
+  function core(i){ return {x:CX0+(i%4)*(CW+CG), y:CY[i&lt;4?0:1], w:CW, h:CW}; }
+  var FOCUS = 3;                                   // the core we zoom into (top right)
+  var PANEL = {x:990,y:380,w:530,h:480};
+  var ENG = [
+    {n:&quot;Tensor&quot;, c:&quot;#3d9bff&quot;, x:1010, y:400},
+    {n:&quot;Vector&quot;, c:&quot;#2fd39a&quot;, x:1265, y:400},
+    {n:&quot;Scalar&quot;, c:&quot;#ffcc33&quot;, x:1010, y:545},
+    {n:&quot;GpSimd&quot;, c:&quot;#ff6b9a&quot;, x:1265, y:545}
+  ];
+  var EW = 235, EH = 125;
+  var MEM = {x:1010,y:700,w:490,h:140}, MEMC = &quot;#b48cff&quot;;
+  // ring order through the 2x4 grid, and one colour per core (all-gather payloads)
+  var RING = [0,1,2,3,7,6,5,4];
+  var KC = [&quot;#3d9bff&quot;,&quot;#2fd39a&quot;,&quot;#ffcc33&quot;,&quot;#ff6b9a&quot;,&quot;#b48cff&quot;,&quot;#ff7a3d&quot;,&quot;#22d3ee&quot;,&quot;#e8ecf4&quot;];
+  var LINK = &quot;#22d3ee&quot;;
+
+  // ---- timing ----
+  var B1 = 0, ZOOM = 1, ENG0 = 2, ESTEP = 1.2, ALL = ENG0+4*ESTEP;  // beat 1
+  var B2 = 8, RSTEP = 0.85, NSTEP = 7;                               // beat 2
+  var B3 = B2 + 0.6 + NSTEP*RSTEP + 0.6;                              // beat 3 (~15.1 s)
+
+  // ====== intro: what the Neuron SDK is ======
+  var SDK = [
+    {n:&quot;TorchNeuron&quot;, d:&quot;PyTorch on Trainium&quot;,        c:&quot;#ff9900&quot;},
+    {n:&quot;NKI&quot;,         d:&quot;custom kernels&quot;,             c:&quot;#ffcc33&quot;},
+    {n:&quot;Compiler&quot;,    d:&quot;graphs \u2192 NEFF&quot;,           c:&quot;#3d9bff&quot;},
+    {n:&quot;Runtime&quot;,     d:&quot;runs NEFFs + collectives&quot;,   c:&quot;#22d3ee&quot;},
+    {n:&quot;Tools&quot;,       d:&quot;profiler (Neuron Explorer)&quot;, c:&quot;#b48cff&quot;}
+  ];
+  function intro(t){
+    var fade = 1, s = &#x27;&#x27;;                 // hold the full stack until the loop restarts
+    var ti = ease(prog(t,0,0.6));
+    s += T(800,150,76,&#x27;Neuron SDK&#x27;,&#x27;#ffffff&#x27;,ti*fade);
+    for (var i=0;i&lt;SDK.length;i++){
+      var p = ease(prog(t,0.8+i*0.8,0.6)), L = SDK[i], y = 220+i*122;
+      if (p&lt;=0) continue;
+      s += &#x27;&lt;g opacity=&quot;&#x27;+(p*fade)+&#x27;&quot; transform=&quot;translate(&#x27;+lerp(-80,0,p)+&#x27;,0)&quot;&gt;&#x27;+
+        R(260,y,1080,100,18,hexA(L.c,.16),L.c,6)+
+        R(260,y,340,100,18,L.c)+
+        T(430,y+66,44,L.n,&#x27;#0b0d12&#x27;)+
+        T(970,y+64,40,L.d,&#x27;#e8ecf4&#x27;)+&#x27;&lt;/g&gt;&#x27;;
+    }
+    return s;
+  }
+  function render(t){
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = intro(t);
+  }
+
+  // ---- loop / restart / reduced motion ----
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = LOOP - 0.01;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<iframe title="anim/trainium_collectives.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Trainium cores, engines and collectives&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;A Trainium2 device with 8 NeuronCores. Inside one core the Tensor, Vector, Scalar and GpSimd engines light up in turn next to on-chip memory. Then collectives move data between the cores: an all-gather around a ring, until every core holds every block. Then the device shrinks into the left half of a pod whose right half holds the model code and the model weights. First the pod holds the model code and the model weights; the device waits below it. kube-scheduler asks the Neuron DRA driver for NeuronCores, the driver allocates the device, which moves into the pod&#x27;s left half, and the scheduler places the pod. Then an EKS cluster frames everything, the pod shrinks into a column of four identical pods, and the one scheduler and one DRA driver serve each of them.&quot;&gt;
+  &lt;defs&gt;
+    &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
+      &lt;feGaussianBlur stdDeviation=&quot;9&quot; result=&quot;b&quot;/&gt;
+      &lt;feMerge&gt;&lt;feMergeNode in=&quot;b&quot;/&gt;&lt;feMergeNode in=&quot;SourceGraphic&quot;/&gt;&lt;/feMerge&gt;
+    &lt;/filter&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  var LOOP;
+  // ---- helpers ----
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return &quot;rgba(&quot;+(n&gt;&gt;16&amp;255)+&quot;,&quot;+(n&gt;&gt;8&amp;255)+&quot;,&quot;+(n&amp;255)+&quot;,&quot;+a+&quot;)&quot;; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+Math.max(0,h)+&#x27;&quot; rx=&quot;&#x27;+rx+
+      &#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+(stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op){ return &#x27;&lt;text x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;middle&quot;&#x27;+
+      &#x27; style=&quot;&#x27;+(fill?&#x27;fill:&#x27;+fill+&#x27;;&#x27;:&#x27;&#x27;)+&#x27;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+
+  // ---- geometry ----
+  var CHIP = {x:100,y:380,w:820,h:480};
+  var CW = 150, CG = 50, CX0 = 135, CY = [478,688];
+  function core(i){ return {x:CX0+(i%4)*(CW+CG), y:CY[i&lt;4?0:1], w:CW, h:CW}; }
+  var FOCUS = 3;                                   // the core we zoom into (top right)
+  var PANEL = {x:990,y:380,w:530,h:480};
+  var ENG = [
+    {n:&quot;Tensor&quot;, c:&quot;#3d9bff&quot;, x:1010, y:400},
+    {n:&quot;Vector&quot;, c:&quot;#2fd39a&quot;, x:1265, y:400},
+    {n:&quot;Scalar&quot;, c:&quot;#ffcc33&quot;, x:1010, y:545},
+    {n:&quot;GpSimd&quot;, c:&quot;#ff6b9a&quot;, x:1265, y:545}
+  ];
+  var EW = 235, EH = 125;
+  var MEM = {x:1010,y:700,w:490,h:140}, MEMC = &quot;#b48cff&quot;;
+  // ring order through the 2x4 grid, and one colour per core (all-gather payloads)
+  var RING = [0,1,2,3,7,6,5,4];
+  var KC = [&quot;#3d9bff&quot;,&quot;#2fd39a&quot;,&quot;#ffcc33&quot;,&quot;#ff6b9a&quot;,&quot;#b48cff&quot;,&quot;#ff7a3d&quot;,&quot;#22d3ee&quot;,&quot;#e8ecf4&quot;];
+  var LINK = &quot;#22d3ee&quot;;
+
+  // ---- timing ----
+  var B1 = 0, ZOOM = 1, ENG0 = 2, ESTEP = 1.2, ALL = ENG0+4*ESTEP;  // beat 1
+  var B2 = 8, RSTEP = 0.85, NSTEP = 7;                               // beat 2
+  var B3 = B2 + 0.6 + NSTEP*RSTEP + 0.6;                              // all done (~15.1 s)
+  // beat 4: the device shrinks into the left half of a pod; code + weights fill its right half;
+  // kube-scheduler asks the Neuron DRA driver for NeuronCores, the driver allocates them, the pod is scheduled
+  var SH = B3 + 1.0, POD = SH + 1.4, SCH = POD + 1.4, ASK = SCH + 0.7, ALLOC = ASK + 0.8, MOVE = ALLOC + 0.8, BIND = MOVE + 1.1;
+  // beat 5: EKS around everything, the pod shrinks into a column, more pods, one scheduler + one DRA driver
+  var S2 = BIND + 1.4, NP = 4, PODS = S2 + 1.4, PSTEP = 0.5;
+  LOOP = PODS + NP*PSTEP + 3.0;
+  var PCX = 565, PCY = 450;                                        // beat-4 pod centre
+  var PK = 0.40, PW = 1070*PK, PH = 320*PK, PX = 300, PY0 = 220, PG = PH + 40;   // beat-5 column
+  // ---- the pod: dashed box, tag, and its right half (model code + model weights), beat-4 coordinates ----
+  function podBox(){ return R(30,290,1070,320,30,hexA(&#x27;#5b8cff&#x27;,.07),&#x27;#9ab6ff&#x27;,8,&#x27; stroke-dasharray=&quot;26 14&quot;&#x27;); }
+  function podTag(){ return R(56,268,110,44,10,&#x27;#0b0d12&#x27;,&#x27;#9ab6ff&#x27;,3)+T(111,300,30,&#x27;Pod&#x27;,&#x27;#9ab6ff&#x27;); }
+  function codeWeights(){
+    var g = R(640,335,210,230,20,hexA(&#x27;#c9d1e0&#x27;,.10),&#x27;#c9d1e0&#x27;,5) + T(745,445,64,&#x27;&amp;lt;/&amp;gt;&#x27;,&#x27;#c9d1e0&#x27;) +
+            T(745,530,28,&#x27;Model code&#x27;,&#x27;#ffffff&#x27;);
+    g += R(870,335,210,230,20,hexA(&#x27;#2fd39a&#x27;,.12),&#x27;#2fd39a&#x27;,5);
+    for (var i=2;i&gt;=0;i--) g += R(935+i*12, 372-i*12+24, 64, 80, 8, &#x27;#1b2a26&#x27;,&#x27;#2fd39a&#x27;,3);
+    g += T(975,530,25,&#x27;Model weights&#x27;,&#x27;#ffffff&#x27;);
+    return g;
+  }
+  function arrow(x1,y1,x2,y2,col,extra){
+    var a = Math.atan2(y2-y1, x2-x1), L = Math.hypot(x2-x1,y2-y1);
+    if (L &lt; 40) return &#x27;&#x27;;         // no lone arrowhead before the line grows
+    return &#x27;&lt;line x1=&quot;&#x27;+x1+&#x27;&quot; y1=&quot;&#x27;+y1+&#x27;&quot; x2=&quot;&#x27;+(x2-24*Math.cos(a))+&#x27;&quot; y2=&quot;&#x27;+(y2-24*Math.sin(a))+&#x27;&quot; stroke=&quot;&#x27;+col+&#x27;&quot; stroke-width=&quot;8&quot; stroke-linecap=&quot;round&quot;&#x27;+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;+
+           &#x27;&lt;polygon points=&quot;0,-16 30,0 0,16&quot; fill=&quot;&#x27;+col+&#x27;&quot; transform=&quot;translate(&#x27;+(x2-30*Math.cos(a))+&#x27;,&#x27;+(y2-30*Math.sin(a))+&#x27;) rotate(&#x27;+(a*180/Math.PI)+&#x27;)&quot;/&gt;&#x27;;
+  }
+
+
+  function render(t){
+    var s = &#x27;&#x27;;
+    // ====== device with 8 NeuronCores ======
+    var dev = ease(prog(t,B1,0.9));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+dev+&#x27;&quot;&gt;&#x27;;
+    s += R(CHIP.x,CHIP.y,CHIP.w,CHIP.h,26,&#x27;#121826&#x27;,&#x27;#8fa3c7&#x27;,8);
+    // collective links (beat 2): thick bars between ring neighbours
+    var lk = ease(prog(t,B2,0.6));
+    for (var r=0;r&lt;8;r++){
+      var a = core(RING[r]), b = core(RING[(r+1)%8]), L = linkRect(a,b);
+      s += R(L.x,L.y,L.w,L.h,8, lk&gt;0?hexA(LINK,0.25+0.55*lk):&#x27;#2a3246&#x27;);
+    }
+    var col = ease(prog(t,B2,0.6));
+    if (col&gt;0) s += T(CHIP.x+CHIP.w/2, CHIP.y+68, 50, &#x27;Collectives&#x27;, LINK, col);
+    // ring step progress (all-gather: each step every core passes one block to its neighbour)
+    var stepT = (t - (B2+0.6)) / RSTEP, step = Math.floor(stepT), sp = stepT - step;
+    for (var i=0;i&lt;8;i++){
+      var c = core(i), lit = (i===FOCUS) &amp;&amp; t&gt;=ZOOM;
+      s += R(c.x,c.y,c.w,c.h,18,&#x27;#1f2940&#x27;, lit?&#x27;#ffffff&#x27;:&#x27;#6f86b8&#x27;, lit?10:6, lit?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;);
+      // engine dots in each core (a tiny echo of the zoomed core)
+      for (var e=0;e&lt;4;e++){
+        var on = engOn(t,e);
+        s += R(c.x+18+(e%2)*62, c.y+16+Math.floor(e/2)*40, 52, 30, 7,
+               on ? ENG[e].c : hexA(ENG[e].c,.35));
+      }
+      // received blocks: 8 slots, fill as the all-gather proceeds
+      var pos = RING.indexOf(i);
+      for (var k=0;k&lt;8;k++){
+        var src = RING[(pos - k + 8) % 8];   // k = 0 is the core&#x27;s own block
+        var have = (t &gt;= B2) &amp;&amp; (k===0 || (stepT &gt;= k));
+        s += R(c.x+12+k*16, c.y+c.h-40, 14, 28, 3, have?KC[src]:&#x27;#0b0d12&#x27;);
+      }
+    }
+    // packets moving along every link at once
+    if (t &gt;= B2+0.6 &amp;&amp; step &lt; NSTEP &amp;&amp; step &gt;= 0){
+      for (r=0;r&lt;8;r++){
+        var from = RING[r], to = RING[(r+1)%8];
+        var payload = RING[(r - step + 8) % 8];
+        var A = core(from), Bc = core(to);
+        var e2 = ease(clamp(sp/0.85));
+        var px = lerp(A.x+A.w/2, Bc.x+Bc.w/2, e2), py2 = lerp(A.y+A.h/2, Bc.y+Bc.h/2, e2);
+        s += R(px-20,py2-20,40,40,8,KC[payload],&#x27;#0b0d12&#x27;,5,&#x27; filter=&quot;url(#glow)&quot;&#x27;);
+      }
+    }
+    s += &#x27;&lt;/g&gt;&#x27;;
+
+    // ====== zoom into one core: four engines + on-chip memory ======
+    var zm = ease(prog(t,ZOOM,0.9));
+    if (zm&gt;0){
+      var f = core(FOCUS);
+      s += &#x27;&lt;g opacity=&quot;&#x27;+zm+&#x27;&quot;&gt;&#x27;;
+      // thick connector from the focused core to the panel
+      s += &#x27;&lt;polygon points=&quot;&#x27;+(f.x+f.w)+&#x27;,&#x27;+(f.y+10)+&#x27; &#x27;+PANEL.x+&#x27;,&#x27;+PANEL.y+&#x27; &#x27;+PANEL.x+&#x27;,&#x27;+(PANEL.y+PANEL.h)+&#x27; &#x27;+(f.x+f.w)+&#x27;,&#x27;+(f.y+f.h-10)+&#x27;&quot; fill=&quot;rgba(255,255,255,.10)&quot;/&gt;&#x27;;
+      s += R(PANEL.x,PANEL.y,PANEL.w,PANEL.h,26,&#x27;#121826&#x27;,&#x27;#ffffff&#x27;,8);
+      for (e=0;e&lt;4;e++){
+        var E = ENG[e], o = engOn(t,e);
+        s += R(E.x,E.y,EW,EH,18, o?E.c:hexA(E.c,.18), E.c, o?10:6, o?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;);
+        s += T(E.x+EW/2, E.y+EH/2+15, 42, E.n, o?&#x27;#0b0d12&#x27;:&#x27;#ffffff&#x27;);
+      }
+      // on-chip memory: a block of cells (shape only)
+      var mOn = anyEng(t);
+      s += R(MEM.x,MEM.y,MEM.w,MEM.h,18, hexA(MEMC, mOn?.35:.15), MEMC, mOn?10:6, mOn?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;);
+      for (var my=0;my&lt;3;my++) for (var mx=0;mx&lt;10;mx++)
+        s += R(MEM.x+22+mx*46, MEM.y+20+my*36, 34, 26, 5, hexA(MEMC, mOn?.95:.5));
+      // data pulse from memory up into the active engine
+      for (e=0;e&lt;4;e++){
+        var a0 = ENG0 + e*ESTEP, pp = prog(t,a0,ESTEP*0.7);
+        if (pp&gt;0 &amp;&amp; pp&lt;1 &amp;&amp; t &lt; ALL){
+          var Ee = ENG[e], ex = Ee.x+EW/2;
+          var y0 = MEM.y+10, y1 = Ee.y+EH-10, yy = lerp(y0,y1,ease(pp));
+          s += R(ex-18,yy-18,36,36,8,&#x27;#ffffff&#x27;,null,0,&#x27; filter=&quot;url(#glow)&quot;&#x27;);
+        }
+      }
+      s += &#x27;&lt;/g&gt;&#x27;;
+    }
+    // beat 4: shrink (the opposite of the zoom) into the left half of the pod
+    // the device shrinks and waits below the pod, dimmed, until the DRA driver allocates it
+    var sh = ease(prog(t,SH,1.3)), mv = ease(prog(t,MOVE,0.9));
+    var k = lerp(1,0.38,sh), cx = lerp(810,320,sh), cy = lerp(450,745,sh) + (450-745)*mv;
+    var dimd = lerp(1, 0.45, sh) + 0.55*mv;
+    var dev = &#x27;&lt;g opacity=&quot;&#x27;+dimd+&#x27;&quot; transform=&quot;translate(&#x27;+cx+&#x27;,&#x27;+cy+&#x27;) scale(&#x27;+k+&#x27;) translate(-810,-450)&quot;&gt;&#x27;+
+              &#x27;&lt;g transform=&quot;translate(0,-170)&quot;&gt;&#x27;+s+&#x27;&lt;/g&gt;&lt;/g&gt;&#x27;;
+    var pd = ease(prog(t,POD,0.7)), cw = ease(prog(t,POD+0.4,0.7));
+    var grp = (pd&gt;0 ? &#x27;&lt;g opacity=&quot;&#x27;+pd+&#x27;&quot;&gt;&#x27;+podBox()+&#x27;&lt;/g&gt;&#x27; : &#x27;&#x27;) + dev +
+              (cw&gt;0 ? &#x27;&lt;g opacity=&quot;&#x27;+cw+&#x27;&quot;&gt;&#x27;+codeWeights()+&#x27;&lt;/g&gt;&#x27; : &#x27;&#x27;) +
+              (pd&gt;0 ? &#x27;&lt;g opacity=&quot;&#x27;+pd+&#x27;&quot;&gt;&#x27;+podTag()+&#x27;&lt;/g&gt;&#x27; : &#x27;&#x27;);
+    // beat 5: the pod shrinks into the first slot of a column
+    var s2 = ease(prog(t,S2,1.2)), k2 = lerp(1,PK,s2);
+    var out = &#x27;&lt;g transform=&quot;translate(&#x27;+lerp(PCX,PX,s2)+&#x27;,&#x27;+lerp(PCY,PY0,s2)+&#x27;) scale(&#x27;+k2+&#x27;) translate(&#x27;+(-PCX)+&#x27;,&#x27;+(-PCY)+&#x27;)&quot;&gt;&#x27;+grp+&#x27;&lt;/g&gt;&#x27;;
+    if (s2&gt;0) out = &#x27;&lt;g opacity=&quot;&#x27;+s2+&#x27;&quot;&gt;&#x27;+R(40,40,1520,830,30,hexA(&#x27;#ff9900&#x27;,.05),&#x27;#ff9900&#x27;,8)+
+                    T(120,95,44,&#x27;EKS&#x27;,&#x27;#ff9900&#x27;)+&#x27;&lt;/g&gt;&#x27; + out;
+    // the other pods: the same pod, with a small device in its left half
+    for (var q=1;q&lt;NP;q++){
+      var pq = ease(prog(t,PODS+(q-1)*PSTEP,0.5)); if (pq&lt;=0) continue;
+      var mini = podBox() + R(50,359,540,182,16,&#x27;#121826&#x27;,&#x27;#8fa3c7&#x27;,4);
+      for (var m=0;m&lt;8;m++) mini += R(70+(m%4)*128, 375+Math.floor(m/4)*80, 112, 68, 10, &#x27;#1f2940&#x27;,&#x27;#6f86b8&#x27;,3);
+      mini += codeWeights() + podTag();
+      out += &#x27;&lt;g opacity=&quot;&#x27;+pq+&#x27;&quot; transform=&quot;translate(&#x27;+PX+&#x27;,&#x27;+(PY0+q*PG)+&#x27;) scale(&#x27;+PK+&#x27;) translate(&#x27;+(-PCX)+&#x27;,&#x27;+(-PCY)+&#x27;)&quot;&gt;&#x27;+mini+&#x27;&lt;/g&gt;&#x27;;
+    }
+    // kube-scheduler and the Neuron DRA driver (move into the cluster in beat 5)
+    var sc = ease(prog(t,SCH,0.6));
+    var KX = lerp(1200,1100,s2), KY = lerp(110,170,s2), KW = lerp(370,380,s2), KH = 170;
+    var DX = lerp(1200,1100,s2), DY = lerp(360,580,s2), DW = KW, DH = 170;
+    if (sc&gt;0){
+      out += &#x27;&lt;g opacity=&quot;&#x27;+sc+&#x27;&quot;&gt;&#x27;+R(KX,KY,KW,KH,24,hexA(&#x27;#ffcc33&#x27;,.14),&#x27;#ffcc33&#x27;,8)+
+             T(KX+KW/2,KY+KH/2+13,37,&#x27;kube-scheduler&#x27;,&#x27;#ffffff&#x27;)+&#x27;&lt;/g&gt;&#x27;;
+      out += &#x27;&lt;g opacity=&quot;&#x27;+sc+&#x27;&quot;&gt;&#x27;+R(DX,DY,DW,DH,24,hexA(&#x27;#5b8cff&#x27;,.18),&#x27;#5b8cff&#x27;,8)+
+             T(DX+DW/2,DY+DH/2-12,42,&#x27;Neuron DRA&#x27;,&#x27;#ffffff&#x27;)+T(DX+DW/2,DY+DH/2+40,42,&#x27;driver&#x27;,&#x27;#ffffff&#x27;)+&#x27;&lt;/g&gt;&#x27;;
+    }
+    // scheduler -&gt; DRA driver: which NeuronCores can this pod get?
+    var ak = ease(prog(t,ASK,0.6));
+    if (ak&gt;0) out += arrow(KX+KW/2, KY+KH+6, KX+KW/2, lerp(KY+KH+6, DY-6, ak), &#x27;#ffcc33&#x27;, &#x27;&#x27;);
+    // beat 4 only: DRA -&gt; pod (allocates the cores), scheduler -&gt; pod (places it); they fade in beat 5
+    var f4 = 1 - s2;
+    // DRA -&gt; the device&#x27;s NeuronCores (below the pod), then the device moves into the pod
+    var al = ease(prog(t,ALLOC,0.6)), alo = f4 * (1 - prog(t,MOVE+0.6,0.4));
+    if (al&gt;0 &amp;&amp; alo&gt;0){
+      var ax = DX+DW/2, ay0 = DY+DH+6, ayE = 745, axE = 606;
+      var p1 = clamp(al*2), p2 = clamp(al*2-1);
+      var seg = &#x27;&lt;path d=&quot;M&#x27;+ax+&#x27; &#x27;+ay0+&#x27; V&#x27;+lerp(ay0,ayE,p1)+(p2&gt;0?&#x27; H&#x27;+lerp(ax,axE+24,p2):&#x27;&#x27;)+&#x27;&quot; stroke=&quot;#9ab6ff&quot; stroke-width=&quot;8&quot; fill=&quot;none&quot; stroke-linecap=&quot;round&quot;/&gt;&#x27;;
+      if (p2&gt;=1) seg += &#x27;&lt;polygon points=&quot;&#x27;+(axE+30)+&#x27;,&#x27;+(ayE-16)+&#x27; &#x27;+axE+&#x27;,&#x27;+ayE+&#x27; &#x27;+(axE+30)+&#x27;,&#x27;+(ayE+16)+&#x27;&quot; fill=&quot;#9ab6ff&quot;/&gt;&#x27;;
+      out += &#x27;&lt;g opacity=&quot;&#x27;+alo+&#x27;&quot;&gt;&#x27;+seg+&#x27;&lt;/g&gt;&#x27;;
+    }
+    var bd = ease(prog(t,BIND,0.6)) * f4;
+    if (bd&gt;0){
+      var bx = lerp(KX-6, 1000, ease(prog(t,BIND,0.6)));
+      out += &#x27;&lt;g opacity=&quot;&#x27;+f4+&#x27;&quot;&gt;&lt;path d=&quot;M&#x27;+(KX-6)+&#x27; &#x27;+(KY+KH/2)+&#x27; H&#x27;+bx+&#x27;&quot; stroke=&quot;#ffcc33&quot; stroke-width=&quot;8&quot; fill=&quot;none&quot; stroke-dasharray=&quot;18 10&quot;/&gt;&#x27;+
+             (prog(t,BIND,0.6)&gt;=1 ? arrow(1000,KY+KH/2,1000,282,&#x27;#ffcc33&#x27;,&#x27; stroke-dasharray=&quot;18 10&quot;&#x27;) : &#x27;&#x27;)+&#x27;&lt;/g&gt;&#x27;;
+    }
+    // beat 5: one scheduler arrow and one DRA arrow per pod
+    for (q=0;q&lt;NP;q++){
+      var a5 = ease(prog(t,PODS-0.6+q*PSTEP,0.5)); if (a5&lt;=0) continue;
+      var tx = PX+PW/2+8, ty = PY0+q*PG;
+      out += arrow(KX-6, KY+KH/2, lerp(KX-6,tx,a5), lerp(KY+KH/2,ty-22,a5), &#x27;#ffcc33&#x27;, &#x27; stroke-dasharray=&quot;18 10&quot;&#x27;);
+      out += arrow(DX-6, DY+DH/2, lerp(DX-6,tx,a5), lerp(DY+DH/2,ty+22,a5), &#x27;#9ab6ff&#x27;, &#x27;&#x27;);
+    }
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = out;
+  }
+
+  function engOn(t,e){
+    if (t &lt; ENG0) return false;
+    if (t &lt; ALL) return t &gt;= ENG0+e*ESTEP &amp;&amp; t &lt; ENG0+(e+1)*ESTEP;
+    return t &lt; ALL + 1.0 || t &gt;= B3;            // all four together, then again in the final picture
+  }
+  function anyEng(t){ return engOn(t,0)||engOn(t,1)||engOn(t,2)||engOn(t,3); }
+  function linkRect(a,b){
+    var W = 26;
+    if (a.y === b.y){ // horizontal neighbours
+      var x1 = Math.min(a.x,b.x)+CW, x2 = Math.max(a.x,b.x);
+      return {x:x1-4, y:a.y+CW/2-W/2, w:x2-x1+8, h:W};
+    }
+    var y1 = Math.min(a.y,b.y)+CW, y2 = Math.max(a.y,b.y);
+    return {x:a.x+CW/2-W/2, y:y1-4, w:W, h:y2-y1+8};
+  }
+
+  // ---- loop / restart / reduced motion ----
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = LOOP - 0.01;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<h2>5. Bring-up in eager mode</h2>
+<p class="say">Move the model to the neuron device first, and keep its output as the reference for every later step.</p>
+<pre><code class="language-python">NEURON_DEVICE = torch.device(&quot;neuron&quot;)
+torch.neuron.set_device(local_rank)
+text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
+vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)</code></pre>
+<p class="refs">Code: <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L72"><code>inference_neuron_ti2v.py#L72</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L194-L213"><code>#L194-L213</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/rope_neuron.py"><code>rope_neuron.py</code></a></p>
+<h2>6. torch.compile</h2>
+<p class="say">Compiling small modules works, but leaves many small graphs with Python and collectives in between.</p>
+<pre><code class="language-python">block.ffn = torch.compile(block.ffn, backend=&quot;neuron&quot;, dynamic=False)
+
+@torch.compiler.disable          # forces a graph break around every collective
+def all_reduce_sum(x): ...</code></pre>
+<p class="refs">Code: <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/tp_utils.py#L119-L128"><code>models/tp_utils.py#L119-L128</code></a></p>
+<p class="say">One graph per transformer block, collectives inside, lets the compiler fuse the ops.</p>
+<pre><code class="language-python">import torch.distributed._functional_collectives as funcol
+
+def _all_reduce(x):
+    return funcol.all_reduce(x, &quot;sum&quot;, get_tp_group())   # traced: lives inside the graph
+
+class _FastBlock(nn.Module):
+    def forward(self, x, e, cos, sin, ck, cv):
+        # norm + modulation, QKV, QK-norm, RoPE, attention, O-proj + all-reduce,
+        # cross-attention, FFN + all-reduce, gated residuals: all in one graph
+        ...
+
+kw = dict(backend=&quot;neuron&quot;, dynamic=False, fullgraph=True)
+self.blocks = [torch.compile(_FastBlock(b, ...), **kw) for b in model.blocks]</code></pre>
+<iframe title="anim/op_fusion.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Operation fusion: eager vs torch.compile&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;Eager: six operations (norm, scale, shift, matmul, SiLU, add) run one after another. Each one is launched, reads its input from HBM, computes on one engine, and writes its result back to HBM, so the timeline fills with launch and memory time. Fused with torch.compile: the same six operations are one graph with one launch; the data is read from HBM once, passes from operation to operation in on-chip SBUF while the engines overlap, and is written back once. Its timeline is much shorter.&quot;&gt;
+  &lt;defs&gt;
+    &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
+      &lt;feGaussianBlur stdDeviation=&quot;8&quot; result=&quot;b&quot;/&gt;
+      &lt;feMerge&gt;&lt;feMergeNode in=&quot;b&quot;/&gt;&lt;feMergeNode in=&quot;SourceGraphic&quot;/&gt;&lt;/feMerge&gt;
+    &lt;/filter&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  // ---- helpers ----
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return &quot;rgba(&quot;+(n&gt;&gt;16&amp;255)+&quot;,&quot;+(n&gt;&gt;8&amp;255)+&quot;,&quot;+(n&amp;255)+&quot;,&quot;+a+&quot;)&quot;; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+Math.max(0,h)+&#x27;&quot; rx=&quot;&#x27;+rx+
+      &#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+(stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op,anchor){ return &#x27;&lt;text x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;&#x27;+(anchor||&#x27;middle&#x27;)+&#x27;&quot;&#x27;+
+      &#x27; style=&quot;&#x27;+(fill?&#x27;fill:&#x27;+fill+&#x27;;&#x27;:&#x27;&#x27;)+&#x27;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+
+  // ---- the six operations of a block fragment, and the engine each runs on ----
+  var VEC = &quot;#2fd39a&quot;, TEN = &quot;#3d9bff&quot;, SCA = &quot;#ffcc33&quot;;
+  var OPS = [
+    {n:&quot;norm&quot;,   e:&quot;Vector&quot;, c:VEC}, {n:&quot;scale&quot;,  e:&quot;Vector&quot;, c:VEC}, {n:&quot;shift&quot;, e:&quot;Vector&quot;, c:VEC},
+    {n:&quot;matmul&quot;, e:&quot;Tensor&quot;, c:TEN}, {n:&quot;SiLU&quot;,   e:&quot;Scalar&quot;, c:SCA}, {n:&quot;add&quot;,   e:&quot;Vector&quot;, c:VEC}
+  ];
+  var LAUNCH = &quot;#8a93a8&quot;, HBMC = &quot;#8fa3c7&quot;, SBUFC = &quot;#b48cff&quot;;
+  var OX0 = 250, OW = 180, OG = 34;                 // op boxes, x
+  function ox(i){ return OX0 + i*(OW+OG); }
+
+  // ---- eager schedule: per op, launch -&gt; read from HBM -&gt; compute -&gt; write to HBM ----
+  var E0 = 0.8, EV = [], tt = E0;
+  for (var i=0;i&lt;OPS.length;i++){
+    var L = 0.28, Rd = 0.32, C = (i===3 ? 0.45 : 0.24), W = 0.32;
+    EV.push({l:tt, r:tt+L, c:tt+L+Rd, w:tt+L+Rd+C, e:tt+L+Rd+C+W});
+    tt += L+Rd+C+W;
+  }
+  var EEND = tt;
+  // ---- fused schedule: one launch, one read, the ops overlap through SBUF, one write ----
+  var F0 = EEND + 0.9, FL = F0 + 0.6, FR = FL + 0.3, OP0 = FR + 0.4, OSTEP = 0.14, ODUR = 0.42;
+  var FW = OP0 + (OPS.length-1)*OSTEP + ODUR, FEND = FW + 0.4;
+  var LOOP = FEND + 3.5;
+
+  // ---- timeline: the same seconds-to-pixels scale for both bars ----
+  var TX = 330, TWID = 1180, SEC = TWID / (EEND - E0);
+  function seg(y,a,b,t,col){ if (t&lt;=a) return &#x27;&#x27;; var x1 = TX+(a-E0)*SEC, x2 = TX+(Math.min(b,t)-E0)*SEC;
+    return R(x1,y,Math.max(0,x2-x1),34,4,col); }
+  function fseg(y,a,b,t,col){ if (t&lt;=a) return &#x27;&#x27;; var x1 = TX+(a-F0-0.6)*SEC, x2 = TX+(Math.min(b,t)-F0-0.6)*SEC;
+    return R(x1,y,Math.max(0,x2-x1),34,4,col); }
+
+  function opBox(x,y,w,h,o,on,fs){
+    return R(x,y,w,h,16, on?o.c:hexA(o.c,.14), o.c, on?8:4, on?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;) +
+           T(x+w/2,y+h/2+fs*0.12,fs,o.n,on?&#x27;#0b0d12&#x27;:&#x27;#ffffff&#x27;) +
+           T(x+w/2,y+h/2+fs*0.12+fs*0.8,fs*0.55,o.e,on?&#x27;#0b0d12&#x27;:&#x27;#aab3c5&#x27;);
+  }
+  function packet(x,y,col){ return R(x-16,y-16,32,32,7,col,&#x27;#0b0d12&#x27;,3,&#x27; filter=&quot;url(#glow)&quot;&#x27;); }
+
+  function render(t){
+    var s = &#x27;&#x27;;
+    // ================= eager =================
+    s += T(60,72,40,&#x27;Eager&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;);
+    s += R(OX0,262,OPS.length*(OW+OG)-OG,46,12,hexA(HBMC,.18),HBMC,4) + T(OX0-24,294,28,&#x27;HBM&#x27;,HBMC,null,&#x27;end&#x27;);
+    for (i=0;i&lt;OPS.length;i++){
+      var ev = EV[i], x = ox(i), on = t&gt;=ev.c &amp;&amp; t&lt;ev.w;
+      s += opBox(x,110,OW,110,OPS[i],on,34);
+      if (t&gt;=ev.l &amp;&amp; t&lt;ev.r) s += R(x+OW/2-52,62,104,34,17,LAUNCH) + T(x+OW/2,86,20,&#x27;launch&#x27;,&#x27;#0b0d12&#x27;);
+      var pr = prog(t,ev.r,ev.c-ev.r); if (pr&gt;0 &amp;&amp; pr&lt;1) s += packet(x+OW/2, lerp(262,222,ease(pr)), HBMC);
+      var pw = prog(t,ev.w,ev.e-ev.w); if (pw&gt;0 &amp;&amp; pw&lt;1) s += packet(x+OW/2, lerp(222,262,ease(pw)), HBMC);
+    }
+
+    // ================= fused =================
+    var fb = ease(prog(t,F0,0.5));
+    if (fb&gt;0){
+      s += &#x27;&lt;g opacity=&quot;&#x27;+fb+&#x27;&quot;&gt;&#x27;;
+      s += T(60,392,40,&#x27;Fused&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;) + T(220,392,28,&#x27;torch.compile: one graph&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
+      s += R(OX0-20,420,OPS.length*(OW+OG)-OG+40,200,22,hexA(&#x27;#ffffff&#x27;,.04),&#x27;#ffffff&#x27;,4,&#x27; stroke-dasharray=&quot;16 10&quot;&#x27;);
+      s += R(OX0,560,OPS.length*(OW+OG)-OG,44,12,hexA(SBUFC,.20),SBUFC,4) + T(OX0-34,592,28,&#x27;SBUF&#x27;,SBUFC,null,&#x27;end&#x27;);
+      s += R(OX0,668,OPS.length*(OW+OG)-OG,46,12,hexA(HBMC,.18),HBMC,4) + T(OX0-24,700,28,&#x27;HBM&#x27;,HBMC,null,&#x27;end&#x27;);
+      for (i=0;i&lt;OPS.length;i++){
+        var a0 = OP0+i*OSTEP, onf = t&gt;=a0 &amp;&amp; t&lt;a0+ODUR;
+        s += opBox(ox(i),440,OW,100,OPS[i],onf,30);
+      }
+      if (t&gt;=FL &amp;&amp; t&lt;FR) s += R(800-52,404,104,34,17,LAUNCH) + T(800,428,20,&#x27;launch&#x27;,&#x27;#0b0d12&#x27;);
+      var fr = prog(t,FR,OP0-FR); if (fr&gt;0 &amp;&amp; fr&lt;1) s += packet(ox(0)+OW/2, lerp(668,604,ease(fr)), HBMC);
+      // the intermediate hops from op to op inside SBUF
+      for (i=0;i&lt;OPS.length-1;i++){
+        var ph = prog(t,OP0+i*OSTEP+0.12,OSTEP+0.1);
+        if (ph&gt;0 &amp;&amp; ph&lt;1) s += packet(lerp(ox(i)+OW/2, ox(i+1)+OW/2, ease(ph)), 582, SBUFC);
+      }
+      var fw = prog(t,FW,FEND-FW); if (fw&gt;0 &amp;&amp; fw&lt;1) s += packet(ox(OPS.length-1)+OW/2, lerp(604,668,ease(fw)), HBMC);
+      s += &#x27;&lt;/g&gt;&#x27;;
+    }
+
+    // ================= timelines (same scale) =================
+    s += T(TX-20,792,26,&#x27;eager&#x27;,&#x27;#ffffff&#x27;,null,&#x27;end&#x27;) + R(TX,766,TWID,34,4,&#x27;#141a26&#x27;);
+    for (i=0;i&lt;OPS.length;i++){
+      var e2 = EV[i];
+      s += seg(766,e2.l,e2.r,t,LAUNCH) + seg(766,e2.r,e2.c,t,HBMC) + seg(766,e2.c,e2.w,t,OPS[i].c) + seg(766,e2.w,e2.e,t,HBMC);
+    }
+    if (fb&gt;0){
+      s += &#x27;&lt;g opacity=&quot;&#x27;+fb+&#x27;&quot;&gt;&#x27; + T(TX-20,846,26,&#x27;fused&#x27;,&#x27;#ffffff&#x27;,null,&#x27;end&#x27;) + R(TX,820,TWID,34,4,&#x27;#141a26&#x27;);
+      s += fseg(820,FL,FR,t,LAUNCH) + fseg(820,FR,OP0,t,HBMC);
+      // overlapping engines: three thin lanes inside the compute span
+      var lanes = [TEN,VEC,SCA];
+      for (i=0;i&lt;OPS.length;i++){
+        var b0 = OP0+i*OSTEP, ln = lanes.indexOf(OPS[i].c);
+        if (t&gt;b0){ var x1 = TX+(b0-F0-0.6)*SEC, x2 = TX+(Math.min(b0+ODUR,t)-F0-0.6)*SEC;
+          s += R(x1,820+ln*11.3,Math.max(0,x2-x1),11,2,OPS[i].c); }
+      }
+      s += fseg(820,FW,FEND,t,HBMC) + &#x27;&lt;/g&gt;&#x27;;
+    }
+    // legend
+    s += R(TX,872,22,16,3,LAUNCH)+T(TX+30,887,18,&#x27;launch&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;) +
+         R(TX+130,872,22,16,3,HBMC)+T(TX+160,887,18,&#x27;HBM read / write&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;) +
+         R(TX+340,872,22,16,3,TEN)+R(TX+364,872,22,16,3,VEC)+R(TX+388,872,22,16,3,SCA)+T(TX+418,887,18,&#x27;compute&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
+  }
+
+  // ---- loop: hold the final picture, then play again; click or Space restarts ----
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = FEND + 0.1;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<p class="refs">Code: <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L260-L311"><code>models/fast_dit.py#L260-L311</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L586-L645"><code>#L586-L645</code></a></p>
+<h2>7. Compile best practice: roll the loop</h2>
+<p class="say">Compile the repeated block, not the whole loop: one small graph, compiled once, called for every block.</p>
+<iframe title="anim/compile_rolled.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Roll the loop: compile one block, reuse it&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+  text.m{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;Roll the loop. Left, unrolled: decoder = torch.compile(self.decoder). torch.compile sees the whole decoder including its loop over 14 ResidualBlocks, so it builds all 14 blocks into one graph: 58 minutes to compile, 11.5 to 12.9 seconds per warm decode. Right, rolled: G = torch.compile(block_body). torch.compile sees one block body and builds one graph G; the decoder loop stays plain Python and every block calls G with its own weights: about 3 minutes to compile, 4.4 seconds per warm decode.&quot;&gt;
+  &lt;defs&gt;
+    &lt;marker id=&quot;ar&quot; markerUnits=&quot;userSpaceOnUse&quot; markerWidth=&quot;14&quot; markerHeight=&quot;14&quot; refX=&quot;12&quot; refY=&quot;7&quot; orient=&quot;auto&quot;&gt;&lt;path d=&quot;M0,0 L14,7 L0,14 z&quot; fill=&quot;#ff6b6b&quot;/&gt;&lt;/marker&gt;
+    &lt;marker id=&quot;ag&quot; markerUnits=&quot;userSpaceOnUse&quot; markerWidth=&quot;14&quot; markerHeight=&quot;14&quot; refX=&quot;12&quot; refY=&quot;7&quot; orient=&quot;auto&quot;&gt;&lt;path d=&quot;M0,0 L14,7 L0,14 z&quot; fill=&quot;#4cd6a0&quot;/&gt;&lt;/marker&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+h+&#x27;&quot; rx=&quot;&#x27;+rx+&#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+
+      (stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op,anchor,cls){ return &#x27;&lt;text&#x27;+(cls?&#x27; class=&quot;&#x27;+cls+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27; x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;&#x27;+(anchor||&#x27;middle&#x27;)+&#x27;&quot;&#x27;+
+      &#x27; style=&quot;fill:&#x27;+fill+&#x27;;white-space:pre;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+  function L(x1,y1,x2,y2,col,w){ return &#x27;&lt;line x1=&quot;&#x27;+x1+&#x27;&quot; y1=&quot;&#x27;+y1+&#x27;&quot; x2=&quot;&#x27;+x2+&#x27;&quot; y2=&quot;&#x27;+y2+&#x27;&quot; stroke=&quot;&#x27;+col+&#x27;&quot; stroke-width=&quot;&#x27;+w+&#x27;&quot;/&gt;&#x27;; }
+
+  var RED = &quot;#ff6b6b&quot;, GREEN = &quot;#4cd6a0&quot;, MUTED = &quot;#aab3c5&quot;, GRAY = &quot;#8a93a8&quot;, CODE = &quot;#d6dbe6&quot;;
+  // Measured 2026-11-05, trn2 LNC1, Wan2.2 VAE 368x480x21. Unrolled: commit 1b18e22 VAE_COMPILE=1,
+  // first-run VAE 3476.8 s, warm 12.9 / 11.5 s. Rolled: commit 0ae83b3 VAE_COMPILE_ROLLED=1,
+  // first-run VAE 178.1 s, warm 4.4 / 4.4 s. The decoder has 14 ResidualBlocks (2 middle + 4 x 3).
+  var NB = 14, BW = 41, BH = 34, GAP = 5;
+  var A_L = 0.5, A_R = 6.2, A_SUM = 11.2, END = A_SUM + 1.2;
+
+  // code panel; `cover` = rows inside the dashed &quot;torch.compile sees this&quot; box; loop body rows highlight
+  function code(x, y, lines, cover, col, label, t, aBox, loopOn){
+    var s = R(x, y, 680, 22 + lines.length*32, 10, &#x27;#141a26&#x27;, &#x27;#2a3142&#x27;, 2);
+    for (var i=0;i&lt;lines.length;i++){
+      var ly = y + 34 + i*32;
+      if (loopOn &amp;&amp; i &gt;= 2) s += R(x+8, ly-23, 664, 30, 6, &#x27;rgba(255,255,255,0.10)&#x27;);
+      s += T(x+20, ly, 20, lines[i].replace(/&amp;/g,&#x27;&amp;amp;&#x27;).replace(/&lt;/g,&#x27;&amp;lt;&#x27;), i === 0 ? &#x27;#ffffff&#x27; : CODE, null, &#x27;start&#x27;, &#x27;m&#x27;);
+    }
+    var b = ease(prog(t, aBox, 0.5));
+    if (b &gt; 0){
+      var top = y + 34 + cover[0]*32 - 26, h = (cover[1]-cover[0]+1)*32 + 6;
+      s += &#x27;&lt;g opacity=&quot;&#x27;+b+&#x27;&quot;&gt;&#x27; + R(x+3, top, 674, h, 8, &#x27;none&#x27;, col, 3, &#x27; stroke-dasharray=&quot;12 7&quot;&#x27;) +
+           T(x+676, y-8, 18, label, col, null, &#x27;end&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    }
+    return s;
+  }
+  function box(x, y, txt, fill, stroke, dark){
+    return R(x, y, BW, BH, 6, fill, stroke, 2) + T(x+BW/2, y+23, 15, txt, dark ? &#x27;#0b0d12&#x27; : &#x27;#ffffff&#x27;);
+  }
+
+  function render(t){
+    var s = T(800,56,40,&#x27;Roll the loop: compile one block, reuse it&#x27;,&#x27;#ffffff&#x27;) +
+            T(800,94,22,&#x27;Same Wan2.2 VAE decoder on trn2. The only change is what you put inside torch.compile.&#x27;,MUTED);
+
+    // ===== unrolled =====
+    var l = ease(prog(t,A_L,0.6)), BX = 80;
+    var j = Math.floor((t - A_L - 1.4) / 0.2), loopL = j &gt;= 0 &amp;&amp; j &lt; NB;
+    s += &#x27;&lt;g opacity=&quot;&#x27;+l+&#x27;&quot;&gt;&#x27; + R(40,116,740,534,20,&#x27;rgba(255,255,255,0.03)&#x27;,&#x27;#3a4256&#x27;,2) +
+      T(60,160,28,&#x27;Unrolled&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;) +
+      code(60, 182, [&#x27;decoder = torch.compile(self.decoder)&#x27;, &#x27;out = decoder(x)   # runs decoder.forward:&#x27;, &#x27;  for block in blocks:   # 14 ResidualBlocks&#x27;, &#x27;      x = block(x, cache)&#x27;],
+           [0,3], RED, &#x27;inside torch.compile: all of this&#x27;, t, A_L+0.8, loopL);
+    s += T(BX, 356, 18, &#x27;compile time: torch.compile walks the loop and traces block 1, 2 … 14&#x27;, MUTED, null, &#x27;start&#x27;);
+    for (var i=0;i&lt;NB;i++){
+      var on = loopL &amp;&amp; i === j;
+      s += box(BX + i*(BW+GAP), 366, &#x27;&#x27;+(i+1), on ? RED : &#x27;rgba(255,107,107,0.15)&#x27;, RED, on);
+    }
+    var built = Math.max(0, Math.min(NB, Math.floor((t - A_L - 1.4) / 0.2) + 1));
+    s += T(BX, 506, 18, &#x27;torch.compile builds ONE graph with a copy of all 14&#x27;, MUTED, null, &#x27;start&#x27;);
+    for (var c=0;c&lt;built;c++) s += box(BX + c*(BW+GAP), 446, &#x27;&#x27;+(c+1), &#x27;rgba(255,107,107,0.9)&#x27;, RED, true);
+    s += R(BX-8, 440, NB*(BW+GAP)-GAP+16, BH+12, 10, &#x27;none&#x27;, RED, 2, &#x27; stroke-dasharray=&quot;10 7&quot;&#x27;);
+    var aL = ease(prog(t,A_L+1.2,0.5));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+(l*aL)+&#x27;&quot;&gt;&#x27; + &#x27;&lt;path d=&quot;M738,300 C770,300 770,463 730,463&quot; fill=&quot;none&quot; stroke=&quot;&#x27;+RED+&#x27;&quot; stroke-width=&quot;3&quot; marker-end=&quot;url(#ar)&quot;/&gt;&#x27; +
+         T(752,428,17,&#x27;becomes&#x27;,RED,null,&#x27;end&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    s += T(70,540,20,&#x27;Compile, first run&#x27;,MUTED,null,&#x27;start&#x27;) + R(70,548,640,26,8,&#x27;#141a26&#x27;) + R(70,548,640*built/NB,28,8,RED) +
+         T(70,598,20,&#x27;Warm decode&#x27;,MUTED,null,&#x27;start&#x27;) + R(70,606,640,26,8,&#x27;#141a26&#x27;) +
+         R(70,606,640*(12.2/13)*ease(prog(t,A_L+4.4,0.8)),28,8,RED) + &#x27;&lt;/g&gt;&#x27;;
+    s += T(700,568,21,&#x27;58 min&#x27;,&#x27;#0b0d12&#x27;,ease(prog(t,A_L+4.2,0.4)),&#x27;end&#x27;);
+    s += T(70+640*(12.2/13)-12,626,21,&#x27;11.5–12.9 s&#x27;,&#x27;#0b0d12&#x27;,ease(prog(t,A_L+5.0,0.4)),&#x27;end&#x27;);
+
+    // ===== rolled =====
+    var r = ease(prog(t,A_R,0.6)), BX2 = 860, gOn = t &gt; A_R + 1.3;
+    var done = t &gt;= END - 0.05;   // final frame: every block has called G
+    var k = !done &amp;&amp; t &gt; A_R + 1.9 ? Math.floor(((t - A_R - 1.9) / 0.2) % NB) : -1;
+    s += &#x27;&lt;g opacity=&quot;&#x27;+r+&#x27;&quot;&gt;&#x27; + R(820,116,740,534,20,&#x27;rgba(255,255,255,0.03)&#x27;,&#x27;#3a4256&#x27;,2) +
+      T(840,160,28,&#x27;Rolled&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;) +
+      code(840, 182, [&#x27;G = torch.compile(block_body)&#x27;, &#x27;out = self.decoder(x)   # NOT compiled:&#x27;, &#x27;  for block in blocks:   # 14 ResidualBlocks&#x27;, &#x27;      x = G(x, cache, block.weights)&#x27;],
+           [0,0], GREEN, &#x27;inside torch.compile: only this&#x27;, t, A_R+0.8, k &gt;= 0);
+    s += T(BX2, 356, 18, &#x27;run time: the Python loop calls G for block 1, 2 … 14&#x27;, MUTED, null, &#x27;start&#x27;);
+    for (var i2=0;i2&lt;NB;i2++){
+      var on2 = done || i2 === k;
+      s += box(BX2 + i2*(BW+GAP), 366, &#x27;&#x27;+(i2+1), on2 ? GREEN : &#x27;rgba(76,214,160,0.15)&#x27;, GREEN, on2);
+    }
+    s += T(BX2, 506, 18, &#x27;torch.compile builds ONE block: graph G&#x27;, MUTED, null, &#x27;start&#x27;);
+    if (gOn){
+      s += box(BX2, 446, &#x27;G&#x27;, &#x27;rgba(76,214,160,0.9)&#x27;, GREEN, true) + R(BX2-8, 440, BW+16, BH+12, 10, &#x27;none&#x27;, GREEN, 2, &#x27; stroke-dasharray=&quot;10 7&quot;&#x27;);
+      if (k &gt;= 0) s += L(BX2+BW/2, 446, BX2 + k*(BW+GAP) + BW/2, 366+BH, GREEN, 3);
+      if (done) for (var q=0;q&lt;NB;q++) s += &#x27;&lt;g opacity=&quot;0.45&quot;&gt;&#x27; + L(BX2+BW/2, 446, BX2 + q*(BW+GAP) + BW/2, 366+BH, GREEN, 2) + &#x27;&lt;/g&gt;&#x27;;
+      s += T(BX2+BW+24, 469, 18, &#x27;every block calls G with its own weights&#x27;, GREEN, ease(prog(t,A_R+1.9,0.4)), &#x27;start&#x27;);
+    }
+    var aR = ease(prog(t,A_R+1.1,0.5));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+(r*aR)+&#x27;&quot;&gt;&#x27; + &#x27;&lt;path d=&quot;M842,212 C822,212 822,463 850,463&quot; fill=&quot;none&quot; stroke=&quot;&#x27;+GREEN+&#x27;&quot; stroke-width=&quot;3&quot; marker-end=&quot;url(#ag)&quot;/&gt;&#x27; +
+         T(836,428,17,&#x27;becomes&#x27;,GREEN,null,&#x27;start&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    s += T(850,540,20,&#x27;Compile, first run&#x27;,MUTED,null,&#x27;start&#x27;) + R(850,548,640,26,8,&#x27;#141a26&#x27;) + R(850,548,640*(3/58)*(gOn?1:0),28,8,GREEN) +
+         T(850,598,20,&#x27;Warm decode&#x27;,MUTED,null,&#x27;start&#x27;) + R(850,606,640,26,8,&#x27;#141a26&#x27;) +
+         R(850,606,640*(4.4/13)*ease(prog(t,A_R+2.4,0.8)),28,8,GREEN) + &#x27;&lt;/g&gt;&#x27;;
+    s += T(850+640*(3/58)+14,568,21,&#x27;~3 min&#x27;,GREEN,ease(prog(t,A_R+1.5,0.4)),&#x27;start&#x27;);
+    s += T(850+640*(4.4/13)+14,626,21,&#x27;4.4 s&#x27;,GREEN,ease(prog(t,A_R+3.2,0.4)),&#x27;start&#x27;);
+
+    // ===== summary =====
+    var m = ease(prog(t,A_SUM,0.8));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+m+&#x27;&quot;&gt;&#x27; + R(40,680,1520,180,20,&#x27;rgba(255,255,255,0.04)&#x27;,&#x27;#3a4256&#x27;,3) +
+      T(70,728,27,&#x27;Rolled: compile 58 min → ~3 min, warm decode 11.5–12.9 s → 4.4 s.&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;) +
+      T(70,772,23,&#x27;Put the repeated block inside torch.compile, not the loop. One small graph, called many times.&#x27;,&#x27;#d6dbe6&#x27;,null,&#x27;start&#x27;) +
+      T(70,830,17,&#x27;Measured 2026-11-05, trn2, 368x480x21. Unrolled: commit 1b18e22, VAE_COMPILE=1. Rolled: commit 0ae83b3, VAE_COMPILE_ROLLED=1. Code simplified.&#x27;,GRAY,null,&#x27;start&#x27;) +
+      &#x27;&lt;/g&gt;&#x27;;
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
+  }
+
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = END;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<p class="lbl">Before, unrolled</p>
+<pre><code class="language-python"># animation: decoder = torch.compile(self.decoder)
+decoder = torch.compile(self.decoder, backend=&quot;neuron&quot;, dynamic=False)
+for i in range(iter_):                       # once per latent frame
+    # animation: out = decoder(x)
+    out_ = decoder(x[:, :, i:i + 1],
+                   feat_cache=self._feat_map, feat_idx=self._conv_idx)
+
+class Decoder3d(nn.Module):
+    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        # animation: for block in blocks  (traced: all 14 blocks go into ONE graph)
+        for layer in self.middle:        # 2 ResidualBlocks (+ attention): blocks 1-2
+            x = layer(x, feat_cache, feat_idx)
+        for layer in self.upsamples:     # 4 stages, 3 ResidualBlocks each: blocks 3-14
+            x = layer(x, feat_cache, feat_idx, first_chunk)</code></pre>
+<p class="lbl">After, rolled</p>
+<pre><code class="language-python"># animation: G = torch.compile(block_body)
+_rolled_res_compiled = torch.compile(_rolled_res_unit, backend=&quot;neuron&quot;, dynamic=False)
+
+class Decoder3d(nn.Module):
+    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        # animation: for block in blocks  (unchanged, plain Python, NOT compiled)
+        for layer in self.middle: ...    # blocks 1-2
+        for layer in self.upsamples: ... # blocks 3-14
+
+class ResidualBlock(nn.Module):
+    def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # animation: x = G(x, cache, block.weights)
+        out, n1, n2 = _rolled_res(x, feat_cache[i], feat_cache[i + 1],   # calls G
+                                  r[0].gamma, r[2].weight, r[2].bias, ...)</code></pre>
+<p class="refs">Code: <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/1b18e22/wan/modules/vae2_2.py#L969-L984"><code>#L969-L984</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/1b18e22/wan/modules/vae2_2.py#L836-L847"><code>#L836-L847</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/0ae83b3/wan/modules/vae2_2.py#L340"><code>#L340</code></a>, <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/0ae83b3/wan/modules/vae2_2.py#L895-L905"><code>#L895-L905</code></a></p>
+<h2>8. Compiled, and still slow: profile, then NKI</h2>
+<p class="say">Profile the compiled graph: here the matrix engine sits idle while the softmax runs.</p>
+<p><img src="img/no_nki_dit_engines_timeline.png" alt="compiled DiT block without NKI, Neuron Explorer timeline" style="max-width:100%"></p>
+<p><img src="img/no_nki_dit_sdpa_source_highlight.png" alt="instructions from the native SDPA line highlighted" style="max-width:100%"></p>
+<iframe title="anim/sdpa_softmax_engines.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;title&gt;Native SDPA on the NeuronCore engines&lt;/title&gt;
+&lt;style&gt;
+  html, body { margin: 0; height: 100%; background: #0b0f17; overflow: hidden; }
+  canvas { display: block; margin: 0 auto; }
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;canvas id=&quot;c&quot; width=&quot;1600&quot; height=&quot;900&quot; aria-label=&quot;Animation: one DiT block with native SDPA. For each of 3 attention heads the Tensor engine computes Q times K, then sits idle while Vector computes the row max, Scalar computes exp and Vector computes the row sum, then Tensor multiplies by V. After the three heads, Tensor runs cross-attention and the FFN densely.&quot;&gt;&lt;/canvas&gt;
+&lt;script&gt;
+// One DiT block, native SDPA, no NKI (profile: 1_compiled_no_nki, rank01_dit_56.14ms).
+// Timeline in block milliseconds, simplified from the Neuron Explorer trace: per head, Tensor
+// does QK, then idles while Vector (row max), Scalar (exp), Vector (row sum) run the softmax,
+// then Tensor does P x V. Three heads per core, then O-proj + cross-attention + FFN (dense).
+const cv = document.getElementById(&#x27;c&#x27;), g = cv.getContext(&#x27;2d&#x27;);
+const W = 1600, H = 900;
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * s + &#x27;px&#x27;; cv.style.height = H * s + &#x27;px&#x27;;
+  cv.style.marginTop = (innerHeight - H * s) / 2 + &#x27;px&#x27;;
+}
+addEventListener(&#x27;resize&#x27;, fit); fit();
+
+const C = { tensor: &#x27;#ff6b8b&#x27;, vector: &#x27;#4ade80&#x27;, scalar: &#x27;#facc15&#x27;, dma: &#x27;#60a5fa&#x27;,
+            idle: &#x27;#ef4444&#x27;, text: &#x27;#f1f5f9&#x27;, dim: &#x27;#334155&#x27;, grid: &#x27;#1e293b&#x27; };
+const LANES = [[&#x27;Tensor&#x27;, C.tensor], [&#x27;Vector&#x27;, C.vector], [&#x27;Scalar&#x27;, C.scalar]];
+const BLOCK_MS = 56;
+
+// segments: [lane, start_ms, end_ms, phase]
+// Per head, from the trace: [QK start, softmax start, max-&gt;exp, exp-&gt;sum, PV start, PV end]
+const HD = [[4, 7, 9.7, 12.3, 15, 16.5], [16.5, 18, 20.3, 22.7, 25, 26.5], [26.5, 28, 30, 32, 34, 35.5]];
+const DENSE = 35.5;
+const SEG = [[0, 0, 4, &#x27;qkv&#x27;]];
+HD.forEach(([q, m, e, su, pv, end], h) =&gt; {
+  SEG.push([0, q, m, &#x27;qk&#x27; + h]);
+  SEG.push([1, m, e, &#x27;max&#x27; + h]);
+  SEG.push([2, e, su, &#x27;exp&#x27; + h]);
+  SEG.push([1, su, pv, &#x27;sum&#x27; + h]);
+  SEG.push([0, pv, end, &#x27;pv&#x27; + h]);
+});
+SEG.push([0, DENSE, 56, &#x27;dense&#x27;]);
+// light vector/scalar work during the dense part (norms, gates)
+for (let t = 36.5; t &lt; 56; t += 2.2) { SEG.push([1, t, t + 0.6, &#x27;ew&#x27;]); SEG.push([2, t + 0.9, t + 1.4, &#x27;ew&#x27;]); }
+const IDLE = HD.map(h =&gt; [h[1], h[4]]);   // Tensor idle: 7-15, 18-25, 28-34 ms = 21 ms
+const HEADS = HD.map(h =&gt; h[0]);
+
+const MS_PER_SEC = 2.6;                 // playback speed
+const PLAY = BLOCK_MS / MS_PER_SEC;     // seconds for the sweep
+const HOLD = 5;                         // seconds on the final frame
+const LOOP = PLAY + HOLD;
+
+// layout
+const X0 = 170, X1 = 1540, LANE_Y = 520, LANE_H = 70, LANE_GAP = 22;
+const xOf = ms =&gt; X0 + (X1 - X0) * ms / BLOCK_MS;
+
+function phaseAt(ms) {
+  for (const s of SEG) if (s[3] !== &#x27;ew&#x27; &amp;&amp; ms &gt;= s[1] &amp;&amp; ms &lt; s[2]) return s[3];
+  return ms &gt;= 56 ? &#x27;dense&#x27; : &#x27;qkv&#x27;;
+}
+
+function rr(x, y, w, h, r) { g.beginPath(); g.roundRect(x, y, w, h, r); }
+
+function drawLanes(ms) {
+  g.font = &#x27;bold 34px system-ui, sans-serif&#x27;; g.textBaseline = &#x27;middle&#x27;; g.textAlign = &#x27;right&#x27;;
+  LANES.forEach(([name, col], i) =&gt; {
+    const y = LANE_Y + i * (LANE_H + LANE_GAP);
+    g.fillStyle = C.grid; rr(X0, y, X1 - X0, LANE_H, 10); g.fill();
+    g.fillStyle = col; g.fillText(name, X0 - 18, y + LANE_H / 2);
+  });
+  // idle windows on Tensor (hatched red), once reached
+  IDLE.forEach(([a, b]) =&gt; {
+    if (ms &lt;= a) return;
+    const e = Math.min(ms, b), y = LANE_Y;
+    g.save(); rr(xOf(a), y, xOf(e) - xOf(a), LANE_H, 8); g.clip();
+    g.fillStyle = &#x27;rgba(239,68,68,0.18)&#x27;; g.fillRect(xOf(a), y, xOf(e) - xOf(a), LANE_H);
+    g.strokeStyle = C.idle; g.lineWidth = 6;
+    for (let x = xOf(a) - LANE_H; x &lt; xOf(e); x += 26) { g.beginPath(); g.moveTo(x, y + LANE_H); g.lineTo(x + LANE_H, y); g.stroke(); }
+    g.restore();
+    if (ms &gt;= b) {
+      g.fillStyle = C.idle; g.textAlign = &#x27;center&#x27;; g.font = &#x27;bold 30px system-ui, sans-serif&#x27;;
+      g.fillText(&#x27;idle&#x27;, (xOf(a) + xOf(b)) / 2, y - 24);
+    }
+  });
+  // busy segments up to the playhead
+  for (const [lane, a, b, ph] of SEG) {
+    if (ms &lt;= a) continue;
+    const e = Math.min(ms, b), y = LANE_Y + lane * (LANE_H + LANE_GAP);
+    const col = LANES[lane][1];
+    g.fillStyle = col;
+    if (ph === &#x27;dense&#x27;) {   // dense: many tight instructions
+      for (let t = a; t &lt; e; t += 0.35) g.fillRect(xOf(t), y + 6, Math.max(2, xOf(Math.min(t + 0.28, e)) - xOf(t)), LANE_H - 12);
+    } else if (ph === &#x27;ew&#x27;) {
+      g.globalAlpha = 0.55; g.fillRect(xOf(a), y + 14, xOf(e) - xOf(a), LANE_H - 28); g.globalAlpha = 1;
+    } else {
+      rr(xOf(a) + 1, y + 6, xOf(e) - xOf(a) - 2, LANE_H - 12, 6); g.fill();
+      const w = xOf(e) - xOf(a);
+      const lab = ph.replace(/\d/, &#x27;&#x27;);
+      const word = { qk: &#x27;Q×K&#x27;, pv: &#x27;P×V&#x27;, max: &#x27;max&#x27;, exp: &#x27;exp&#x27;, sum: &#x27;sum&#x27;, qkv: &#x27;&#x27; }[lab];
+      if (word &amp;&amp; w &gt; 40) {
+        g.fillStyle = &#x27;#0b0f17&#x27;; g.textAlign = &#x27;center&#x27;; g.font = &#x27;bold &#x27; + (w &gt; 60 ? 24 : 19) + &#x27;px system-ui, sans-serif&#x27;;
+        g.fillText(word, xOf(a) + w / 2, y + LANE_H / 2);
+      }
+    }
+  }
+  // head brackets
+  g.textAlign = &#x27;center&#x27;; g.font = &#x27;bold 30px system-ui, sans-serif&#x27;;
+  HD.forEach((hd, h) =&gt; {
+    const b = hd[0], bend = hd[5];
+    if (ms &lt; b) return;
+    const a = xOf(b), e = xOf(Math.min(ms, bend));
+    g.strokeStyle = C.text; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(a, LANE_Y - 70); g.lineTo(a, LANE_Y - 82); g.lineTo(e, LANE_Y - 82);
+    if (ms &gt;= bend) g.lineTo(e, LANE_Y - 70);
+    g.stroke();
+    if (ms &gt;= b + 1) { g.fillStyle = C.text; g.fillText(&#x27;head &#x27; + (h + 1), (a + xOf(bend)) / 2, LANE_Y - 108); }
+  });
+  if (ms &gt;= 38) {
+    g.fillStyle = C.tensor; g.font = &#x27;bold 30px system-ui, sans-serif&#x27;;
+    g.fillText(&#x27;cross-attn + FFN&#x27;, (xOf(DENSE) + xOf(56)) / 2, LANE_Y - 108);
+  }
+  // time axis + playhead
+  g.fillStyle = &#x27;#94a3b8&#x27;; g.font = &#x27;24px system-ui, sans-serif&#x27;; g.textAlign = &#x27;center&#x27;;
+  [0, 10, 20, 30, 40, 50, 56].forEach(t =&gt; g.fillText(t + &#x27; ms&#x27;, xOf(t), LANE_Y + 3 * (LANE_H + LANE_GAP) + 12));
+  if (ms &lt; BLOCK_MS) {
+    const x = xOf(ms); g.strokeStyle = C.text; g.lineWidth = 3;
+    g.beginPath(); g.moveTo(x, LANE_Y - 50); g.lineTo(x, LANE_Y + 3 * (LANE_H + LANE_GAP) - LANE_GAP); g.stroke();
+  }
+}
+
+// Score matrix of the current head: 6 rows x 10 keys
+const R = 6, K = 10, MX = 580, MY = 24, CS = 50;
+const vals = []; for (let i = 0; i &lt; R; i++) { vals.push([]); for (let j = 0; j &lt; K; j++) vals[i].push(Math.abs(Math.sin(i * 2.3 + j * 1.3 + i * j * 0.7))); }
+const rowMax = vals.map(r =&gt; r.indexOf(Math.max(...r)));
+
+function frac(ms, a, b) { return Math.max(0, Math.min(1, (ms - a) / (b - a))); }
+
+function drawMatrix(ms) {
+  const ph = phaseAt(ms);
+  if (ph === &#x27;dense&#x27; || ms &gt;= DENSE) {
+    // dense part: show a big matmul tile stream instead of the score matrix
+    g.fillStyle = C.tensor; g.textAlign = &#x27;center&#x27;; g.font = &#x27;bold 44px system-ui, sans-serif&#x27;;
+    for (let i = 0; i &lt; 6; i++) for (let j = 0; j &lt; 12; j++) {
+      const on = ((Math.floor(ms * 6) + i + j) % 3) !== 0;
+      g.globalAlpha = on ? 0.95 : 0.35; rr(MX - 120 + j * 50, MY + i * 50, 42, 42, 6); g.fill();
+    }
+    g.globalAlpha = 1;
+    return;
+  }
+  const h = ph.match(/\d/) ? +ph.match(/\d/)[0] : 0;
+  if (ph === &#x27;qkv&#x27;) return;
+  const [q, m, e, su, pv, end] = HD[h];
+  const tQK = frac(ms, q, m), tMax = frac(ms, m, e), tExp = frac(ms, e, su),
+        tSum = frac(ms, su, pv), tPV = frac(ms, pv, end);
+  const shown = Math.floor(tQK * R * K);
+  for (let i = 0; i &lt; R; i++) for (let j = 0; j &lt; K; j++) {
+    const idx = i * K + j; if (idx &gt;= shown &amp;&amp; tQK &lt; 1) continue;
+    const v = vals[i][j];
+    let col;
+    if (tExp &gt; 0 &amp;&amp; (i + 1) / R &lt;= tExp + 1e-6) col = `rgba(250,204,21,${0.25 + 0.75 * v * v})`;      // exp&#x27;d
+    else col = `rgba(255,107,139,${0.25 + 0.75 * v})`;                                                 // raw scores
+    g.fillStyle = col; rr(MX + j * CS, MY + i * CS, CS - 8, CS - 8, 6); g.fill();
+    if (tMax &gt; 0 &amp;&amp; j === rowMax[i] &amp;&amp; (i + 1) / R &lt;= tMax + 1e-6) {               // row max found
+      g.strokeStyle = C.vector; g.lineWidth = 6; rr(MX + j * CS - 2, MY + i * CS - 2, CS - 4, CS - 4, 8); g.stroke();
+    }
+  }
+  // Vector sweep while computing max / sum
+  const sweep = tMax &gt; 0 &amp;&amp; tMax &lt; 1 ? tMax : (tSum &gt; 0 &amp;&amp; tSum &lt; 1 ? tSum : -1);
+  if (sweep &gt;= 0) {
+    const i = Math.min(R - 1, Math.floor(sweep * R));
+    g.strokeStyle = C.vector; g.lineWidth = 5; rr(MX - 8, MY + i * CS - 6, K * CS + 8, CS + 4, 10); g.stroke();
+  }
+  // row sums bar
+  if (tSum &gt; 0) for (let i = 0; i &lt; R; i++) {
+    if ((i + 1) / R &gt; tSum + 1e-6) continue;
+    const s = vals[i].reduce((a, v) =&gt; a + v * v, 0) / K;
+    g.fillStyle = C.vector; rr(MX + K * CS + 24, MY + i * CS + 8, 40 + 120 * s, CS - 24, 6); g.fill();
+  }
+  // labels
+  g.textAlign = &#x27;right&#x27;; g.font = &#x27;bold 36px system-ui, sans-serif&#x27;;
+  const label = tPV &gt; 0 ? [&#x27;P×V&#x27;, C.tensor] : tSum &gt; 0 ? [&#x27;sum&#x27;, C.vector] : tExp &gt; 0 ? [&#x27;exp&#x27;, C.scalar]
+              : tMax &gt; 0 ? [&#x27;max&#x27;, C.vector] : [&#x27;Q×K&#x27;, C.tensor];
+  g.fillStyle = label[1]; g.fillText(label[0], MX - 30, MY + R * CS / 2);
+  g.textAlign = &#x27;center&#x27;; g.fillStyle = C.text; g.font = &#x27;bold 34px system-ui, sans-serif&#x27;;
+  g.fillText(&#x27;head &#x27; + (h + 1), MX + K * CS / 2, MY + R * CS + 26);
+  if (tPV &gt; 0) { g.globalAlpha = 1 - tPV; g.fillStyle = &#x27;#0b0f17&#x27;; g.fillRect(MX - 10, MY - 10, K * CS + 220, R * CS + 10); g.globalAlpha = 1; }
+}
+
+function draw(t) {
+  g.clearRect(0, 0, W, H);
+  const ms = Math.min(BLOCK_MS, t * MS_PER_SEC);
+  drawMatrix(ms);
+  drawLanes(ms);
+  if (t &gt;= PLAY) {   // final: total Tensor idle
+    g.textAlign = &#x27;center&#x27;; g.fillStyle = C.idle; g.font = &#x27;bold 46px system-ui, sans-serif&#x27;;
+    g.fillText(&#x27;Tensor idle ≈ 21 ms of 56&#x27;, W / 2, H - 28);
+  }
+}
+
+const params = new URLSearchParams(location.hash.slice(1));
+const reduce = matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+let t0 = 0, running = false;
+// plays once, only after a click (or Space); holds the last frame; another click replays it
+function tick(now) {
+  const t = Math.max(0, (now - t0) / 1000);
+  if (t &gt;= PLAY + 0.1) { draw(PLAY + 0.1); running = false; return; }
+  draw(t); requestAnimationFrame(tick);
+}
+function start() { t0 = performance.now(); if (!running) { running = true; requestAnimationFrame(tick); } }
+if (params.has(&#x27;t&#x27;)) draw(+params.get(&#x27;t&#x27;));
+else if (reduce) draw(PLAY + 0.1);
+else { draw(0); addEventListener(&#x27;click&#x27;, start); addEventListener(&#x27;keydown&#x27;, e =&gt; { if (e.code === &#x27;Space&#x27;) { e.preventDefault(); start(); } }); }
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<p class="say">Replace the hot op with an NKI kernel that keeps the engines busy.</p>
+<pre><code class="language-python">from nkilib.core.attention.attention_cte import attention_cte
+
+def _cte(q, k, v):
+    qn = q.permute(0, 2, 1, 3).reshape(B * n, Lq, d)
+    kn = k.permute(0, 2, 3, 1).reshape(B * n, d, Lk)
+    vn = v.permute(0, 2, 1, 3).reshape(B * n, Lk, d)
+    return attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)</code></pre>
+<p><img src="img/kernels_dit_attention_cte_timeline.png" alt="attention_cte inside the DiT block, Neuron Explorer timeline" style="max-width:100%"></p>
+<p class="refs">Code: <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L228-L241"><code>models/fast_dit.py#L228-L241</code></a></p>
+<h2>9. World model: attention over the KV cache</h2>
+<p class="say">Read each KV chunk in place and merge the partial results, instead of copying the cache on every attention call.</p>
+<iframe title="anim/cte_merge.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Attention over the KV cache&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+  text.m{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;Both paths produce the same output; only space and time differ. Before: on every attention call the cache chunks are copied into a new zero-padded buffer in HBM, and one attention call reads it; the extra HBM written grows call after call. After: one call per chunk reads the cache in place, the small partial results merge exactly into the same output, and no extra HBM is written.&quot;&gt;
+  &lt;defs&gt;
+    &lt;pattern id=&quot;hatch&quot; width=&quot;10&quot; height=&quot;10&quot; patternUnits=&quot;userSpaceOnUse&quot; patternTransform=&quot;rotate(45)&quot;&gt;
+      &lt;rect width=&quot;10&quot; height=&quot;10&quot; fill=&quot;#2a2f3b&quot;/&gt;&lt;line x1=&quot;0&quot; y1=&quot;0&quot; x2=&quot;0&quot; y2=&quot;10&quot; stroke=&quot;#ff6b6b&quot; stroke-width=&quot;3&quot;/&gt;
+    &lt;/pattern&gt;
+    &lt;marker id=&quot;aw&quot; markerUnits=&quot;userSpaceOnUse&quot; markerWidth=&quot;14&quot; markerHeight=&quot;14&quot; refX=&quot;12&quot; refY=&quot;7&quot; orient=&quot;auto&quot;&gt;&lt;path d=&quot;M0,0 L14,7 L0,14 z&quot; fill=&quot;#d6dbe6&quot;/&gt;&lt;/marker&gt;
+    &lt;marker id=&quot;ag&quot; markerUnits=&quot;userSpaceOnUse&quot; markerWidth=&quot;14&quot; markerHeight=&quot;14&quot; refX=&quot;12&quot; refY=&quot;7&quot; orient=&quot;auto&quot;&gt;&lt;path d=&quot;M0,0 L14,7 L0,14 z&quot; fill=&quot;#4cd6a0&quot;/&gt;&lt;/marker&gt;
+  &lt;/defs&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+h+&#x27;&quot; rx=&quot;&#x27;+rx+&#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+
+      (stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op,anchor,cls){ return &#x27;&lt;text&#x27;+(cls?&#x27; class=&quot;&#x27;+cls+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27; x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;&#x27;+(anchor||&#x27;start&#x27;)+&#x27;&quot;&#x27;+
+      &#x27; style=&quot;fill:&#x27;+fill+&#x27;;white-space:pre;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+  function A(x1,y1,x2,y2,col,mk,op){ return &#x27;&lt;path d=&quot;M&#x27;+x1+&#x27;,&#x27;+y1+&#x27; L&#x27;+x2+&#x27;,&#x27;+y2+&#x27;&quot; stroke=&quot;&#x27;+col+&#x27;&quot; stroke-width=&quot;3&quot; fill=&quot;none&quot; marker-end=&quot;url(#&#x27;+mk+&#x27;)&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+
+  var MUTED = &quot;#aab3c5&quot;, RED = &quot;#ff6b6b&quot;, GREEN = &quot;#4cd6a0&quot;, KERN = &quot;#ffcc33&quot;;
+  var CH = [{n:&#x27;sink&#x27;, w:100, c:&#x27;#8a93a8&#x27;}, {n:&#x27;chunk 1&#x27;, w:190, c:&#x27;#3d9bff&#x27;}, {n:&#x27;chunk 2&#x27;, w:190, c:&#x27;#b48cff&#x27;}, {n:&#x27;chunk 3&#x27;, w:150, c:&#x27;#ff9f43&#x27;}];
+  var X0 = 90, GAP = 16, H = 50, TILE = 240;          // TILE: one kernel K tile (512 keys), drawn to scale with the chunks
+  function cx(i){ var x = X0; for (var k=0;k&lt;i;k++) x += CH[k].w + GAP; return x; }   // in the cache: separate tensors
+  function bxp(i){ var x = X0; for (var k=0;k&lt;i;k++) x += CH[k].w; return x; }        // in the buffer: packed end to end
+  var USED = bxp(CH.length) - X0, FULL = Math.ceil(USED / TILE) * TILE;
+  var B0 = 0.6, A0 = 9.4, END = 15.8;
+
+  function chunks(y, lit){
+    var s = &#x27;&#x27;;
+    for (var i=0;i&lt;CH.length;i++){
+      var on = lit === i;
+      s += R(cx(i), y, CH[i].w, H, 8, on ? CH[i].c : &#x27;rgba(255,255,255,0.06)&#x27;, CH[i].c, on ? 4 : 2) +
+           T(cx(i)+CH[i].w/2, y+32, 19, CH[i].n, on ? &#x27;#0b0d12&#x27; : &#x27;#ffffff&#x27;, null, &#x27;middle&#x27;);
+    }
+    return s;
+  }
+  // HBM usage bar: the cache (its chunks, to scale) plus, in Before, the per-call copy and its padding
+  var MS = 0.18;
+  // extra HBM written: starts empty; every attention call adds one copy of the cache plus its zero padding
+  var MW = 250, SEG = MW / 3;
+  function hbm(x, y, done, copyP, padP){
+    var s = T(x, y-10, 18, &#x27;HBM written&#x27;, MUTED) + R(x, y, MW, 30, 4, &#x27;rgba(255,255,255,0.04)&#x27;, &#x27;#5a6070&#x27;, 2);
+    var cw = SEG * USED / FULL, pw = SEG - cw;
+    for (var i=0;i&lt;done;i++){ s += R(x+i*SEG, y, cw, 30, 0, &#x27;#ffb347&#x27;, &#x27;#0b0d12&#x27;, 1) + R(x+i*SEG+cw, y, pw, 30, 0, &#x27;url(#hatch)&#x27;, RED, 1); }
+    if (copyP &gt; 0) s += R(x+done*SEG, y, cw*copyP, 30, 0, &#x27;#ffb347&#x27;, &#x27;#0b0d12&#x27;, 1);
+    if (padP &gt; 0) s += R(x+done*SEG+cw, y, pw*padP, 30, 0, &#x27;url(#hatch)&#x27;, RED, 1);
+    return s;
+  }
+  function hbmAfter(x, y, calls){
+    var s = T(x, y-10, 18, &#x27;HBM written&#x27;, MUTED) + R(x, y, MW, 30, 4, &#x27;rgba(255,255,255,0.04)&#x27;, &#x27;#5a6070&#x27;, 2), sw = MW / 4 / CH.length;
+    for (var i=0;i&lt;calls;i++) s += R(x + i*sw, y, sw, 30, 0, CH[i].c, &#x27;#0b0d12&#x27;, 1);
+    return s;
+  }
+  function panel(y, h, title, col, code){
+    return R(30, y, 1540, h, 20, &#x27;rgba(255,255,255,0.03)&#x27;, &#x27;#3a4256&#x27;, 2) + T(60, y+46, 30, title, col) +
+           T(200, y+46, 21, code, &#x27;#d6dbe6&#x27;, null, &#x27;start&#x27;, &#x27;m&#x27;);
+  }
+
+  function render(t){
+    var s = &#x27;&#x27;;
+
+    // ================= BEFORE =================
+    // every attention call rebuilds the buffer from scratch: copy the cache, pad, then the kernel reads the copy
+    var Y = 30, yc = Y+100, yb = Y+260, C = 2.4, NCALL = 3;
+    s += panel(Y, 410, &#x27;Before&#x27;, RED, &#x27;out = attention_cte(q, pad(cat(chunks)))&#x27;);
+    var tc = t - B0, call = Math.min(NCALL - 1, Math.max(0, Math.floor(tc / C))), u = tc - call*C;
+    var last = tc &gt;= NCALL*C; if (last) u = C - 0.01;
+    s += T(X0, yc-14, 18, &#x27;KV cache (HBM)&#x27;, MUTED) + T(X0, yb-26, 18, &#x27;new buffer (HBM)&#x27;, MUTED);
+    var lit = -1;
+    for (var i=0;i&lt;CH.length;i++) if (tc &gt;= 0 &amp;&amp; u &gt;= i*0.3 &amp;&amp; u &lt; i*0.3 + 0.5 &amp;&amp; !last) lit = i;
+    s += chunks(yc, lit);
+    s += T(cx(CH.length)+20, yc+33, 26, &#x27;copied on every attention call&#x27;, &#x27;#ffb347&#x27;, ease(prog(t, B0+0.2, 0.5)));
+    if (tc &gt;= 0) s += T(1520, Y+46, 24, &#x27;attention call &#x27; + (call + 1), &#x27;#ffffff&#x27;, null, &#x27;end&#x27;);
+    for (var j=0;j&lt;CH.length;j++){
+      var p = tc &lt; 0 ? 0 : ease(clamp((u - j*0.3) / 0.5));
+      if (p &lt;= 0) continue;
+      var x = lerp(cx(j), bxp(j), p), y = lerp(yc, yb, p);
+      s += R(x, y, CH[j].w, H, 0, CH[j].c, &#x27;#0b0d12&#x27;, 1) + T(x+CH[j].w/2, y+32, 19, CH[j].n, &#x27;#0b0d12&#x27;, null, &#x27;middle&#x27;);
+    }
+    var tl = ease(prog(t, B0 + 1.2, 0.5));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+tl+&#x27;&quot;&gt;&#x27;;
+    for (var k=0;k&lt;=FULL/TILE;k++) s += &#x27;&lt;line x1=&quot;&#x27;+(X0+k*TILE)+&#x27;&quot; y1=&quot;&#x27;+(yb-14)+&#x27;&quot; x2=&quot;&#x27;+(X0+k*TILE)+&#x27;&quot; y2=&quot;&#x27;+(yb+H+14)+&#x27;&quot; stroke=&quot;#d6dbe6&quot; stroke-width=&quot;2&quot; stroke-dasharray=&quot;6 5&quot;/&gt;&#x27;;
+    for (var k2=0;k2&lt;FULL/TILE;k2++) s += T(X0+k2*TILE+TILE/2, yb+H+36, 18, &#x27;tile&#x27;, MUTED, null, &#x27;middle&#x27;);
+    s += &#x27;&lt;/g&gt;&#x27;;
+    var pz = tc &lt; 0 ? 0 : ease(clamp((u - 1.2) / 0.3));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+pz+&#x27;&quot;&gt;&#x27; + R(X0+USED, yb, FULL-USED, H, 0, &#x27;url(#hatch)&#x27;, RED, 3) +
+         T(X0+USED+(FULL-USED)/2, yb+33, 22, &#x27;0&#x27;, &#x27;#ffffff&#x27;, null, &#x27;middle&#x27;) +
+         &#x27;&lt;/g&gt;&#x27;;
+    var KX = 1270, kr = tc &lt; 0 ? 0 : ease(clamp((u - 1.6) / 0.3));
+    var cp = tc &lt; 0 ? 0 : clamp(u / 1.2);
+    s += last ? hbm(1270, Y+120, NCALL, 0, 0) : hbm(1270, Y+120, tc &lt; 0 ? 0 : call, cp, pz);
+    s += R(KX, yb-14, 250, 78, 12, &#x27;rgba(255,204,51,0.15)&#x27;, KERN, 3) + T(KX+125, yb+33, 23, &#x27;attention_cte&#x27;, KERN, null, &#x27;middle&#x27;);
+    s += A(X0+FULL+40, yb+H/2, KX-8, yb+H/2, &#x27;#d6dbe6&#x27;, &#x27;aw&#x27;, kr);
+    var ko = tc &lt; 0 ? 0 : (last ? 1 : ease(clamp((u - 1.9) / 0.3)));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+ko+&#x27;&quot;&gt;&#x27; + A(KX+125, yb+66, KX+125, yb+96, GREEN, &#x27;ag&#x27;) + R(KX+75, yb+100, 100, 40, 8, GREEN, GREEN, 2) +
+         T(KX+125, yb+127, 20, &#x27;out&#x27;, &#x27;#0b0d12&#x27;, null, &#x27;middle&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    // the kernel could have read the cache where it was
+    var gh = ease(prog(t, B0 + NCALL*C, 0.6));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+gh+&#x27;&quot;&gt;&#x27; + &#x27;&lt;path d=&quot;M&#x27;+(cx(CH.length)-GAP+6)+&#x27;,&#x27;+(yc+H/2+40)+&#x27; C1100,&#x27;+(yc+60)+&#x27; 1300,&#x27;+(yc+40)+&#x27; &#x27;+(KX+125)+&#x27;,&#x27;+(yb-20)+&#x27;&quot; stroke=&quot;&#x27;+GREEN+&#x27;&quot; stroke-width=&quot;3&quot; stroke-dasharray=&quot;10 8&quot; fill=&quot;none&quot; marker-end=&quot;url(#ag)&quot;/&gt;&#x27; +
+         T(980, yc+118, 22, &#x27;could read here&#x27;, GREEN) + &#x27;&lt;/g&gt;&#x27;;
+
+    // ================= AFTER =================
+    var Y2 = 460, yc2 = Y2+90, yk = Y2+190, yp = Y2+270;
+    var a = ease(prog(t, A0-0.5, 0.6));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+a+&#x27;&quot;&gt;&#x27; + panel(Y2, 410, &#x27;After&#x27;, GREEN, &#x27;for chunk in cache:  partial = attention_cte(q, chunk)&#x27;);
+    var cur = -1;
+    for (var q=0;q&lt;CH.length;q++) if (t &gt;= A0 + q*0.8 &amp;&amp; t &lt; A0 + 0.8 + q*0.8) cur = q;
+    s += T(X0, yc2-14, 18, &#x27;KV cache (HBM)&#x27;, MUTED) + chunks(yc2, cur);
+    s += T(cx(CH.length)+20, yc2+33, 22, &#x27;no copy, no padding&#x27;, GREEN, ease(prog(t, A0+0.4, 0.5)));
+    var callsDone = 0; for (var cc=0;cc&lt;CH.length;cc++) if (t &gt;= A0 + cc*0.8 + 0.3) callsDone = cc + 1;
+    s += hbmAfter(1270, Y2+120, callsDone);
+    for (var r=0;r&lt;CH.length;r++){
+      var on = ease(prog(t, A0 + r*0.8, 0.4)), mid = cx(r) + CH[r].w/2;
+      if (on &lt;= 0) continue;
+      s += &#x27;&lt;g opacity=&quot;&#x27;+on+&#x27;&quot;&gt;&#x27; + A(mid, yc2+H+4, mid, yk-4, KERN, &#x27;aw&#x27;) +
+        R(mid-62, yk, 124, 40, 10, r === cur ? KERN : &#x27;rgba(255,204,51,0.15)&#x27;, KERN, 2) +
+        T(mid, yk+26, 15, &#x27;attention_cte&#x27;, r === cur ? &#x27;#0b0d12&#x27; : KERN, null, &#x27;middle&#x27;) +
+        A(mid, yk+42, mid, yp-4, GREEN, &#x27;ag&#x27;) + R(mid-22, yp, 44, 28, 6, &#x27;rgba(76,214,160,0.35)&#x27;, GREEN, 2) + &#x27;&lt;/g&gt;&#x27;;
+    }
+    var mOn = ease(prog(t, A0 + 3.6, 0.6)), MX = 1120, MY = yk - 4, BUS = yp + 70;
+    s += &#x27;&lt;g opacity=&quot;&#x27;+mOn+&#x27;&quot;&gt;&#x27;;
+    for (var r2=0;r2&lt;CH.length;r2++){ var m2 = cx(r2) + CH[r2].w/2; s += &#x27;&lt;path d=&quot;M&#x27;+m2+&#x27;,&#x27;+(yp+30)+&#x27; L&#x27;+m2+&#x27;,&#x27;+BUS+&#x27;&quot; stroke=&quot;&#x27;+GREEN+&#x27;&quot; stroke-width=&quot;2.5&quot; fill=&quot;none&quot;/&gt;&#x27;; }
+    s += &#x27;&lt;path d=&quot;M&#x27;+(cx(0)+CH[0].w/2)+&#x27;,&#x27;+BUS+&#x27; L&#x27;+(MX+120)+&#x27;,&#x27;+BUS+&#x27;&quot; stroke=&quot;&#x27;+GREEN+&#x27;&quot; stroke-width=&quot;2.5&quot; fill=&quot;none&quot;/&gt;&#x27; + A(MX+120, BUS, MX+120, MY+86, GREEN, &#x27;ag&#x27;) +
+         R(MX, MY, 240, 80, 12, &#x27;rgba(76,214,160,0.18)&#x27;, GREEN, 3) + T(MX+120, MY+36, 24, &#x27;merge&#x27;, GREEN, null, &#x27;middle&#x27;) +
+         T(MX+120, MY+64, 18, &#x27;exact&#x27;, MUTED, null, &#x27;middle&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    var oOn = ease(prog(t, A0 + 4.4, 0.5));
+    s += &#x27;&lt;g opacity=&quot;&#x27;+oOn+&#x27;&quot;&gt;&#x27; + A(MX+242, MY+40, MX+286, MY+40, GREEN, &#x27;ag&#x27;) + R(MX+290, MY+20, 100, 40, 8, GREEN, GREEN, 2) +
+         T(MX+340, MY+47, 20, &#x27;out&#x27;, &#x27;#0b0d12&#x27;, null, &#x27;middle&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    s += &#x27;&lt;/g&gt;&#x27;;
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
+  }
+
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = END;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t &gt;= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener(&#x27;click&#x27;, start);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){ if (ev.code===&#x27;Space&#x27;){ ev.preventDefault(); start(); } });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<p class="lbl">Before</p>
+<pre><code class="language-python"># animation: new buffer (HBM), zero-filled, padded up to the tile edge
+lkv_p = lkv + (KV_ALIGN - lkv % KV_ALIGN) % KV_ALIGN
+k_c = q.new_zeros((n, lkv_p, d), dtype=dtype)
+v_c = q.new_zeros((n, lkv_p, d), dtype=dtype)
+
+# animation: copy sink, chunk 1, 2, 3 into it -- on every attention call
+off = 0
+for kc, vc in zip(k_chunks, v_chunks):
+    L = int(kc.shape[1])
+    k_c[:, off:off + L] = kc[0].permute(1, 0, 2).to(dtype)
+    v_c[:, off:off + L] = vc[0].permute(1, 0, 2).to(dtype)
+    off += L
+
+# animation: ONE attention_cte call over the whole buffer -&gt; out
+out = _attention_cte(q_c, k_c, v_c, scale=1.0, causal_mask=False,
+                     tp_q=True, tp_k=True, tp_out=False)</code></pre>
+<p class="lbl">After</p>
+<pre><code class="language-python"># animation: for chunk in KV cache (HBM) -- one call per chunk, read in place
+for kc, vc in zip(k_chunks, v_chunks):
+    o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, ...,
+                                   cache_softmax=True, skip_output_normalization=True)
+    outs.append(o)                    # animation: partial (unnormalized output)
+    maxs.append(-neg_max.float())     #   + its row max
+    sums.append(s.float())            #   + its row sum
+
+# animation: merge -- rescale each partial by the max, add up, divide (exact)
+m_all = maxs[0]
+for m in maxs[1:]:
+    m_all = torch.maximum(m_all, m)
+w = [torch.exp(m - m_all) for m in maxs]
+out = sum(wc * o for wc, o in zip(w, outs)) / sum(wc * sc for wc, sc in zip(w, sums))</code></pre>
+<p class="refs">Code: <a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/wan/modules/attention.py#L436-L455"><code>attention.py#L436-L455</code></a>, <a href="https://github.com/yahavb/lingbot-world-v2/blob/a12e766/wan/modules/attention.py#L652-L682"><code>attention.py#L652-L682</code></a></p>
+<h2>10. Scale across devices: TP, then CP</h2>
+<p class="say">Use TP inside a device until the heads stop splitting, then CP across devices.</p>
+<iframe title="anim/tp_then_cp.html" srcdoc="&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;
+&lt;title&gt;Tensor parallel first, then context parallel&lt;/title&gt;
+&lt;style&gt;
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,&quot;Segoe UI&quot;,Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
+     aria-label=&quot;The DiT has 40 attention heads and a device holds 4 ranks. TP4: 10 heads per rank, the gather stays inside one device, but devices 2 to 8 sit idle. TP8: 5 heads per rank, but the per-block gather of activations crosses devices. TP16, 32, 64: the heads do not split. TP4 times CP8: tensor parallel inside each device, and the tokens split eight ways across the eight devices; only attention exchanges keys and values between devices.&quot;&gt;
+  &lt;rect width=&quot;1600&quot; height=&quot;900&quot; fill=&quot;#0b0d12&quot;/&gt;
+  &lt;g id=&quot;dyn&quot;&gt;&lt;/g&gt;
+&lt;/svg&gt;
+&lt;script&gt;
+(function(){
+  &quot;use strict&quot;;
+  function clamp(x){ return x&lt;0?0:x&gt;1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p&lt;.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return &#x27;&lt;rect x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; width=&quot;&#x27;+Math.max(0,w)+&#x27;&quot; height=&quot;&#x27;+Math.max(0,h)+&#x27;&quot; rx=&quot;&#x27;+rx+&#x27;&quot; fill=&quot;&#x27;+fill+&#x27;&quot;&#x27;+(stroke?&#x27; stroke=&quot;&#x27;+stroke+&#x27;&quot; stroke-width=&quot;&#x27;+sw+&#x27;&quot;&#x27;:&#x27;&#x27;)+(extra||&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+  function T(x,y,s,txt,fill,op,anchor){ return &#x27;&lt;text x=&quot;&#x27;+x+&#x27;&quot; y=&quot;&#x27;+y+&#x27;&quot; font-size=&quot;&#x27;+s+&#x27;&quot; text-anchor=&quot;&#x27;+(anchor||&#x27;middle&#x27;)+&#x27;&quot; style=&quot;fill:&#x27;+fill+&#x27;;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;&gt;&#x27;+txt+&#x27;&lt;/text&gt;&#x27;; }
+  function L(x1,y1,x2,y2,col,w,op){ return &#x27;&lt;line x1=&quot;&#x27;+x1+&#x27;&quot; y1=&quot;&#x27;+y1+&#x27;&quot; x2=&quot;&#x27;+x2+&#x27;&quot; y2=&quot;&#x27;+y2+&#x27;&quot; stroke=&quot;&#x27;+col+&#x27;&quot; stroke-width=&quot;&#x27;+w+&#x27;&quot;&#x27;+(op!=null?&#x27; opacity=&quot;&#x27;+op+&#x27;&quot;&#x27;:&#x27;&#x27;)+&#x27;/&gt;&#x27;; }
+
+  var WCOL = &quot;#3d9bff&quot;, TCOL = &quot;#ffcc33&quot;, KV = &quot;#ff9f43&quot;, MUTED = &quot;#aab3c5&quot;, GHOST = &quot;#232937&quot;;
+  var NT = 8;                                    // tokens of the video (illustrative)
+  // the three steps: ranks, TP size, CP size
+  var HEADS = 40, PERDEV = 4;                    // LingBot DiT: 40 attention heads; 4 ranks per device at LNC2
+  var STEPS = [
+    {name:&#x27;TP4&#x27;,       ranks:4, tp:4,  cp:1, cap:&#x27;TP4: 10 heads per rank, the gather stays inside one device&#x27;},
+    {name:&#x27;TP8&#x27;,       ranks:8, tp:8,  cp:1, cap:&#x27;TP8: 5 heads per rank, but the gather crosses devices every block&#x27;},
+    {name:&#x27;TP16&#x27;,      ranks:0, tp:16, cp:1, cap:&#x27;TP stops at 8; to use more devices we need another split&#x27;},
+    {name:&#x27;TPx × CPy&#x27;, ranks:8, tp:4,  cp:2, cap:&#x27;back to TP4, and add CP: each device takes a slice of the tokens&#x27;},
+    {name:&#x27;TP4 × CP8&#x27;, ranks:8, tp:4,  cp:8, cap:&#x27;CP: each device takes a slice of the tokens; only attention exchanges K/V&#x27;},
+    {name:&#x27;TP2 × CP16&#x27;, ranks:8, tp:2, cp:16, nt:16, cap:&#x27;TP2 × CP16: 20 heads per rank, 32 ranks on 8 devices: it fits&#x27;},
+    {name:&#x27;TP4 × CP8&#x27;, ranks:8, tp:4,  cp:8, final:true, cap:&#x27;so back to TP4 × CP8: TP inside each device, CP across the 8 devices, the fastest&#x27;}
+  ];
+  var DUR = 9.0, END = STEPS.length*DUR + 0.5;
+  var RW = 150, RH = 320, GAP = 18, GGAP = 140, Y0 = 220;
+
+  function rankX(st, i){
+    var nd = Math.ceil(st.ranks / PERDEV), d = Math.floor(i / PERDEV);
+    var total = st.ranks*RW + (st.ranks - nd)*GAP + (nd - 1)*GGAP;
+    return 800 - total/2 + i*(RW+GAP) - d*GAP + d*GGAP;
+  }
+
+  // half a trn3 = 8 devices; the ones this layout uses are lit, the rest sit idle
+  function strip(lit, op, label, link){
+    var w = 120, g = 22, x0 = 800 - (8*w + 7*g)/2, y = 670;
+    var s = &#x27;&lt;g opacity=&quot;&#x27;+op+&#x27;&quot;&gt;&#x27; + T(800, 782, 22, label, MUTED);
+    // the device drawn above IS the first box here
+    if (link) s += L(800, 592, x0 + w/2, y - 4, WCOL, 3);
+    for (var i=0;i&lt;8;i++){
+      var on = i &lt; lit, x = x0 + i*(w+g);
+      s += R(x, y, w, 76, 12, on ? &#x27;rgba(61,155,255,0.35)&#x27; : &#x27;rgba(255,255,255,0.03)&#x27;, on ? WCOL : &#x27;#3a4256&#x27;, on ? 3 : 2) +
+           T(x+w/2, y+32, 19, &#x27;device &#x27; + (i+1), on ? &#x27;#ffffff&#x27; : &#x27;#8a93a8&#x27;) +
+           T(x+w/2, y+60, 18, on ? &#x27;in use&#x27; : &#x27;idle&#x27;, on ? WCOL : &#x27;#5a6070&#x27;);
+    }
+    return s + &#x27;&lt;/g&gt;&#x27;;
+  }
+  function scene(st, t0, t){
+    var s = &#x27;&#x27;, lt = t - t0, gs = [];
+    if (st.ranks === 0){
+      var rows = [[&#x27;TP16&#x27;, &#x27;40 heads ÷ 16 = 2.5&#x27;], [&#x27;TP32&#x27;, &#x27;40 heads ÷ 32 = 1.25&#x27;], [&#x27;TP64&#x27;, &#x27;40 heads ÷ 64 = 0.625&#x27;]], o = &#x27;&#x27;;
+      for (var r=0;r&lt;rows.length;r++){
+        var op = ease(prog(lt, 0.2 + r*0.5, 0.3)), y = 260 + r*120;
+        o += &#x27;&lt;g opacity=&quot;&#x27;+op+&#x27;&quot;&gt;&#x27; + T(560, y, 44, rows[r][0], MUTED, null, &#x27;end&#x27;) + T(600, y, 52, rows[r][1], &#x27;#ffffff&#x27;, null, &#x27;start&#x27;) +
+             T(1260, y, 52, &#x27;✗&#x27;, &#x27;#ff6b6b&#x27;, null, &#x27;start&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+      }
+      return o + T(800, 640, 30, &#x27;past TP8 a rank would get a fraction of a head&#x27;, &#x27;#ff6b6b&#x27;, ease(prog(lt, 1.8, 0.4)));
+    }
+    // devices: dashed outline around every 4 ranks
+    for (var d=0; d&lt;Math.ceil(st.ranks/PERDEV); d++){
+      var dx1 = rankX(st, d*PERDEV) - 14, dx2 = rankX(st, d*PERDEV + PERDEV - 1) + RW + 14;
+      var more = &#x27;&#x27;;
+      s += R(dx1, Y0-12, dx2-dx1, RH+24, 16, &#x27;none&#x27;, &#x27;#5a6070&#x27;, 2, &#x27; stroke-dasharray=&quot;10 7&quot;&#x27;) + T((dx1+dx2)/2, Y0+RH+46, 20, &#x27;device &#x27; + (d+1) + more, MUTED);
+    }
+    for (var g=0; g&lt;st.cp; g++) gs.push(g);
+    // one TP group = one gather bar above its ranks
+    for (var g2=0; g2&lt;st.ranks/st.tp; g2++){
+      var x1 = rankX(st, g2*st.tp), x2 = rankX(st, g2*st.tp + st.tp - 1) + RW;
+      var pulse = 0.4 + 0.6*Math.abs(Math.sin(lt*3));
+      s += L(x1+10, Y0-26, x2-10, Y0-26, WCOL, 5, ease(prog(lt, 0.4, 0.3))*pulse);
+      if (st.tp &gt; PERDEV){
+        var cx1 = rankX(st, PERDEV-1) + RW, cx2 = rankX(st, PERDEV);
+        s += L(cx1-6, Y0-26, cx2+6, Y0-26, &#x27;#ff6b6b&#x27;, 8, ease(prog(lt, 0.8, 0.3))) + T((cx1+cx2)/2, Y0-40, 18, &#x27;per-block gather of activations&#x27;, &#x27;#ff6b6b&#x27;, ease(prog(lt, 0.8, 0.3)));
+      }
+    }
+    s += T(800, Y0-80, 24, &#x27;TP gather, every block&#x27;, WCOL, ease(prog(lt, 0.4, 0.3)));
+    for (var i=0;i&lt;st.ranks;i++){
+      var x = rankX(st, i), g3 = Math.floor(i / st.tp), slice = i % st.tp;
+      s += R(x, Y0, RW, RH, 12, &#x27;rgba(255,255,255,0.03)&#x27;, &#x27;#3a4256&#x27;, 2) + T(x+RW/2, Y0+30, 18, &#x27;rank &#x27; + (i+1), MUTED);
+      // weights: the full matrix, this rank&#x27;s slice lit
+      var wy = Y0 + 50, wh = 130, sw = (RW-30) / st.tp;
+      s += T(x+RW/2, wy+wh+24, 17, (HEADS/st.tp) + &#x27; heads&#x27;, WCOL);
+      for (var k=0;k&lt;st.tp;k++) s += R(x+15 + k*sw, wy, sw-2, wh, 2, k === slice ? WCOL : GHOST);
+      // tokens: the ones this rank processes are lit
+      var nt = st.nt || NT, ty = Y0 + 218, ts = Math.min(15, (RW-30) / nt);
+      s += T(x+RW/2, ty+42, 17, &#x27;tokens&#x27;, TCOL);
+      for (var n=0;n&lt;nt;n++){
+        var mine = st.cp === 1 ? true : (Math.floor(n / (nt/st.cp)) === g3);
+        var was = st.cp === 8 &amp;&amp; !st.final ? (Math.floor(n / (nt/2)) === g3) : !st.final;          // CP8 starts from the CP2 split
+        var lit = mine ? 1 : (st.cp &gt; 1 ? (was ? 1 - ease(prog(lt, 0.3, 0.7)) : 0) : 1);
+        s += R(x+15 + n*ts, ty, ts-2, 20, 2, GHOST) + R(x+15 + n*ts, ty, ts-2, 20, 2, TCOL, null, 0, &#x27; opacity=&quot;&#x27;+lit+&#x27;&quot;&#x27;);
+      }
+      // K/V this rank must receive from the other CP groups, every attention layer (same scale in every step)
+      if (st.cp &gt; 1){
+        var kin = (HEADS/st.tp) * (1 - 1/st.cp), kmax = (HEADS/2) * (15/16), kc = st.cp === 16 ? &#x27;#ff3b3b&#x27; : &#x27;#ffb347&#x27;;
+        var kp = ease(prog(lt, st.cp === 16 ? 1.8 : 1.2, 0.6));
+        s += R(x+15, Y0+268, RW-30, 16, 4, GHOST) + R(x+15, Y0+268, (RW-30)*kin/kmax*kp, 16, 4, kc) +
+             T(x+RW/2, Y0+304, 17, &#x27;K/V in&#x27;, kc, kp);
+      }
+    }
+    if (st.name === &#x27;TP4&#x27;) s += strip(1, ease(prog(lt, 1.5, 0.5)), &#x27;the machine: 8 devices, TP4 uses only device 1&#x27;, true);
+    if (st.cp === 2) s += strip(2, ease(prog(lt, 2.0, 0.5)), &#x27;CP2: 2 devices, half the tokens each&#x27;, false);
+    if (st.cp === 8) s += strip(8, ease(prog(lt, 0.6, 0.5)), &#x27;CP8: all 8 devices, 1/8 of the tokens each&#x27;, false);
+    if (st.cp === 16){
+      // the waste: K/V each rank must receive per attention layer = its heads x the share held by other groups
+      var bo = ease(prog(lt, 1.8, 0.5)), U = 40, bx0 = 470;
+      var a8 = (HEADS/4) * (7/8), a16 = (HEADS/2) * (15/16);           // 8.75 vs 18.75 head-slices of K/V
+      s += &#x27;&lt;g opacity=&quot;&#x27;+bo+&#x27;&quot;&gt;&#x27; + T(800, 664, 22, &#x27;K/V in, per rank (the bar inside each rank)&#x27;, MUTED) +
+           T(bx0-20, 707, 22, &#x27;TP4 × CP8&#x27;, &#x27;#ffffff&#x27;, null, &#x27;end&#x27;) + R(bx0, 688, a8*U*ease(prog(lt, 1.9, 0.6)), 28, 6, &#x27;#ffb347&#x27;) +
+           T(bx0-20, 755, 22, &#x27;TP2 × CP16&#x27;, &#x27;#ff6b6b&#x27;, null, &#x27;end&#x27;) + R(bx0, 736, a16*U*ease(prog(lt, 2.3, 0.8)), 28, 6, &#x27;#ff3b3b&#x27;) +
+           T(bx0 + a16*U + 16, 757, 26, (a16/a8).toFixed(1) + &#x27;×&#x27;, &#x27;#ff6b6b&#x27;, ease(prog(lt, 3.0, 0.4)), &#x27;start&#x27;) + &#x27;&lt;/g&gt;&#x27;;
+    }
+    // CP: only attention talks across groups -- K/V exchange between every pair of neighboring groups
+    if (st.cp &gt; 1){
+      var on = st.cp &gt;= 8 ? 1 : ease(prog(lt, 1.4, 0.3)), ng = st.ranks / st.tp;
+      if (st.cp === 16) on = ease(prog(lt, 1.6, 0.4));
+      var KC = st.cp === 16 ? &#x27;#ff3b3b&#x27; : KV;     // CP16: the exchange is the problem, draw it red
+      s += &#x27;&lt;g opacity=&quot;&#x27;+on+&#x27;&quot;&gt;&#x27;;
+      for (var gg=0; gg&lt;ng-1; gg++){
+        var xa = rankX(st, gg*st.tp + st.tp - 1) + RW, xb = rankX(st, (gg+1)*st.tp), mid = (xa + xb)/2;
+        s += L(xa+2, Y0+RH/2, xb-2, Y0+RH/2, KC, 4, 0.6);
+        if (xb - xa &gt; 60) s += T(mid, Y0+RH/2-22, 18, &#x27;K/V&#x27;, KC);
+        for (var dd=0; dd&lt;3; dd++){
+          var f = ((lt*0.7) + dd/3) % 1, span = Math.max(4, xb-xa-12);
+          s += R(xa + span*f, Y0+RH/2-12, 8, 8, 2, KC) + R(xb - 8 - span*f, Y0+RH/2+4, 8, 8, 2, KC);
+        }
+      }
+      s += &#x27;&lt;/g&gt;&#x27;;
+    }
+    return s;
+  }
+
+  // k = the step on screen, lt = seconds since that step started (steps advance on click, not on a timer)
+  function render(k, lt){
+    lt = Math.max(0, lt);
+    var st = STEPS[k], fade = k === 4 ? 1 : ease(prog(lt, 0, 0.25));
+    var s = &#x27;&#x27;;
+    // step tabs
+    var TABS = [&#x27;TP4&#x27;, &#x27;TP8&#x27;, &#x27;TP16&#x27;, k === 3 ? &#x27;TPx × CPy&#x27; : (k === 5 ? &#x27;TP2 × CP16&#x27; : &#x27;TP4 × CP8&#x27;)], tab = Math.min(k, 3);
+    for (var i=0;i&lt;TABS.length;i++){
+      var on = i === tab, x = 800 + (i-1.5)*300;
+      var win = on &amp;&amp; st.final;
+      s += R(x-130, 30, 260, 50, 25, win ? &#x27;rgba(76,214,160,0.22)&#x27; : (on ? &#x27;rgba(61,155,255,0.18)&#x27; : &#x27;rgba(255,255,255,0.03)&#x27;), win ? &#x27;#4cd6a0&#x27; : (on ? &#x27;#ffffff&#x27; : &#x27;#3a4256&#x27;), on ? 3 : 1) +
+           T(x, 64, 24, TABS[i], on ? &#x27;#ffffff&#x27; : MUTED);
+    }
+    var cap = (st.name === &#x27;TP4&#x27; &amp;&amp; lt &gt;= 1.5) ? &#x27;TP4 fills one device; devices 2 to 8 sit idle&#x27;
+            : (st.cp === 16 &amp;&amp; lt &gt;= 1.8) ? &#x27;each rank owns twice the heads, so it receives about twice the K/V from the other groups&#x27; : st.cap;
+    s += &#x27;&lt;g opacity=&quot;&#x27;+fade+&#x27;&quot;&gt;&#x27; + scene(st, 0, lt) + T(800, 850, 28, cap, &#x27;#ffffff&#x27;, ease(prog(lt, 0.3, 0.3))) + &#x27;&lt;/g&gt;&#x27;;
+    document.getElementById(&#x27;dyn&#x27;).innerHTML = s;
+  }
+
+  var reduce = window.matchMedia &amp;&amp; window.matchMedia(&#x27;(prefers-reduced-motion: reduce)&#x27;).matches;
+  var hm = /t=([\d.]+)(?:,k=(\d))?/.exec(location.hash);          // e.g. #t=7,k=0 freezes step k at 7 s
+  if (hm){ render(hm[2] ? parseInt(hm[2]) : 0, parseFloat(hm[1])); return; }
+  // click, Space or Right arrow: next step; Left arrow: previous; after the last step, back to the first
+  var step = 0, t0 = performance.now(), started = false;   // waits on the first frame until the first click
+  function go(k){ step = (k + STEPS.length) % STEPS.length; t0 = performance.now(); }
+  function tick(now){ render(step, reduce ? DUR : (started ? (now - t0)/1000 : 0)); requestAnimationFrame(tick); }
+  requestAnimationFrame(tick);
+  function next(){ if (!started){ started = true; go(0); } else go(step + 1); }
+  document.addEventListener(&#x27;click&#x27;, next);
+  document.addEventListener(&#x27;keydown&#x27;, function(ev){
+    if (ev.code === &#x27;Space&#x27; || ev.code === &#x27;ArrowRight&#x27;){ ev.preventDefault(); next(); }
+    else if (ev.code === &#x27;ArrowLeft&#x27;){ ev.preventDefault(); go(step - 1); }
+  });
+})();
+&lt;/script&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+" style="width:100%;aspect-ratio:16/9;border:1px solid #334155;margin:1em 0" loading="lazy"></iframe>
+<h2>11. Summary: six ideas, one method</h2>
+<p class="say">The same six ideas took Wan2.2 from 76.6 s to 8.7 s, and LingBot-World v2 from 6.8 to 25 fps.</p>
+<h3>The six ideas</h3>
+<table><thead><tr><th>Idea</th><th>In one line</th><th>Where in this talk</th></tr></thead><tbody>
+<tr><td>1. Correct first</td><td>Start eager on the neuron device and check every step against it.</td><td>5</td></tr>
+<tr><td>2. Big, reusable graphs</td><td>One compiled graph per repeated block, collectives inside, loops rolled.</td><td>6, 7</td></tr>
+<tr><td>3. Busy engines</td><td>Profile, find where the engines take turns, and use a kernel that overlaps them.</td><td>8</td></tr>
+<tr><td>4. Less data movement</td><td>Copies, calls and small DMAs often cost more than the math.</td><td>9</td></tr>
+<tr><td>5. Split across cores</td><td>TP inside a device, CP across devices; measure the layout.</td><td>10</td></tr>
+<tr><td>6. A fed device</td><td>Warm up, gate readiness on it, and keep the host off the critical path.</td><td></td></tr>
+</tbody></table>
+<h3>Wan2.2: 76.6 s to 8.7 s</h3>
+<table><thead><tr><th>Wan2.2-TI2V-5B, one trn2 device</th><th>Ideas</th><th>Per video</th></tr></thead><tbody>
+<tr><td>Eager</td><td>1</td><td>76.6 s</td></tr>
+<tr><td>+ torch.compile</td><td>2</td><td>36.8 s</td></tr>
+<tr><td>+ VAE on 8 cores, NKI convs</td><td>5, 3</td><td>16.1 s</td></tr>
+<tr><td>+ NKI attention, parallel layouts</td><td>3, 5</td><td>10.8 s</td></tr>
+<tr><td>+ VAE fusion, host fixes</td><td>4, 6</td><td><strong>8.7 s</strong></td></tr>
+</tbody></table>
+<h3>LingBot-World v2: 6.8 to 25 fps</h3>
+<table><thead><tr><th>LingBot-World v2, 16 trn2 devices</th><th>Ideas</th><th>Per video</th><th>fps</th></tr></thead><tbody>
+<tr><td>Upstream port</td><td></td><td>11.90 s</td><td>6.81</td></tr>
+<tr><td>+ merged attention, SP</td><td>4, 5</td><td>8.75 s</td><td>9.26</td></tr>
+<tr><td>+ fused bf16 VAE, paired chunks</td><td>2, 4</td><td>5.29 s</td><td>15.32</td></tr>
+<tr><td>+ host fixes, VAE tiles</td><td>6, 5</td><td>4.37 s</td><td>18.55</td></tr>
+<tr><td>+ tuned attention kernel</td><td>4</td><td>3.97 s</td><td>20.43</td></tr>
+<tr><td>+ chained calls, constant offset</td><td>4, 3</td><td>3.36 s</td><td>24.12</td></tr>
+<tr><td>+ less work before the first block</td><td>6</td><td><strong>3.24 s</strong></td><td><strong>25.02</strong></td></tr>
+<tr><td>8 devices (half a host), with the softmax check</td><td>1</td><td>4.40 s</td><td>18.40</td></tr>
+</tbody></table>
+</body>
+</html>

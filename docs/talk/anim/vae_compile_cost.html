@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>torch.compile made the VAE slower</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Wan2.2 VAE decode at 368x480x21 on trn2, warm runtime after compiling. Eager: 2.4 seconds. torch.compile rolled, one ResidualBlock graph reused: 4.4 seconds. torch.compile of the whole decoder, unrolled: 11.5 to 12.9 seconds. Even the best compiled version is about 2 times slower than eager.">
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+h+'" rx="'+rx+
+      '" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'middle')+'"'+
+      ' style="fill:'+fill+';"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+
+  var EAGER = "#3d9bff", COMP = "#ff6b6b";
+  // Measured 2026-11-05, trn2, commit 1b18e22, 368x480x21, warm runs 2 and 3:
+  // eager VAE 2.5 s, 2.4 s; VAE_COMPILE=1 12.9 s, 11.5 s; run 1 VAE 3476.8 s (compile).
+  var X0 = 380, PX = 90;                      // pixels per second of VAE time
+  var A1 = 0.8, D1 = 1.6, A2 = 3.0, D2 = 5.0, A3 = A2 + D2 + 0.8, A4 = A3 + 1.0;
+
+  function bar(y, label, sub, secs, col, txt, t, a, d){
+    var p = ease(prog(t,a,d)), o = ease(prog(t,a-0.4,0.4));
+    var s = '<g opacity="'+o+'">' + T(60,y+34,34,label,'#ffffff',null,'start') + T(60,y+68,22,sub,'#aab3c5',null,'start') +
+            R(X0,y,1160,72,8,'#141a26') + R(X0,y,secs*PX*p,72,8,col) + '</g>';
+    if (p >= 1) s += T(X0+secs*PX+18, y+48, 36, txt, '#ffffff', ease(prog(t,a+d,0.4)), 'start');
+    return s;
+  }
+
+  function render(t){
+    var s = T(800,70,44,'torch.compile is not always faster','#ffffff') +
+            T(800,118,24,'Wan2.2 VAE decode, 368x480x21, trn2. Warm runtime per video, after compiling.','#aab3c5');
+    s += bar(170, 'Eager', 'no compile', 2.45, EAGER, '2.4 s', t, A1, D1);
+    s += bar(300, 'Rolled compile', 'one block graph, reused', 4.4, '#ffb347', '4.4 s', t, A2, 1.8);
+    s += bar(430, 'Unrolled compile', 'whole decoder, one graph', 12.2, COMP, '', t, A2 + 2.2, D2 - 2.2);
+    if (t >= A2 + D2) s += T(X0+12.2*PX-20, 478, 36, '11.5–12.9 s', '#0b0d12', ease(prog(t,A2+D2,0.4)), 'end');
+    var m = ease(prog(t,A3,0.8));
+    s += '<g opacity="'+m+'">' + R(60,600,1480,240,20,'rgba(255,255,255,0.04)','#3a4256',3) +
+      T(90,662,30,'Runtime, after compiling: even the best compiled VAE is ~2x slower than eager.','#ffffff',null,'start') +
+      T(90,714,26,'Rolling fixed the compile time and most of the slowdown, but not all of it.','#d6dbe6',null,'start') +
+      T(90,760,26,'So measure both. Here we kept the VAE eager and compile only small pieces of it.','#d6dbe6',null,'start') +
+      T(90,812,19,'Measured 2026-11-05, trn2: eager 2.5 / 2.4 s, rolled 4.4 / 4.4 s, unrolled 12.9 / 11.5 s (warm runs). Commits 1b18e22, 0ae83b3.','#8a93a8',null,'start') +
+      '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var END = A4 + 1.0;
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END); return; }
+  var t0 = performance.now(), running = true;
+  // play once, then hold the final frame (click or Space replays)
+  function tick(now){ var t = (now - t0)/1000;
+    if (t >= END){ render(END); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>

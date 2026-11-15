@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TP x CP on the same 32 ranks</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="The same 32 ranks laid out three ways. Each column is a context-parallel group holding a slice of the tokens; the ranks inside a column split the weights (tensor parallel). TP2 x CP16: each rank holds a large weight share and very few queries. TP8 x CP4: small weight share, many queries, but every block gathers across 8 ranks. TP4 x CP8 sits in the middle and is the fastest of the three.">
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+'" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'start')+'" style="fill:'+fill+';"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+  function L(x1,y1,x2,y2,col,w,op){ return '<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+col+'" stroke-width="'+w+'"'+(op!=null?' opacity="'+op+'"':'')+'/>'; }
+
+  var MUTED = "#aab3c5", TPC = "#3d9bff", CPC = "#ff9f43", GREEN = "#4cd6a0", RANK = "#2a3142";
+  // measured, 8 trn3 devices, 32 ranks (LNC2), same flags: fps TP2xCP16 14.74, TP4xCP8 17.88, TP8xCP4 16.70
+  var ROWS = [
+    {tp:2, cp:16, fps:14.74},
+    {tp:4, cp:8,  fps:17.88, best:true},
+    {tp:8, cp:4,  fps:16.70}
+  ];
+  var GX = 250, GW = 760, GH = 170, RY0 = 120, RSTEP = 235, BX = 1110, BW = 400;
+  var D = 3.2, END = 0.4 + ROWS.length*D + 1.4;
+
+  function bar(x, y, label, frac, col, op){
+    return '<g opacity="'+op+'">' + T(x, y-6, 17, label, MUTED) + R(x, y, BW, 18, 9, '#141a26', '#3a4256', 1) + R(x, y, BW*frac, 18, 9, col) + '</g>';
+  }
+
+  function row(r, i, t){
+    var a = 0.4 + i*D, y = RY0 + i*RSTEP, op = ease(prog(t, a, 0.5)), s = '';
+    if (op <= 0) return '';
+    var best = r.best && t > END - 1.4;
+    s += R(30, y-14, 1540, GH+40, 16, best ? 'rgba(76,214,160,0.08)' : 'rgba(255,255,255,0.03)', best ? GREEN : '#3a4256', best ? 3 : 2);
+    s += T(60, y+GH/2+4, 34, 'TP' + r.tp + ' × CP' + r.cp, best ? GREEN : '#ffffff');
+    if (best) s += T(60, y+GH/2+38, 20, 'sweet spot', GREEN);
+    // grid: CP groups as columns, TP ranks stacked inside each column
+    var cw = GW / r.cp, rh = GH / r.tp, pad = Math.min(4, cw*0.12);
+    var pulse = 0.5 + 0.5*Math.sin((t - a) * 6);
+    for (var c=0;c<r.cp;c++){
+      var x = GX + c*cw;
+      for (var k=0;k<r.tp;k++) s += R(x+pad, y+k*rh+pad, cw-2*pad, rh-2*pad, 3, RANK, '#4a5266', 1);
+      // TP: the ranks of one column gather each other's results every block (vertical link)
+      var tpOn = ease(prog(t, a+0.8, 0.4));
+      s += L(x+cw/2, y+pad+2, x+cw/2, y+GH-pad-2, TPC, 3, tpOn*(0.45+0.55*pulse));
+    }
+    // CP: the columns exchange K/V (horizontal link)
+    var cpOn = ease(prog(t, a+1.4, 0.4));
+    s += L(GX+4, y+GH+12, GX+GW-4, y+GH+12, CPC, 4, cpOn*(0.45+0.55*(1-pulse)));
+    // per-rank share: weights shrink with TP, queries shrink with CP; then the measured speed
+    var bOn = ease(prog(t, a+2.0, 0.6));
+    s += bar(BX, y+26, 'HBM per rank: weights + KV cache', 0.25 + 0.75*(2/r.tp), TPC, bOn);   // illustrative: weight share 1/TP, KV share the same for all
+    s += bar(BX, y+84, 'queries per rank', 4/r.cp, CPC, bOn);
+    s += bar(BX, y+142, 'speed', r.fps/18.5, best ? GREEN : '#d6dbe6', ease(prog(t, a+2.5, 0.6)));
+    return s;
+  }
+
+  function render(t){
+    var s = T(800, 62, 38, 'Same 32 ranks: how to split them?', '#ffffff', null, 'middle') +
+            T(800, 96, 21, 'columns split the tokens (CP), ranks in a column split the weights (TP)', MUTED, null, 'middle');
+    for (var i=0;i<ROWS.length;i++) s += row(ROWS[i], i, t);
+    var lg = ease(prog(t, 1.2, 0.5));
+    s += '<g opacity="'+lg+'">' + L(250, 832, 250, 862, TPC, 4) + T(266, 855, 20, 'TP: ranks in a column gather every block', TPC) +
+         L(780, 847, 830, 847, CPC, 4) + T(846, 855, 20, 'CP: columns exchange K/V', CPC) + '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END); return; }
+  var t0 = performance.now(), running = true;
+  // play once, then hold the final frame (click or Space replays)
+  function tick(now){ var t = (now - t0)/1000;
+    if (t >= END){ render(END); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>

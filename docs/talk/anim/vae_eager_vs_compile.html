@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Why the eager VAE was faster</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Why the eager VAE was faster. In the compiled graph, two ops run on GpSimd and take 65 percent of its time: nearest Upsample as a gather, 43 percent, and RMS_norm as a cross-lane reduce, 22 percent. Eager runs each op as its own small graph, about 2,450 graph runs per decode; in its heaviest graphs the matrix engine is 74 to 99 percent busy and GpSimd 5 to 15 percent. torch.compile turns the whole decoder into one 83 megabyte graph per latent frame; in it the matrix engine is 10 percent busy, GpSimd 74 percent, and 82 gigabytes of spilled data are reloaded per call. Result: eager 2.4 seconds, compiled 11.5 to 12.9 seconds.">
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+h+'" rx="'+rx+'" fill="'+fill+'"'+
+      (stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op,anchor){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="'+(anchor||'middle')+'"'+
+      ' style="fill:'+fill+';"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+
+  var BLUE = "#3d9bff", RED = "#ff6b6b", GRAY = "#8a93a8", MUTED = "#aab3c5";
+  // Measured 2026-11-05, trn2 LNC1, commit 1b18e22, 368x480x21 (device profiles):
+  //  eager: heaviest 4 graphs = 47% of eager VAE device time; TensorE 74-99%, GpSimd 5-15%.
+  //  compiled: steady decoder graph 0f9b8d1e (83 MB NEFF), 2.14 s/call; TensorE 10%, GpSimd 74%,
+  //  spill reload 82 GB per call.
+  var OPS = ["norm","SiLU","cat","pad","conv3d","norm","SiLU","cat","pad","conv3d","+","up 2x"];
+  var HOT = {0:1, 5:1, 11:1};               // RMS_norm and Upsample: 65% of the compiled graph
+  var A_L = 0.6, A_R = 4.2, A_SUM = 8.4, END = A_SUM + 1.2;
+
+  function meter(x, y, label, pct, txt, col, op){
+    return '<g opacity="'+op+'">' + T(x, y, 21, label, MUTED, null, 'start') +
+      R(x, y+12, 420, 24, 12, '#141a26', '#3a4256', 2) + R(x, y+12, 420*pct, 24, 12, col) +
+      T(x+436, y+32, 24, txt, col, null, 'start') + '</g>';
+  }
+
+  function ops(x0, y, w, gap, t, a, perGraph, col){
+    var s = '', n = OPS.length, lit = Math.floor(((t - a) * 4) % n);
+    for (var i=0;i<n;i++){
+      var x = x0 + i*(w+gap), on = perGraph && t > a && i === lit;
+      if (perGraph) s += R(x-4, y-4, w+8, 58, 10, 'none', on ? '#ffffff' : GRAY, on ? 3 : 1.5, ' stroke-dasharray="6 5"');
+      var hot = !perGraph && HOT[i] && t > a + 2.2, c = hot ? '#ffd166' : col;
+      s += R(x, y, w, 50, 8, on || hot ? c : (col === BLUE ? 'rgba(61,155,255,0.16)' : 'rgba(255,107,107,0.16)'), c, 2) +
+           T(x+w/2, y+31, 13, OPS[i], on || hot ? '#0b0d12' : '#ffffff');
+    }
+    if (!perGraph) s += R(x0-12, y-12, n*(w+gap)-gap+24, 74, 14, 'none', '#ffffff', 3, ' stroke-dasharray="12 8"');
+    return s;
+  }
+
+  function render(t){
+    var s = T(800,62,42,'Why the eager VAE was faster','#ffffff') +
+            T(800,104,23,'Same decoder, same chip. What changes is how much of it the compiler sees at once.',MUTED);
+
+    // left: eager
+    var l = ease(prog(t,A_L,0.6));
+    s += '<g opacity="'+l+'">' + R(40,140,740,500,20,'rgba(255,255,255,0.03)','#3a4256',2) +
+      T(70,186,30,'Eager: one small graph per op','#ffffff',null,'start') +
+      T(70,220,20,'~2,450 graph runs per decode; each graph is one op','#aab3c5',null,'start') +
+      ops(76, 254, 50, 6, t, A_L, true, BLUE) +
+      T(70,352,20,'Each dashed box is a separate graph. The heaviest ones are the convs.','#d6dbe6',null,'start') + '</g>';
+    s += meter(70, 400, 'Matrix engine busy (the conv math)', 0.99, '74–99%', BLUE, ease(prog(t,A_L+1.0,0.6)));
+    s += meter(70, 480, 'GpSimd busy', 0.15, '5–15%', BLUE, ease(prog(t,A_L+1.6,0.6)));
+    s += T(70, 600, 19, 'Heaviest 4 eager graphs, 47% of eager VAE device time', GRAY, ease(prog(t,A_L+2.0,0.6)), 'start');
+
+    // right: compiled
+    var r = ease(prog(t,A_R,0.6));
+    s += '<g opacity="'+r+'">' + R(820,140,740,500,20,'rgba(255,255,255,0.03)','#3a4256',2) +
+      T(850,186,30,'torch.compile: the whole decoder in one graph','#ffffff',null,'start') +
+      T(850,220,20,'one 83 MB graph per latent frame, 2.14 s per call','#aab3c5',null,'start') +
+      ops(862, 254, 50, 6, t, A_R, false, RED) +
+      T(850,352,20,'All ops in one graph. Two of them turn into slow GpSimd work (yellow).','#d6dbe6',null,'start') + '</g>';
+    s += meter(850, 400, 'Matrix engine busy (the conv math)', 0.10, '10%', RED, ease(prog(t,A_R+1.0,0.6)));
+    s += meter(850, 480, 'GpSimd busy (gather + reduce)', 0.74, '74%', RED, ease(prog(t,A_R+1.6,0.6)));
+    var b = ease(prog(t,A_R+2.2,0.8)), BX = 850, BW = 680;
+    s += '<g opacity="'+b+'">' + T(BX, 560, 21, 'Where the compiled graph spends its 2.14 s', MUTED, null, 'start') +
+      R(BX, 572, BW*0.43, 34, 6, '#ffd166') + R(BX+BW*0.43, 572, BW*0.22, 34, 6, '#ffb347') + R(BX+BW*0.65, 572, BW*0.35, 34, 6, '#3a4256') +
+      T(BX+BW*0.215, 595, 17, 'Upsample 43%', '#0b0d12') + T(BX+BW*0.54, 595, 17, 'RMS_norm 22%', '#0b0d12') +
+      T(BX+BW*0.825, 595, 17, 'everything else 35%', '#ffffff') + '</g>';
+
+    // summary
+    var m = ease(prog(t,A_SUM,0.8));
+    s += '<g opacity="'+m+'">' + R(40,670,1520,190,20,'rgba(255,255,255,0.04)','#3a4256',3) +
+      T(70,720,27,'Eager: the heaviest graphs are the convs, matrix engine busy.  VAE 2.4 s','#ffffff',null,'start') +
+      T(70,766,27,'Compiled: Upsample and RMS_norm become GpSimd work, 65% of the graph.  VAE 11.5–12.9 s','#ffffff',null,'start') +
+      T(70,830,18,'Device profiles, 2026-11-05, trn2, commit 1b18e22, 368x480x21. Same code; only VAE_COMPILE changes.',GRAY,null,'start') +
+      '</g>';
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END); return; }
+  var t0 = performance.now(), running = true;
+  // play once, then hold the final frame (click or Space replays)
+  function tick(now){ var t = (now - t0)/1000;
+    if (t >= END){ render(END); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function restart(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>

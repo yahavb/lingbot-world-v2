@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trainium cores, engines and collectives</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="A Trainium2 device with 8 NeuronCores. Inside one core the Tensor, Vector, Scalar and GpSimd engines light up in turn next to on-chip memory. Then collectives move data between the cores: an all-gather around a ring, until every core holds every block. Then the device shrinks into the left half of a pod whose right half holds the model code and the model weights. First the pod holds the model code and the model weights; the device waits below it. kube-scheduler asks the Neuron DRA driver for NeuronCores, the driver allocates the device, which moves into the pod's left half, and the scheduler places the pod. Then an EKS cluster frames everything, the pod shrinks into a column of four identical pods, and the one scheduler and one DRA driver serve each of them.">
+  <defs>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  var LOOP;
+  // ---- helpers ----
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return "rgba("+(n>>16&255)+","+(n>>8&255)+","+(n&255)+","+a+")"; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+
+      '" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill,op){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="middle"'+
+      ' style="'+(fill?'fill:'+fill+';':'')+'"'+(op!=null?' opacity="'+op+'"':'')+'>'+txt+'</text>'; }
+
+  // ---- geometry ----
+  var CHIP = {x:100,y:380,w:820,h:480};
+  var CW = 150, CG = 50, CX0 = 135, CY = [478,688];
+  function core(i){ return {x:CX0+(i%4)*(CW+CG), y:CY[i<4?0:1], w:CW, h:CW}; }
+  var FOCUS = 3;                                   // the core we zoom into (top right)
+  var PANEL = {x:990,y:380,w:530,h:480};
+  var ENG = [
+    {n:"Tensor", c:"#3d9bff", x:1010, y:400},
+    {n:"Vector", c:"#2fd39a", x:1265, y:400},
+    {n:"Scalar", c:"#ffcc33", x:1010, y:545},
+    {n:"GpSimd", c:"#ff6b9a", x:1265, y:545}
+  ];
+  var EW = 235, EH = 125;
+  var MEM = {x:1010,y:700,w:490,h:140}, MEMC = "#b48cff";
+  // ring order through the 2x4 grid, and one colour per core (all-gather payloads)
+  var RING = [0,1,2,3,7,6,5,4];
+  var KC = ["#3d9bff","#2fd39a","#ffcc33","#ff6b9a","#b48cff","#ff7a3d","#22d3ee","#e8ecf4"];
+  var LINK = "#22d3ee";
+
+  // ---- timing ----
+  var B1 = 0, ZOOM = 1, ENG0 = 2, ESTEP = 1.2, ALL = ENG0+4*ESTEP;  // beat 1
+  var B2 = 8, RSTEP = 0.85, NSTEP = 7;                               // beat 2
+  var B3 = B2 + 0.6 + NSTEP*RSTEP + 0.6;                              // all done (~15.1 s)
+  // beat 4: the device shrinks into the left half of a pod; code + weights fill its right half;
+  // kube-scheduler asks the Neuron DRA driver for NeuronCores, the driver allocates them, the pod is scheduled
+  var SH = B3 + 1.0, POD = SH + 1.4, SCH = POD + 1.4, ASK = SCH + 0.7, ALLOC = ASK + 0.8, MOVE = ALLOC + 0.8, BIND = MOVE + 1.1;
+  // beat 5: EKS around everything, the pod shrinks into a column, more pods, one scheduler + one DRA driver
+  var S2 = BIND + 1.4, NP = 4, PODS = S2 + 1.4, PSTEP = 0.5;
+  LOOP = PODS + NP*PSTEP + 3.0;
+  var PCX = 565, PCY = 450;                                        // beat-4 pod centre
+  var PK = 0.40, PW = 1070*PK, PH = 320*PK, PX = 300, PY0 = 220, PG = PH + 40;   // beat-5 column
+  // ---- the pod: dashed box, tag, and its right half (model code + model weights), beat-4 coordinates ----
+  function podBox(){ return R(30,290,1070,320,30,hexA('#5b8cff',.07),'#9ab6ff',8,' stroke-dasharray="26 14"'); }
+  function podTag(){ return R(56,268,110,44,10,'#0b0d12','#9ab6ff',3)+T(111,300,30,'Pod','#9ab6ff'); }
+  function codeWeights(){
+    var g = R(640,335,210,230,20,hexA('#c9d1e0',.10),'#c9d1e0',5) + T(745,445,64,'&lt;/&gt;','#c9d1e0') +
+            T(745,530,28,'Model code','#ffffff');
+    g += R(870,335,210,230,20,hexA('#2fd39a',.12),'#2fd39a',5);
+    for (var i=2;i>=0;i--) g += R(935+i*12, 372-i*12+24, 64, 80, 8, '#1b2a26','#2fd39a',3);
+    g += T(975,530,25,'Model weights','#ffffff');
+    return g;
+  }
+  function arrow(x1,y1,x2,y2,col,extra){
+    var a = Math.atan2(y2-y1, x2-x1), L = Math.hypot(x2-x1,y2-y1);
+    if (L < 40) return '';         // no lone arrowhead before the line grows
+    return '<line x1="'+x1+'" y1="'+y1+'" x2="'+(x2-24*Math.cos(a))+'" y2="'+(y2-24*Math.sin(a))+'" stroke="'+col+'" stroke-width="8" stroke-linecap="round"'+(extra||'')+'/>'+
+           '<polygon points="0,-16 30,0 0,16" fill="'+col+'" transform="translate('+(x2-30*Math.cos(a))+','+(y2-30*Math.sin(a))+') rotate('+(a*180/Math.PI)+')"/>';
+  }
+
+
+  function render(t){
+    var s = '';
+    // ====== device with 8 NeuronCores ======
+    var dev = ease(prog(t,B1,0.9));
+    s += '<g opacity="'+dev+'">';
+    s += R(CHIP.x,CHIP.y,CHIP.w,CHIP.h,26,'#121826','#8fa3c7',8);
+    // collective links (beat 2): thick bars between ring neighbours
+    var lk = ease(prog(t,B2,0.6));
+    for (var r=0;r<8;r++){
+      var a = core(RING[r]), b = core(RING[(r+1)%8]), L = linkRect(a,b);
+      s += R(L.x,L.y,L.w,L.h,8, lk>0?hexA(LINK,0.25+0.55*lk):'#2a3246');
+    }
+    var col = ease(prog(t,B2,0.6));
+    if (col>0) s += T(CHIP.x+CHIP.w/2, CHIP.y+68, 50, 'Collectives', LINK, col);
+    // ring step progress (all-gather: each step every core passes one block to its neighbour)
+    var stepT = (t - (B2+0.6)) / RSTEP, step = Math.floor(stepT), sp = stepT - step;
+    for (var i=0;i<8;i++){
+      var c = core(i), lit = (i===FOCUS) && t>=ZOOM;
+      s += R(c.x,c.y,c.w,c.h,18,'#1f2940', lit?'#ffffff':'#6f86b8', lit?10:6, lit?' filter="url(#glow)"':'');
+      // engine dots in each core (a tiny echo of the zoomed core)
+      for (var e=0;e<4;e++){
+        var on = engOn(t,e);
+        s += R(c.x+18+(e%2)*62, c.y+16+Math.floor(e/2)*40, 52, 30, 7,
+               on ? ENG[e].c : hexA(ENG[e].c,.35));
+      }
+      // received blocks: 8 slots, fill as the all-gather proceeds
+      var pos = RING.indexOf(i);
+      for (var k=0;k<8;k++){
+        var src = RING[(pos - k + 8) % 8];   // k = 0 is the core's own block
+        var have = (t >= B2) && (k===0 || (stepT >= k));
+        s += R(c.x+12+k*16, c.y+c.h-40, 14, 28, 3, have?KC[src]:'#0b0d12');
+      }
+    }
+    // packets moving along every link at once
+    if (t >= B2+0.6 && step < NSTEP && step >= 0){
+      for (r=0;r<8;r++){
+        var from = RING[r], to = RING[(r+1)%8];
+        var payload = RING[(r - step + 8) % 8];
+        var A = core(from), Bc = core(to);
+        var e2 = ease(clamp(sp/0.85));
+        var px = lerp(A.x+A.w/2, Bc.x+Bc.w/2, e2), py2 = lerp(A.y+A.h/2, Bc.y+Bc.h/2, e2);
+        s += R(px-20,py2-20,40,40,8,KC[payload],'#0b0d12',5,' filter="url(#glow)"');
+      }
+    }
+    s += '</g>';
+
+    // ====== zoom into one core: four engines + on-chip memory ======
+    var zm = ease(prog(t,ZOOM,0.9));
+    if (zm>0){
+      var f = core(FOCUS);
+      s += '<g opacity="'+zm+'">';
+      // thick connector from the focused core to the panel
+      s += '<polygon points="'+(f.x+f.w)+','+(f.y+10)+' '+PANEL.x+','+PANEL.y+' '+PANEL.x+','+(PANEL.y+PANEL.h)+' '+(f.x+f.w)+','+(f.y+f.h-10)+'" fill="rgba(255,255,255,.10)"/>';
+      s += R(PANEL.x,PANEL.y,PANEL.w,PANEL.h,26,'#121826','#ffffff',8);
+      for (e=0;e<4;e++){
+        var E = ENG[e], o = engOn(t,e);
+        s += R(E.x,E.y,EW,EH,18, o?E.c:hexA(E.c,.18), E.c, o?10:6, o?' filter="url(#glow)"':'');
+        s += T(E.x+EW/2, E.y+EH/2+15, 42, E.n, o?'#0b0d12':'#ffffff');
+      }
+      // on-chip memory: a block of cells (shape only)
+      var mOn = anyEng(t);
+      s += R(MEM.x,MEM.y,MEM.w,MEM.h,18, hexA(MEMC, mOn?.35:.15), MEMC, mOn?10:6, mOn?' filter="url(#glow)"':'');
+      for (var my=0;my<3;my++) for (var mx=0;mx<10;mx++)
+        s += R(MEM.x+22+mx*46, MEM.y+20+my*36, 34, 26, 5, hexA(MEMC, mOn?.95:.5));
+      // data pulse from memory up into the active engine
+      for (e=0;e<4;e++){
+        var a0 = ENG0 + e*ESTEP, pp = prog(t,a0,ESTEP*0.7);
+        if (pp>0 && pp<1 && t < ALL){
+          var Ee = ENG[e], ex = Ee.x+EW/2;
+          var y0 = MEM.y+10, y1 = Ee.y+EH-10, yy = lerp(y0,y1,ease(pp));
+          s += R(ex-18,yy-18,36,36,8,'#ffffff',null,0,' filter="url(#glow)"');
+        }
+      }
+      s += '</g>';
+    }
+    // beat 4: shrink (the opposite of the zoom) into the left half of the pod
+    // the device shrinks and waits below the pod, dimmed, until the DRA driver allocates it
+    var sh = ease(prog(t,SH,1.3)), mv = ease(prog(t,MOVE,0.9));
+    var k = lerp(1,0.38,sh), cx = lerp(810,320,sh), cy = lerp(450,745,sh) + (450-745)*mv;
+    var dimd = lerp(1, 0.45, sh) + 0.55*mv;
+    var dev = '<g opacity="'+dimd+'" transform="translate('+cx+','+cy+') scale('+k+') translate(-810,-450)">'+
+              '<g transform="translate(0,-170)">'+s+'</g></g>';
+    var pd = ease(prog(t,POD,0.7)), cw = ease(prog(t,POD+0.4,0.7));
+    var grp = (pd>0 ? '<g opacity="'+pd+'">'+podBox()+'</g>' : '') + dev +
+              (cw>0 ? '<g opacity="'+cw+'">'+codeWeights()+'</g>' : '') +
+              (pd>0 ? '<g opacity="'+pd+'">'+podTag()+'</g>' : '');
+    // beat 5: the pod shrinks into the first slot of a column
+    var s2 = ease(prog(t,S2,1.2)), k2 = lerp(1,PK,s2);
+    var out = '<g transform="translate('+lerp(PCX,PX,s2)+','+lerp(PCY,PY0,s2)+') scale('+k2+') translate('+(-PCX)+','+(-PCY)+')">'+grp+'</g>';
+    if (s2>0) out = '<g opacity="'+s2+'">'+R(40,40,1520,830,30,hexA('#ff9900',.05),'#ff9900',8)+
+                    T(120,95,44,'EKS','#ff9900')+'</g>' + out;
+    // the other pods: the same pod, with a small device in its left half
+    for (var q=1;q<NP;q++){
+      var pq = ease(prog(t,PODS+(q-1)*PSTEP,0.5)); if (pq<=0) continue;
+      var mini = podBox() + R(50,359,540,182,16,'#121826','#8fa3c7',4);
+      for (var m=0;m<8;m++) mini += R(70+(m%4)*128, 375+Math.floor(m/4)*80, 112, 68, 10, '#1f2940','#6f86b8',3);
+      mini += codeWeights() + podTag();
+      out += '<g opacity="'+pq+'" transform="translate('+PX+','+(PY0+q*PG)+') scale('+PK+') translate('+(-PCX)+','+(-PCY)+')">'+mini+'</g>';
+    }
+    // kube-scheduler and the Neuron DRA driver (move into the cluster in beat 5)
+    var sc = ease(prog(t,SCH,0.6));
+    var KX = lerp(1200,1100,s2), KY = lerp(110,170,s2), KW = lerp(370,380,s2), KH = 170;
+    var DX = lerp(1200,1100,s2), DY = lerp(360,580,s2), DW = KW, DH = 170;
+    if (sc>0){
+      out += '<g opacity="'+sc+'">'+R(KX,KY,KW,KH,24,hexA('#ffcc33',.14),'#ffcc33',8)+
+             T(KX+KW/2,KY+KH/2+13,37,'kube-scheduler','#ffffff')+'</g>';
+      out += '<g opacity="'+sc+'">'+R(DX,DY,DW,DH,24,hexA('#5b8cff',.18),'#5b8cff',8)+
+             T(DX+DW/2,DY+DH/2-12,42,'Neuron DRA','#ffffff')+T(DX+DW/2,DY+DH/2+40,42,'driver','#ffffff')+'</g>';
+    }
+    // scheduler -> DRA driver: which NeuronCores can this pod get?
+    var ak = ease(prog(t,ASK,0.6));
+    if (ak>0) out += arrow(KX+KW/2, KY+KH+6, KX+KW/2, lerp(KY+KH+6, DY-6, ak), '#ffcc33', '');
+    // beat 4 only: DRA -> pod (allocates the cores), scheduler -> pod (places it); they fade in beat 5
+    var f4 = 1 - s2;
+    // DRA -> the device's NeuronCores (below the pod), then the device moves into the pod
+    var al = ease(prog(t,ALLOC,0.6)), alo = f4 * (1 - prog(t,MOVE+0.6,0.4));
+    if (al>0 && alo>0){
+      var ax = DX+DW/2, ay0 = DY+DH+6, ayE = 745, axE = 606;
+      var p1 = clamp(al*2), p2 = clamp(al*2-1);
+      var seg = '<path d="M'+ax+' '+ay0+' V'+lerp(ay0,ayE,p1)+(p2>0?' H'+lerp(ax,axE+24,p2):'')+'" stroke="#9ab6ff" stroke-width="8" fill="none" stroke-linecap="round"/>';
+      if (p2>=1) seg += '<polygon points="'+(axE+30)+','+(ayE-16)+' '+axE+','+ayE+' '+(axE+30)+','+(ayE+16)+'" fill="#9ab6ff"/>';
+      out += '<g opacity="'+alo+'">'+seg+'</g>';
+    }
+    var bd = ease(prog(t,BIND,0.6)) * f4;
+    if (bd>0){
+      var bx = lerp(KX-6, 1000, ease(prog(t,BIND,0.6)));
+      out += '<g opacity="'+f4+'"><path d="M'+(KX-6)+' '+(KY+KH/2)+' H'+bx+'" stroke="#ffcc33" stroke-width="8" fill="none" stroke-dasharray="18 10"/>'+
+             (prog(t,BIND,0.6)>=1 ? arrow(1000,KY+KH/2,1000,282,'#ffcc33',' stroke-dasharray="18 10"') : '')+'</g>';
+    }
+    // beat 5: one scheduler arrow and one DRA arrow per pod
+    for (q=0;q<NP;q++){
+      var a5 = ease(prog(t,PODS-0.6+q*PSTEP,0.5)); if (a5<=0) continue;
+      var tx = PX+PW/2+8, ty = PY0+q*PG;
+      out += arrow(KX-6, KY+KH/2, lerp(KX-6,tx,a5), lerp(KY+KH/2,ty-22,a5), '#ffcc33', ' stroke-dasharray="18 10"');
+      out += arrow(DX-6, DY+DH/2, lerp(DX-6,tx,a5), lerp(DY+DH/2,ty+22,a5), '#9ab6ff', '');
+    }
+    document.getElementById('dyn').innerHTML = out;
+  }
+
+  function engOn(t,e){
+    if (t < ENG0) return false;
+    if (t < ALL) return t >= ENG0+e*ESTEP && t < ENG0+(e+1)*ESTEP;
+    return t < ALL + 1.0 || t >= B3;            // all four together, then again in the final picture
+  }
+  function anyEng(t){ return engOn(t,0)||engOn(t,1)||engOn(t,2)||engOn(t,3); }
+  function linkRect(a,b){
+    var W = 26;
+    if (a.y === b.y){ // horizontal neighbours
+      var x1 = Math.min(a.x,b.x)+CW, x2 = Math.max(a.x,b.x);
+      return {x:x1-4, y:a.y+CW/2-W/2, w:x2-x1+8, h:W};
+    }
+    var y1 = Math.min(a.y,b.y)+CW, y2 = Math.max(a.y,b.y);
+    return {x:a.x+CW/2-W/2, y:y1-4, w:W, h:y2-y1+8};
+  }
+
+  // ---- loop / restart / reduced motion ----
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=8 freezes at 8 s (for checking)
+  var END_T = LOOP - 0.01;
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(END_T); return; }
+  // plays once, only after a click (or Space); holds the last frame; another click replays it
+  var t0 = 0, running = false;
+  function tick(now){ var t = Math.max(0, (now - t0)/1000);
+    if (t >= END_T){ render(END_T); running = false; return; }
+    render(t); requestAnimationFrame(tick); }
+  function start(){ t0 = performance.now(); if (!running){ running = true; requestAnimationFrame(tick); } }
+  render(0);
+  document.addEventListener('click', start);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); start(); } });
+})();
+</script>
+</body>
+</html>
