@@ -171,6 +171,27 @@ def s2c_svg():
     return o + "</svg>"
 
 
+def kernel_side_by_side():
+    """One slide right after S5a-AFTER: the same LingBot block without and with the kernel, side by side."""
+    img = lambda f: base64.b64encode(open(os.path.join(HERE, "anim", f), "rb").read()).decode()
+    col = ('<div style="display:flex;flex-direction:column;gap:10px;width:560px">'
+           '<div style="font-size:30px;font-weight:800;color:%s">%s</div>'
+           '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" style="width:560px;height:auto;border-radius:8px"></a>'
+           '<div style="font-size:21px;color:#c3c2b7">%s</div></div>')
+    left = col % ("#ff6b6b", "WITHOUT the kernel: 8.98 ms", S5A_URL, img("S5a_code_view_marked.jpg"),
+                  "5 yellow boxes: the matmul engine stops and waits for the softmax")
+    right = (col % ("#4cd04c", "WITH the kernel: 4.37 ms", "", img("S5h_kernel_marked.jpg"),
+                    "green box: no waiting, the softmax runs alongside the matmuls")).replace('<a href="" target="_blank" rel="noopener">', "").replace("</a>", "")
+    body = ('<div style="display:flex;gap:40px;justify-content:center;align-items:flex-start;width:100%%">%s%s</div>' % (left, right))
+    cell = ('<div class="cell" data-ref="S5a-KERNEL"><section class="slide"><p class="kicker">Idea 3 · NKI · Keep the engines busy</p>'
+            '<h1>The same LingBot block, before and after the kernel</h1><div class="body">%s</div>'
+            '<p class="takeaway"><span class="k">Takeaway</span><span>2.1× faster: the kernel overlaps the softmax with the matmuls, so Tensor stops waiting.</span></p>'
+            '</section><div class="nt">%s</div></div>\n') % (body, notes(
+                ["new slide, right after S5a-AFTER, so the fix sits next to the problem"],
+                ["Left: pairs/block_WITHOUT_kernel_8.98ms (S5a). Right: pairs/block_WITH_kernel_4.37ms (S5h). Same rank, same shard, same block; only the attention changes."]))
+    return with_banner(cell, "S5a-KERNEL", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="S5a-KERNEL-AFTER"', 'data-ref="S5a-KERNEL"')
+
+
 # ───────────── edit machinery ─────────────
 class Miss(Exception):
     pass
@@ -310,6 +331,8 @@ pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
       "56.1 ms → 8.98 ms; three gaps ~22 ms → five softmax gaps of ~0.3 ms, 1.46 ms in all (1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms from the block start; Vector 93-99% and Scalar 87-97% busy in them, all from attention.py:802). A sixth 85 us gap at 7.83 ms is not softmax.", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
      ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself.",
       "<b>Profile:</b> docs/talk/validate/pairs/block_WITHOUT_kernel_8.98ms (S5a)/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/block_WITHOUT_kernel_8.98ms (S5a)/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (kiro/e2e/profile.sh)."])
+
+PAIRS.append(kernel_side_by_side())
 
 pair("S5b", "Wan2.2 Explorer screenshot",
      [("img", timeline("iv_demo_sdpa.json", 726, 478, "every instruction of F.scaled_dot_product_attention")),
