@@ -45,6 +45,11 @@
     <div id="hud" aria-hidden="true"></div>
   </div>
 
+  <div class="row" style="margin-top:12px" role="group" aria-label="Content check">
+    <button id="describe">What does Muse Glimmer see?</button>
+  </div>
+  <p id="caption" aria-live="polite"></p>
+
   <p id="status" role="status" aria-live="polite">Pick a scene and press Start.</p>
 
   <div class="row" role="group" aria-label="Camera controls">
@@ -65,10 +70,6 @@
   <label for="prompt">Prompt (sent with Start; "Send prompt" switches it live)</label>
   <textarea id="prompt" rows="4"></textarea>
   <div class="row"><button id="sendPrompt">Send prompt</button></div>
-  <div class="row" role="group" aria-label="Content check">
-    <button id="describe">What does Muse Glimmer see?</button>
-  </div>
-  <p id="caption" aria-live="polite"></p>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
