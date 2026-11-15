@@ -111,7 +111,7 @@ rank 0's capture is +16%). Tools: `engine_overlap.py`, `attn_span.py` (this fold
 | Tensor busy | **45.3%** | 39% |
 | Exactly one engine busy | **28.5%** | 36% |
 | Every engine idle | **16.6%** | 16% |
-| Tensor gaps > 50 us during attention | **6 gaps, 1.54 ms** (each ~0.3 ms) | 3 gaps, ~22 ms |
+| Tensor gaps > 50 us during attention | **6 gaps, 1.54 ms**; 5 of them are the softmax (~0.3 ms each, 1.46 ms: 1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms), the 6th (85 us at 7.83 ms) is not | 3 gaps, ~22 ms |
 | Softmax work (Vector + Scalar) while Tensor idle | **2.32 ms** | |
 | Attention on Vector (max, sum) / Scalar (exp) | **2.93 / 1.87 ms** | 12.8 / 7.7 ms |
 | Source line of every attention instruction (S5b) | `wan/modules/attention.py:802`, `F.scaled_dot_product_attention` | |

@@ -118,7 +118,8 @@ def timeline(prof, w, h, sel_label, gap_ms=0.05):
         a0, a1 = min(a for a, _ in att), max(b for _, b in att)
         ten = sorted(d["eng"]["Tensor"])
         for (p0, p1), (q0, q1) in zip(ten, ten[1:]):
-            if q0 - p1 > gap_ms and p1 >= a0 and q0 <= a1:
+            vs = sum(max(0, min(y, q0) - max(x, p1)) for x, y in d["att"].get("Vector", []))
+            if q0 - p1 > gap_ms and p1 >= a0 and q0 <= a1 and vs > 0.5 * (q0 - p1):
                 s += ('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="none" stroke="#fab219" stroke-width="2.5" '
                       'stroke-dasharray="6 4"/>' % (sx(p1), top + 1, sx(q0) - sx(p1), rh - 2))
     for t in range(0, int(ms) + 1):
@@ -296,10 +297,10 @@ pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
      [("r", "One compiled DiT block, native SDPA, one core: 56.1 ms",
        "One compiled LingBot DiT block, SDPA as matmul → softmax → matmul, one core: 8.98 ms"),
       ("img", timeline("iv_blk_sdpa.json", 726, 478, "F.scaled_dot_product_attention (attention.py:802)")),
-      ("r", "<b>Three long Tensor gaps:</b> ~22 of 56 ms", "<b>Six Tensor gaps:</b> 1.54 of 8.98 ms (dashed)"),
+      ("r", "<b>Three long Tensor gaps:</b> ~22 of 56 ms", "<b>Five Tensor gaps:</b> ~0.3 ms each, 1.46 of 8.98 ms (dashed)"),
       ("r", "<b>Three times,</b> once per head", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle")],
      ["screenshot of the Wan2.2 block → engine timeline drawn from the LingBot block's profile (pairs/1_sdpa_math_rank1, rank 1)",
-      "56.1 ms → 8.98 ms; three gaps ~22 ms → six gaps 1.54 ms", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
+      "56.1 ms → 8.98 ms; three gaps ~22 ms → five softmax gaps of ~0.3 ms, 1.46 ms in all (1.37-1.67, 2.52-2.82, 3.67-3.97, 4.84-5.12, 6.34-6.61 ms from the block start; Vector 93-99% and Scalar 87-97% busy in them, all from attention.py:802). A sixth 85 us gap at 7.83 ms is not softmax.", "\"three times, once per head\" → 2.32 ms softmax with Tensor idle"],
      ["TORCH_NEURONX_ENABLE_NKI_SDPA=0, otherwise torch-neuronx (SDK 2.33) swaps in an NKI kernel by itself.",
       "<b>Profile:</b> docs/talk/validate/pairs/S5a-AFTER/s5a_lingbot_block_sdpa_8.98ms.neff + .ntff (rank 1 of 32, TP4 x CP8, the steady block, 1,600 calls per pass), source pairs/S5a-AFTER/source.tar.gz (unpacks to /tmp/lingbot, the path in the NEFF). Job talk-sdpa-math-job.yaml (kiro/e2e/profile.sh)."])
 
