@@ -189,20 +189,21 @@ def kernel_side_by_side():
 
 def b6b_profile():
     """One slide right after B6b-AFTER: the copy-first block in the profile (the read-in-place block goes next to it)."""
-    img = base64.b64encode(open(os.path.join(HERE, "anim", "B6b_copy_first_marked.jpg"), "rb").read()).decode()
-    body = ('<div style="display:flex;gap:36px;align-items:center;width:100%%">'
-            '<img src="data:image/jpeg;base64,%s" alt="copy-first block in Neuron Explorer: DMA busy ~14 ms copying, compute engines empty" style="height:455px;width:auto;border-radius:8px">'
-            '<div style="display:flex;flex-direction:column;gap:20px">'
-            '<div style="font-size:28px;font-weight:800;color:#ff6b6b">COPY FIRST: 17.1 ms block</div>'
-            '<div class="stat"><div class="v" style="color:#ff6b6b">14.4 <small>of 17.1 ms</small></div><div class="l">spent copying the memory into a new buffer (DMA busy)</div></div>'
-            '<div class="stat"><div class="v">~0 <small>compute</small></div><div class="l">Tensor, Vector, Scalar empty while it copies</div></div>'
-            '<div style="font-size:17px;color:#898781">wan/modules/attention.py:448-449 · pairs/copy_first_17.1ms (B6b)</div>'
-            '</div></div>') % img
+    img = lambda f: base64.b64encode(open(os.path.join(HERE, "anim", f), "rb").read()).decode()
+    col = ('<div style="display:flex;flex-direction:column;gap:8px;width:560px">'
+           '<div style="font-size:28px;font-weight:800;color:%s">%s</div>'
+           '<img src="data:image/jpeg;base64,%s" alt="%s" style="width:560px;max-height:330px;object-fit:contain;object-position:top;border-radius:8px">'
+           '<div style="font-size:19px;color:#c3c2b7">%s</div></div>')
+    body = ('<div style="display:flex;gap:32px;justify-content:center;align-items:flex-start;width:100%%">%s%s</div>'
+            % (col % ("#ff6b6b", "COPY FIRST: 17.1 ms block", img("B6b_copy_first_marked.jpg"), "copy-first block: DMA busy ~14 ms, compute empty",
+                      "14.4 of 17.1 ms copying the memory; Tensor, Vector, Scalar empty"),
+               col % ("#4cd04c", "READ IN PLACE: 2.92 ms block", img("B6b_read_in_place_marked.jpg"), "read-in-place block: compute engines busy the whole block",
+                      "no copy: the compute engines work the whole block")))
     cell = ('<div class="cell" data-ref="B6b-PROFILE"><section class="slide"><h1>Backup: the copy, in the profile</h1>'
             '<div class="body">%s</div>'
-            '<p class="takeaway"><span class="k">Takeaway</span><span>While the memory is copied, the chip computes nothing.</span></p>'
+            '<p class="takeaway"><span class="k">Takeaway</span><span>Copying the memory first leaves the chip idle; reading it in place keeps it working.</span></p>'
             '</section><div class="nt">%s</div></div>\n') % (body, notes(
-                ["new slide right after B6b-AFTER: the copy-first block in Neuron Explorer, marked"],
+                ["new slide right after B6b-AFTER: copy-first and read-in-place blocks in Neuron Explorer, marked, side by side"],
                 ["Profile: pairs/copy_first_17.1ms (B6b), job lbw-talk-b6-nomerge (LINGBOT_CTE_MERGE=0), rank 0, the chunk position where the copy is worst. "
                  "The copy is the loop at attention.py:444-450 (_cte_attention_chunks). The read-in-place block: pairs/read_in_place_2.92ms (B6b)."]))
     return with_banner(cell, "B6b-PROFILE", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="B6b-PROFILE-AFTER"', 'data-ref="B6b-PROFILE"')
