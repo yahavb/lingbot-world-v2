@@ -329,7 +329,7 @@ def _encode_prompt_tp(args, cfg, device, rank, world_size):
     init_t5_parallel_group(world_size)
     # LINGBOT_T5_FP32=1: run the encoder in fp32 (output rounded to cfg.t5_dtype once). The bf16
     # TP encoder's context was 2.8% (32 ranks) / 3.5% (16 ranks) rel-RMS from an fp32 CPU T5
-    # (kiro/e2e/t5_ref.py). The encode runs once per prompt, before GEN.
+    # (perf/e2e/t5_ref.py). The encode runs once per prompt, before GEN.
     _t5_fp32 = os.environ.get("LINGBOT_T5_FP32", "0") == "1"
     text_encoder = T5EncoderModel(
         text_len=cfg.text_len,

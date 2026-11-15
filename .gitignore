@@ -10,3 +10,4 @@ logs/
 *.pth
 *.zip
 results/
+docs/talk/validate/pairs/
