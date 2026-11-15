@@ -24,7 +24,7 @@ import tempfile
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 LBW_URL = os.environ.get("LBW_URL", "http://lbw-v2-dit-t5.default.svc.cluster.local:8000")
 VLM_URL = os.environ.get("VLM_URL", "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1")
@@ -191,6 +191,16 @@ async def stop():
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
+# URL_PREFIX (e.g. /lbw): serve under that path, so an ALB can route /lbw straight here.
+# The page uses relative URLs, so it only needs the trailing slash.
+PREFIX = os.environ.get("URL_PREFIX", "").rstrip("/")
+if PREFIX:
+    root = FastAPI()
+    root.add_api_route(PREFIX, lambda: RedirectResponse(PREFIX + "/"), include_in_schema=False)
+    root.mount(PREFIX, app)
+else:
+    root = app
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "7860")),
+    uvicorn.run(root, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "7860")),
                 log_level="warning")
