@@ -172,23 +172,18 @@ def s2c_svg():
 
 
 def kernel_side_by_side():
-    """One slide right after S5a-AFTER: the same LingBot block without and with the kernel, side by side."""
-    img = lambda f: base64.b64encode(open(os.path.join(HERE, "anim", f), "rb").read()).decode()
-    col = ('<div style="display:flex;flex-direction:column;gap:10px;width:560px">'
-           '<div style="font-size:30px;font-weight:800;color:%s">%s</div>'
-           '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" style="width:560px;height:auto;border-radius:8px"></a>'
-           '<div style="font-size:21px;color:#c3c2b7">%s</div></div>')
-    left = col % ("#ff6b6b", "WITHOUT the kernel: 8.98 ms", S5A_URL, img("S5a_code_view_marked.jpg"),
-                  "5 yellow boxes: the matmul engine stops and waits for the softmax")
-    right = (col % ("#4cd04c", "WITH the kernel: 4.37 ms", "", img("S5h_kernel_marked.jpg"),
-                    "green box: no waiting, the softmax runs alongside the matmuls")).replace('<a href="" target="_blank" rel="noopener">', "").replace("</a>", "")
-    body = ('<div style="display:flex;gap:40px;justify-content:center;align-items:flex-start;width:100%%">%s%s</div>' % (left, right))
+    """One slide right after S5a-AFTER: the same LingBot block WITH the kernel (S5a-AFTER shows it without)."""
+    img = base64.b64encode(open(os.path.join(HERE, "anim", "S5h_kernel_marked.jpg"), "rb").read()).decode()
+    body = ('<div style="display:flex;flex-direction:column;gap:10px;align-items:center;width:100%%">'
+            '<div style="font-size:30px;font-weight:800;color:#4cd04c">WITH the kernel: 4.37 ms</div>'
+            '<img src="data:image/jpeg;base64,%s" style="width:760px;height:auto;border-radius:8px">'
+            '<div style="font-size:21px;color:#c3c2b7">green box: no waiting, the softmax runs alongside the matmuls</div></div>' % img)
     cell = ('<div class="cell" data-ref="S5a-KERNEL"><section class="slide"><p class="kicker">Idea 3 · NKI · Keep the engines busy</p>'
-            '<h1>The same LingBot block, before and after the kernel</h1><div class="body">%s</div>'
+            '<h1>The same LingBot block with the kernel</h1><div class="body">%s</div>'
             '<p class="takeaway"><span class="k">Takeaway</span><span>2.1× faster: the kernel overlaps the softmax with the matmuls, so Tensor stops waiting.</span></p>'
             '</section><div class="nt">%s</div></div>\n') % (body, notes(
-                ["new slide, right after S5a-AFTER, so the fix sits next to the problem"],
-                ["Left: pairs/block_WITHOUT_kernel_8.98ms (S5a). Right: pairs/block_WITH_kernel_4.37ms (S5h). Same rank, same shard, same block; only the attention changes."]))
+                ["new slide, right after S5a-AFTER (which is labelled WITHOUT the kernel: 8.98 ms), so the fix sits next to the problem"],
+                ["pairs/block_WITH_kernel_4.37ms (S5h). Same rank, same shard, same block as S5a; only the attention changes."]))
     return with_banner(cell, "S5a-KERNEL", "after", "LingBot-World v2 · 8 trn3 chips").replace('data-ref="S5a-KERNEL-AFTER"', 'data-ref="S5a-KERNEL"')
 
 
@@ -321,7 +316,7 @@ pair("S4e", "Wan2.2 VAE; for LingBot the result is the opposite",
 pair("S5a", "Wan2.2 block: 56.1 ms, 3 heads, Explorer screenshot",
      [("r", "One compiled DiT block, native SDPA, one core: 56.1 ms",
        "One compiled LingBot DiT block, SDPA as matmul → softmax → matmul, one core: 8.98 ms"),
-      ("img", '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="LingBot block without the kernel in Neuron Explorer, attention.py:802 selected; five Tensor gaps marked" style="width:726px;height:auto"></a>'
+      ("img", '<div><div style="font-size:30px;font-weight:800;color:#ff6b6b;margin-bottom:8px">WITHOUT the kernel: 8.98 ms</div><a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="LingBot block without the kernel in Neuron Explorer, attention.py:802 selected; five Tensor gaps marked" style="width:726px;height:auto"></a></div>'
               % (S5A_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5a_code_view_marked.jpg"), "rb").read()).decode())),
       ("r", "<b>Three long Tensor gaps:</b> ~22 of 56 ms", "<b>Five Tensor gaps:</b> ~0.3 ms each, 1.46 of 8.98 ms (yellow)"),
       ("r", "<b>Three times,</b> once per head", "<b>All inside attention:</b> 2.32 ms of softmax with Tensor idle"),
