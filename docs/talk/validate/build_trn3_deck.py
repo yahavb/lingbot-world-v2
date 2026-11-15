@@ -340,10 +340,12 @@ pair("S5b", "Wan2.2 screenshot · no AFTER: merged into S5a-AFTER",
 
 PAIRS.pop()   # S5b-AFTER removed: S5a-AFTER's one screenshot already shows "select one call, see every instruction"
 
-pair("S5d", "Wan2.2: 39% / 36% / 16%",
+pair("S5d", "Wan2.2 numbers · no AFTER: same point as S5a",
      [("r", "One native-SDPA block, 56.1 ms, measured from the profile", "One LingBot block, SDPA as matmul → softmax → matmul, 8.98 ms, measured from the profile"),
       ("re", r">39%<", ">45%<"), ("re", r">36%<", ">29%<"), ("re", r">16%<", ">17%<")],
      ["56.1 ms → 8.98 ms", "Tensor busy 39% → 45%", "one engine busy 36% → 29% (28.5%)", "every engine idle 16% → 17% (16.6%)"])
+
+PAIRS.pop()   # S5d-AFTER removed: it repeats S5a in numbers
 
 pair("S5f", "Wan2.2: 18.2 → 5.3 ms per call, 7,854 tokens",
      [("svg", 0, hbars([(0, "SELF-ATTENTION, ONE LINGBOT RANK: 640 × 17,280"), (298, "PER CALL")],

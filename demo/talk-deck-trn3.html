@@ -886,7 +886,7 @@
 <p>The pink box is the selected instruction’s details; it covers the right half of the top rows. The dense part after 35 ms is on the previous slide.</p>
 <p><b>Click 1, the takeaway:</b> Map the profile back to your code: select a PyTorch call, see every instruction it made.</p>
 </div></div>
-<div class="cell" data-ref="S5d-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>Wan2.2: 39% / 36% / 16%</small></div>
+<div class="cell" data-ref="S5d-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>Wan2.2 numbers · no AFTER: same point as S5a</small></div>
   <p class="kicker">Idea 3 · NKI · Keep the engines busy</p>
   <h1>Measured: half the block, at most one engine busy</h1>
   <p class="dek">One native-SDPA block, 56.1 ms, measured from the profile</p>
@@ -908,22 +908,6 @@
 <p><b>If asked:</b> the softmax costs 12.8 ms of Vector time (max and sum) and 7.7 ms of Scalar time (exp) per block (<code>engine_overlap.py</code> on the profile).</p>
 <p><b>Click 1, the takeaway on the slide:</b> Engines taking turns is time a kernel can win back. Here, it is attention.</p>
 </div></div>
-<div class="cell" data-ref="S5d-AFTER"><section class="slide"><div class="bab after">AFTER<small>LingBot-World v2 · 8 trn3 chips</small></div>
-  <p class="kicker">Idea 3 · NKI · Keep the engines busy</p>
-  <h1>Measured: half the block, at most one engine busy</h1>
-  <p class="dek">One LingBot block, SDPA as matmul → softmax → matmul, 8.98 ms, measured from the profile</p>
-  <div class="body">
-<div class="stack" style="gap:30px">
-<div class="stats c3">
-  <div class="stat big x"><div class="v">45%</div><div class="l">Tensor busy</div></div>
-  <div class="stat big x"><div class="v">29%</div><div class="l">only one engine busy</div></div>
-  <div class="stat big x"><div class="v">17%</div><div class="l">every engine idle</div></div>
-</div>
-</div>
-  </div>
-  <p class="takeaway" data-step="1"><span class="k">Takeaway</span><span>Engines taking turns is time a kernel can win back. Here, it is attention.</span></p>
-</section>
-<div class="nt"><p class="meta">AFTER · the same slide, LingBot-World v2 on 8 trn3 chips (xl-lnc2, TP4 × CP8), 81 frames 480×768 · numbers from docs/talk/validate/RESULTS.md</p><p><b>Changed from the original:</b></p><ul><li>56.1 ms → 8.98 ms</li><li>Tensor busy 39% → 45%</li><li>one engine busy 36% → 29% (28.5%)</li><li>every engine idle 16% → 17% (16.6%)</li></ul></div></div>
 <div class="cell" data-ref="S5f-BEFORE"><section class="slide"><div class="bab before">BEFORE<small>Wan2.2: 18.2 → 5.3 ms per call, 7,854 tokens</small></div>
   <p class="kicker">Idea 3 · NKI · Keep the engines busy</p>
   <h1>Attention: the operator that dominates</h1>
