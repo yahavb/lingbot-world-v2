@@ -229,6 +229,7 @@ def notes(changes, extra=()):
 
 
 PAIRS = []
+S5B_URL = "https://neuron-explorer.harmony.a2z.com/profile/attention_only_WITHOUT_kernel_2.69ms_S5b?shared=H4sIAKwS-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWt1lBJLSlLzSjLz8-Lz83Iq0Q0z0jOzBBuWhMcwIzMLM1MDy9paACJ_RF6SAAAA"
 S5A_URL = "https://neuron-explorer.harmony.a2z.com/profile/block_WITHOUT_kernel_8.98ms_S5a?shared=H4sIAFoF-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWtrAdB7B0lFAAAA"
 
 
@@ -348,11 +349,16 @@ pair("S5d", "Wan2.2 numbers · no AFTER: same point as S5a",
 PAIRS.pop()   # S5d-AFTER removed: it repeats S5a in numbers
 
 pair("S5f", "Wan2.2: 18.2 → 5.3 ms per call, 7,854 tokens",
-     [("svg", 0, hbars([(0, "SELF-ATTENTION, ONE LINGBOT RANK: 640 × 17,280"), (298, "PER CALL")],
-                       [dict(label="Native SDPA", v=2.687, text="2.69 ms", bar="bar-x", t="t"),
-                        dict(label="nkilib attention_cte", v=1.574, text="1.57 ms", bar="bar-g", t="t-g", step=1)],
-                       x0=298, maxw=744, rowh=120))],
-     ["7,854 tokens (Wan2.2) → one LingBot rank: 640 queries × 17,280 keys, 10 heads",
+     [("svg", 0, '<div style="display:flex;gap:36px;align-items:center;width:100%%">'
+                 '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" alt="attention alone without the kernel in Neuron Explorer: one 1.17 ms Tensor pause" style="width:760px;height:auto;border-radius:8px"></a>'
+                 '<div style="display:flex;flex-direction:column;gap:22px">'
+                 '<div class="stat"><div class="v" style="color:#ff6b6b">2.69 <small>ms</small></div><div class="l">Native SDPA: the matmul engine waits 1.17 ms</div></div>'
+                 '<div class="stat g" data-step="1"><div class="v">1.57 <small>ms</small></div><div class="l">nkilib attention_cte: no long wait</div></div>'
+                 '<p><a class="xlink" href="%s" target="_blank" rel="noopener">Open this profile in Neuron Explorer</a></p>'
+                 '<p style="font-size:15px;color:#898781">attention alone, one call over 17,280 keys: a simplified test, not the block\'s exact attention</p>'
+                 '</div></div>' % (S5B_URL, base64.b64encode(open(os.path.join(HERE, "anim", "S5f_without_code_marked.jpg"), "rb").read()).decode(), S5B_URL))],
+     ["chart → your Neuron Explorer screenshot of attention alone without the kernel (line 55 selected), linked to the shared profile; with-kernel screenshot to come",
+      "7,854 tokens (Wan2.2) → one LingBot rank: 640 queries × 17,280 keys, 10 heads",
       "18.2 → 5.3 ms → 2.69 → 1.57 ms device time per call (demo/sdpa_vs_nki.py, one core)"])
 
 pair("S5g", "Wan2.2: 16.2 → 13.2 s; for LingBot calling it yourself is slower",
