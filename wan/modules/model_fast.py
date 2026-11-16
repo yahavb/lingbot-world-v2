@@ -3717,6 +3717,9 @@ def load_tp_wan_model_fast(checkpoint_dir, subfolder, tp_degree, dtype,
                 model = model.to(device=device)
             model.eval()
             model.requires_grad_(False)
+            if tp_degree > 1 and not _FFN_MX:
+                _q(f"[model_fast] after load: device memory allocated "
+                   f"{torch.neuron.memory_allocated() / (1 << 30):.2f} GiB (rank 0)")
             if _FFN_MX and tp_degree > 1:
                 # Right after the weights land on the device, before the KV cache and the first
                 # forward allocate: at LNC1 the bf16 model alone leaves no room for those.
