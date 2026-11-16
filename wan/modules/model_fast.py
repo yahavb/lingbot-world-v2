@@ -911,7 +911,9 @@ def _prequantize_ffn_mx(blocks):
             rel = ((ref.float() - dense).norm() / dense.norm()).item()
             _q(f"[model_fast] LINGBOT_FFN_MX: {ffn_mx.FP8}, compiled vs eager max|d| {dd:.3e}, "
                f"eager vs bf16-weight fp32 matmul rel {rel:.3e}")
-            if dd > 0 or not rel < 0.1:
+            # tuned tiles (LINGBOT_MX_TUNED) may sum in another order than the default eager kernel
+            _tol = 1e-2 * float(ref.float().abs().max()) if ffn_mx._TUNED_ON else 0.0
+            if dd > _tol or not rel < 0.1:
                 raise RuntimeError(f"LINGBOT_FFN_MX self-check failed: compiled vs eager {dd}, rel {rel}")
         # Free the bf16 copies (weight, and LINGBOT_WT_PRE's transposed _wt): only the MXFP8 data
         # and scales serve the FFN from here on. The empty weight keeps .dtype for the callers.

@@ -40,3 +40,47 @@ def prequantize_weight(w):
 
 mm_eager = _mm_pq[LNC]       # x [M, K] bf16, (data, scales) -> [M, N] bf16
 mm = wrap_nki(_mm_pq)        # the same, traceable inside a fullgraph torch.compile region
+
+
+# LINGBOT_MX_TUNED=1 (LNC1): per-shape tiles from perf/mx_tile_sweep.py at the LNC1 TP4 x CP8
+# per-rank shapes (M=544), one Neuron core, us/call vs bf16 torch.matmul at the same shape:
+#   (K, N) = (5120, 1280) q/k/v, cross q/k/v, cam layer1/scale/shift: 99.9 vs 172.5 (default 130.8)
+#            (1536, 5120) o, cross o, cam layer2:                    107.1 vs 201.8 (default 183.5)
+#            (5120, 3456) ffn.0:                                       192.9 vs 407.7 (default 251.9)
+#            (3584, 5120) ffn.2:                                       173.0 vs 425.9 (default 192.0)
+_TUNED = {
+    (5120, 1280): dict(tn=1280, bm=4, bn=1, bk=10, lm=4, ln=1, sr=False, extra={"load_with_PE_swizzle": True}),
+    (1536, 5120): dict(tn=512, bm=4, bn=4, bk=3, lm=4, ln=2, sr=True, extra={}),
+    (5120, 3456): dict(tn=512, bm=4, bn=4, bk=10, lm=4, ln=2, sr=True, extra={"load_with_PE_swizzle": True}),
+    (3584, 5120): dict(tn=512, bm=4, bn=4, bk=7, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
+}
+_TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1" and LNC == 1
+_TUNED_MM = {}
+
+
+def _tuned_kernel(key):
+    t = _TUNED[key]
+    kw = dict(TILES_IN_BLOCK_M=t["bm"], TILES_IN_BLOCK_N=t["bn"], TILES_IN_BLOCK_K=t["bk"],
+              TILES_IN_LOAD_M=t["lm"], TILES_IN_LOAD_N=t["ln"],
+              lhs_matmul_tile_shape_logical=(512, 128), rhs_matmul_tile_shape_logical=(512, t["tn"]),
+              spill_reload=t["sr"], **t["extra"])
+
+    @nki.jit
+    def k(lhs, w_data, w_scales):
+        return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
+                            output_dtype=nl.bfloat16, run_with_lnc2=False,
+                            use_scale_packing=True, lhs_is_swizzled=False, **kw)
+    return wrap_nki(k)
+
+
+_mm_default = mm
+
+
+def mm(x, w_data, w_scales):  # noqa: F811 -- tuned dispatch over the default kernel
+    if _TUNED_ON:
+        key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
+        if key in _TUNED:
+            if key not in _TUNED_MM:
+                _TUNED_MM[key] = _tuned_kernel(key)
+            return _TUNED_MM[key](x, w_data, w_scales)
+    return _mm_default(x, w_data, w_scales)
