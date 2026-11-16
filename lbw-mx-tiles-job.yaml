@@ -1,0 +1,74 @@
+# MX tile sweep (perf/mx_tile_sweep.py): one trn3 device at LNC1, one Linear shape of the LNC1
+# TP4 x CP8 block per NeuronCore, nkilib autotune candidates vs bf16. Results in the pod log.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lbw-mx-tiles
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              trap 'sleep "${KEEP_ALIVE_SECONDS:-600}"' EXIT
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              cd /tmp/lingbot
+              echo "commit: $(git log --oneline -1)"
+              pip list 2>/dev/null | grep -iE "^(nki|nkilib|neuronx-cc|torch-neuronx) " || true
+              if ! python3 -c "import nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_kernel, nkilib.experimental.quantize_mxfp8.quantize_mxfp8" 2>/tmp/imp.err; then
+                echo "installed nkilib has no MXFP8 kernels ($(tail -1 /tmp/imp.err)); using github aws-neuron/nki-library"
+                git clone -q --depth 1 https://github.com/aws-neuron/nki-library.git /tmp/nkl
+                export PYTHONPATH=/tmp/nkl/src/nkilib_src
+              fi
+              # one shape per NeuronCore of the device, in parallel
+              i=0; for sh in qkv o ffn_up ffn_down cross_kv; do
+                NEURON_RT_VISIBLE_CORES=$i NEURON_LOGICAL_NC_CONFIG=1 SHAPE=$sh NKI_ENABLE_TRACE_CACHE=0 \
+                  python3 perf/mx_tile_sweep.py > /tmp/tile_$sh.log 2>&1 &
+                i=$((i+1))
+              done; wait
+              cat /tmp/tile_*.log | grep -a "^\[tile\]"
+              echo "TILES DONE"
+          env:
+            - name: BRANCH
+              value: "mxfp8"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FP8
+              value: "float8_e4m3fn"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: NKI_COMPILER_FRONTEND
+              value: "tracer"
+          resources:
+            claims:
+              - name: neuroncores
+            requests:
+              cpu: "8"
+              memory: 64Gi
+            limits:
+              memory: 128Gi
+          volumeMounts:
+            - name: node-cache
+              mountPath: /node-cache
+              readOnly: true
+      volumes:
+        - name: node-cache
+          hostPath:
+            path: /opt/lingbot-world-v2
+            type: Directory
