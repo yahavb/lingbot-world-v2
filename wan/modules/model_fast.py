@@ -758,6 +758,7 @@ _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
 _LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
 _FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
 # LINGBOT_LIN_MX_SKIP="self_attn.o,cross_attn.o": these Linears stay bf16 under LINGBOT_LIN_MX.
+_MX_QKV_FUSED = os.environ.get("LINGBOT_MX_QKV_FUSED", "0") == "1"
 _MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").replace(":", ",").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
@@ -877,8 +878,22 @@ def _prequantize_linears_mx(blocks):
     n = 0
     for blk in blocks:
         b_ = getattr(blk, "_orig_mod", blk)
+        sa = b_.self_attn
+        if _MX_QKV_FUSED and getattr(sa, "_mxqkv", None) is None:
+            with torch.no_grad():
+                h = nn.Module()
+                h.weight = nn.Parameter(torch.cat([sa.q.weight, sa.k.weight, sa.v.weight], 0), requires_grad=False)
+                bs = [l_.bias for l_ in (sa.q, sa.k, sa.v)]
+                h.register_buffer("bias", torch.cat(bs, 0) if all(x_ is not None for x_ in bs) else None)
+                _mx_quantize_linear(h)
+                sa._mxqkv = h
+                sa._qkv_split = (int(sa.q.weight.shape[0]), int(sa.k.weight.shape[0]), int(sa.v.weight.shape[0]))
+                for l_ in (sa.q, sa.k, sa.v):
+                    l_.weight = nn.Parameter(torch.empty(0, dtype=l_.weight.dtype, device=l_.weight.device),
+                                             requires_grad=False)
+                n += 3
         for name in _MX_LIN_NAMES:
-            if name in _MX_LIN_SKIP:
+            if name in _MX_LIN_SKIP or (_MX_QKV_FUSED and name in ("self_attn.q", "self_attn.k", "self_attn.v")):
                 continue
             lin = b_.get_submodule(name)
             _mx_quantize_linear(lin)
@@ -1087,6 +1102,14 @@ class CausalWanSelfAttention(nn.Module):
                 q = _tp_rms_norm(_lin(self.q), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
                 k = _tp_rms_norm(_lin(self.k), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
                 return q, k, _lin(self.v).view(b, s, n, d)
+            if (getattr(self, 'tp_enabled', False) and self.qk_norm
+                    and getattr(self, "_mxqkv", None) is not None):
+                # LINGBOT_MX_QKV_FUSED: one MXFP8 matmul on [Wq; Wk; Wv] (input loaded and quantized once)
+                qkv = _mx_linear_forward(self._mxqkv, x)
+                nq, nk, nv = self._qkv_split
+                q = _tp_rms_norm(qkv[..., :nq], self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                k = _tp_rms_norm(qkv[..., nq:nq + nk], self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                return q, k, qkv[..., nq + nk:].reshape(b, s, n, d)
             if (getattr(self, 'tp_enabled', False) and self.qk_norm
                     and getattr(self, "_wqkv", None) is not None):
                 qkv = torch_F.linear(x, self._wqkv, self._bqkv)
