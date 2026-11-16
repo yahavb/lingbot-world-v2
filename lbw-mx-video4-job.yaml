@@ -1,4 +1,4 @@
-# One 81-frame video on 4 trn3 devices (TP4 x CP4) -- was 8 devices with the live deploy's flags (TP4 x CP8, 480x768), then
+# One 81-frame video on 4 trn3 devices (l-lnc2, TP4 x CP4) with lbw-bench-job.yaml's flags (its 4-chip config ran).
 # the steady-state GEN / VAE times: fps = 81 / (GEN + VAE), the k8s_sweep definition (17.88 fps).
 # LINGBOT_FFN_MX=1 runs the FFN in MXFP8 (kernels/ffn_mx.py). The video is written to /tmp/results.
 apiVersion: batch/v1
@@ -79,7 +79,33 @@ spec:
             - name: dshm
               mountPath: /dev/shm
           env:
+            - name: LINGBOT_FFN_MX
+              value: "1"
+            - name: BRANCH
+              value: "mxfp8"
+            - name: LINGBOT_WT_PRE
+              value: "1"
+            - name: LINGBOT_ATTN_FMAJ
+              value: "1"
+            - name: LINGBOT_FFN_FMAJ
+              value: "1"
             - name: LINGBOT_VAE_GATHER1
+              value: "1"
+            - name: LINGBOT_FILM_ALL_CHUNKS
+              value: "3"
+            - name: LINGBOT_FILM_ALL_BLOCKS
+              value: "10"
+            - name: LINGBOT_FILM_ALL
+              value: "0"
+            - name: LINGBOT_BLOCK_GROUP
+              value: "2"
+            - name: LINGBOT_CTE_SCALAR_ROWMAX
+              value: "1"
+            - name: LINGBOT_CTE_PRIOR_FULL
+              value: "1"
+            - name: LINGBOT_CTE_EXP_SPLIT
+              value: "2"
+            - name: LINGBOT_T5_FP32
               value: "1"
             - name: LINGBOT_VAE_2D
               value: "1"
@@ -93,12 +119,56 @@ spec:
               value: "1"
             - name: LINGBOT_VAE_FUSED
               value: "1"
-            - name: LINGBOT_FFN_MX
+            - name: LINGBOT_STEP_NOWRITE
               value: "1"
-            - name: BRANCH
-              value: "mxfp8"
-            - name: LINGBOT_BENCH_RUNS
+            - name: LINGBOT_K_BLOCKED
+              value: "1"
+            - name: NKI_ENABLE_TRACE_CACHE
+              value: "0"
+            - name: LINGBOT_CTE_VGROUP
+              value: "8"
+            - name: LINGBOT_CTE_LOCAL
+              value: "1"
+            - name: LINGBOT_IMG_BLOCK
+              value: "1"
+            - name: LINGBOT_KEY_THREADS
+              value: "4"
+            - name: LINGBOT_COMMIT_NOHEAD
+              value: "1"
+            - name: LINGBOT_EMPTY_CACHE_SEQ
+              value: "1000000000"
+            - name: LINGBOT_PREUPLOAD
+              value: "1"
+            - name: LINGBOT_CROSS_NMAJOR
+              value: "1"
+            - name: LINGBOT_HEAD_COMPILE
+              value: "1"
+            - name: LINGBOT_FILM_BATCH
+              value: "1"
+            - name: LINGBOT_PLUCKER_COMPILE
+              value: "1"
+            - name: LINGBOT_ATTN_PAIR
+              value: "1"
+            - name: LINGBOT_ATTN_EARLY
               value: "2"
+            - name: LINGBOT_TOKEN_PAD
+              value: "32"
+            - name: LINGBOT_NO_SYNC
+              value: "1"
+            - name: LINGBOT_SKIP_LAST_COMMIT
+              value: "1"
+            - name: LINGBOT_LOAD_CONCURRENCY
+              value: "16"
+            - name: NEURON_LAUNCH_BLOCKING
+              value: "0"
+            - name: LINGBOT_FILM_A2A
+              value: "1"
+            - name: LINGBOT_CTE_MERGE
+              value: "1"
+            - name: LINGBOT_SP
+              value: "1"
+            - name: LINGBOT_HOT_ATTN
+              value: "cte"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
@@ -110,7 +180,7 @@ spec:
             - name: TP
               value: "4"
             - name: SIZE
-              value: "480*768"
+              value: "448*704"
             - name: FRAME_NUM
               value: "81"
             - name: CHUNK_SIZE
@@ -123,6 +193,8 @@ spec:
               value: "4"
             - name: PROMPT
               value: "gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
+            - name: LINGBOT_BENCH_RUNS
+              value: "2"
             - name: LINGBOT_CHUNKED_KV
               value: "1"
             - name: LINGBOT_COMPILE_DIT
@@ -133,61 +205,6 @@ spec:
               value: "1"
             - name: ATTENTION_BACKEND
               value: "cte"
-            # loop_engineering (kiro/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
-            # on the non-streaming path
-            - name: LINGBOT_HOT_ATTN
-              value: "cte"
-            - name: LINGBOT_SP
-              value: "1"
-            - name: LINGBOT_CTE_MERGE
-              value: "1"
-            - name: LINGBOT_FILM_A2A
-              value: "1"
-            - name: NEURON_LAUNCH_BLOCKING
-              value: "0"
-            - name: LINGBOT_LOAD_CONCURRENCY
-              value: "16"
-            - name: LINGBOT_SKIP_LAST_COMMIT
-              value: "1"
-            - name: LINGBOT_NO_SYNC
-              value: "1"
-            - name: LINGBOT_TOKEN_PAD
-              value: "32"
-            - name: LINGBOT_ATTN_EARLY
-              value: "2"
-            - name: LINGBOT_ATTN_PAIR
-              value: "1"
-            - name: LINGBOT_PLUCKER_COMPILE
-              value: "1"
-            - name: LINGBOT_FILM_BATCH
-              value: "1"
-            - name: LINGBOT_HEAD_COMPILE
-              value: "1"
-            - name: LINGBOT_CROSS_NMAJOR
-              value: "1"
-            - name: LINGBOT_PREUPLOAD
-              value: "1"
-            - name: LINGBOT_EMPTY_CACHE_SEQ
-              value: "1000000000"
-            - name: LINGBOT_COMMIT_NOHEAD
-              value: "1"
-            - name: LINGBOT_FILM_ALL
-              value: "1"
-            - name: LINGBOT_KEY_THREADS
-              value: "4"
-            - name: LINGBOT_IMG_BLOCK
-              value: "1"
-            # q20_kbnw (kiro/k8s_sweep.sh)
-            - name: LINGBOT_CTE_LOCAL
-              value: "1"
-            - name: LINGBOT_CTE_VGROUP
-              value: "8"
-            - name: NKI_ENABLE_TRACE_CACHE
-              value: "0"
-            - name: LINGBOT_K_BLOCKED
-              value: "1"
-            - name: LINGBOT_STEP_NOWRITE
-              value: "1"
             - name: NEURON_CC_FLAGS
               value: "--internal-backend-options=--disable-cb-before-global-cc"
             - name: NKI_COMPILER_FRONTEND
