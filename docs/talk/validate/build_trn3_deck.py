@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build demo/talk-deck-trn3.html: every validated slide as a BEFORE / AFTER pair.
+"""Build demo/talk-deck-trn3.html (changed slides only) and demo/talk-deck.html (the full talk, merged).
 
 BEFORE = the slide exactly as in the original deck (~/Downloads/talk-deck_v2.html), red banner,
          data-ref "<id>-BEFORE". Delete these after the review.
@@ -176,8 +176,9 @@ def kernel_side_by_side():
     img = base64.b64encode(open(os.path.join(HERE, "anim", "S5h_kernel_marked.jpg"), "rb").read()).decode()
     body = ('<div style="display:flex;flex-direction:column;gap:10px;align-items:center;width:100%%">'
             '<div style="font-size:30px;font-weight:800;color:#4cd04c">WITH the kernel: 4.37 ms</div>'
-            '<img src="data:image/jpeg;base64,%s" style="width:760px;height:auto;border-radius:8px">'
-            '<div style="font-size:21px;color:#c3c2b7">green box: no waiting, the softmax runs alongside the matmuls</div></div>' % img)
+            '<a href="%s" target="_blank" rel="noopener"><img src="data:image/jpeg;base64,%s" style="width:760px;height:auto;border-radius:8px"></a>'
+            '<a class="xlink" href="%s" target="_blank" rel="noopener">Open this profile in Neuron Explorer</a>'
+            '<div style="font-size:21px;color:#c3c2b7">green box: no waiting, the softmax runs alongside the matmuls</div></div>' % (S5H_URL, img, S5H_URL))
     cell = ('<div class="cell" data-ref="S5a-KERNEL"><section class="slide"><p class="kicker">Idea 3 · NKI · Keep the engines busy</p>'
             '<h1>The same LingBot block with the kernel</h1><div class="body">%s</div>'
             '<p class="takeaway"><span class="k">Takeaway</span><span>2.1× faster: the kernel overlaps the softmax with the matmuls, so Tensor stops waiting.</span></p>'
@@ -268,6 +269,7 @@ def notes(changes, extra=()):
 PAIRS = []
 S5F_URL = "https://neuron-explorer.harmony.a2z.com/profile/attention_only_WITH_kernel_1.57ms_S5f?shared=H4sIABYU-WoAA33MvQqDMBAA4He5WYJRLj8-QTt1aErHENsUxHgBvaVI3r1g6VLE7Zu-FfqUH6O_n93pcnN-jDPF5I2wZlr8FQN0KywcZnbDFKGrK4j0_NpYjRbbUkFgjsRDJp8pvf-zRii7Zf1B1iijsLb72W-SAvU2vQ4mibpV0pTyAVkbucjcAAAA"
 S5B_URL = "https://neuron-explorer.harmony.a2z.com/profile/attention_only_WITHOUT_kernel_2.69ms_S5b?shared=H4sIAKwS-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWt1lBJLSlLzSjLz8-Lz83Iq0Q0z0jOzBBuWhMcwIzMLM1MDy9paACJ_RF6SAAAA"
+S5H_URL = "https://neuron-explorer.harmony.a2z.com/profile/s5h_lingbot_block_attention_cte_4.37ms"
 S5A_URL = "https://neuron-explorer.harmony.a2z.com/profile/block_WITHOUT_kernel_8.98ms_S5a?shared=H4sIAFoF-WoAA6tWSsrJT86OD_cM8fAPDYnPTi3KS82Jt9CztMgtjg82TVSyqlYqLkksKgnJzE1VsjLQUUrNS4GwLSzNTS1NjWtrAdB7B0lFAAAA"
 
 
@@ -536,7 +538,8 @@ pair("B6a", "trn2, 16 devices",
      [])
 
 PAIRS.append(with_banner(cell_of(orig, "B6b"), "B6b", "before", "trn2: 8.95 → 5.73 s, 3.28 → 2.88 ms"))
-cur = open(os.path.join(REPO, "demo", "talk-deck.html"), encoding="utf-8").read()
+# The approved B6b animation, saved from demo/talk-deck.html before that file became this script's output.
+cur = open(os.path.join(HERE, "B6b_approved.html"), encoding="utf-8").read()
 PAIRS.append(with_banner(cell_of(cur, "B6b"), "B6b", "after", "LingBot-World v2 · 8 trn3 chips · approved"))
 PAIRS.append(b6b_profile())
 
@@ -583,12 +586,370 @@ pair("B7c", "Wan2.2 layouts on one trn2 device",
      ["four Wan2.2 layouts inside one trn2 device (29.4 → 20.6 ms per block) → three LingBot layouts on 8 trn3 chips, per video",
       "per-block column removed: not measured per layout"])
 
+# ═══════════════════ the full talk: original deck, each validated slide replaced by its AFTER ═══════════════════
+# BEFORE slides are dropped. A BEFORE with no AFTER (S5b, S5d) is dropped from the talk too: its point
+# is merged into S5a. New slides (S5a-KERNEL, B6b-COPY, B6b-INPLACE) follow the AFTER they belong to.
+FULL = os.path.join(REPO, "demo", "talk-deck.html")   # the full talk
+CELL = re.compile(r'<div class="cell" data-ref="([^"]+)"')
+
+
+def split_cells(text):
+    pos = [m.start() for m in CELL.finditer(text)]
+    return [(CELL.match(text, p).group(1), text[p:pos[i + 1] if i + 1 < len(pos) else len(text)].rstrip() + "\n")
+            for i, p in enumerate(pos)]
+
+
+def unbanner(cell, ref):
+    cell = re.sub(r'<div class="bab (?:before|after)">.*?</small></div>', "", cell, count=1, flags=re.S)
+    return cell.replace('data-ref="%s-AFTER"' % ref, 'data-ref="%s"' % ref, 1)
+
+
 title = ('<div class="cell" data-ref="T0"><section class="slide title-slide"><h1>LingBot-World v2 on Trainium3: '
-         'the validated numbers</h1><p class="byline kind">Every slide twice: <b style="color:#ff6b6b">BEFORE</b> '
-         '(the original, Wan2.2 or trn2) then <b style="color:#4cd04c">AFTER</b> (the same slide, the same point, '
-         'LingBot numbers measured on 8 trn3 chips). Delete the BEFORE slides once reviewed.</p></section>'
+         'the changed slides</h1><p class="byline kind">Only the slides that changed, with LingBot numbers measured '
+         'on 8 trn3 chips. The full talk with these merged in: demo/talk-deck.html.</p></section>'
          '<div class="nt"><p>Built by docs/talk/validate/build_trn3_deck.py. Each AFTER slide\'s notes list what changed.</p></div></div>\n')
-cells = title + "\n".join(PAIRS)
-out = PREFIX.replace("</style>", CSS + "</style>", 1).replace("<title>", "<title>[trn3 BEFORE/AFTER] ", 1) + cells + SUFFIX
+cells = title + "".join(c for r, c in split_cells("\n".join(PAIRS)) if not r.endswith("-BEFORE"))
+out = PREFIX.replace("</style>", CSS + "</style>", 1).replace("<title>", "<title>[trn3 changed slides] ", 1) + cells + SUFFIX
 open(OUT, "w", encoding="utf-8").write(out)
 print("wrote", OUT, "slides:", cells.count('<div class="cell"'))
+
+
+after, extras, dropped, last = {}, {}, set(), None
+for ref, cell in split_cells("\n".join(PAIRS)):
+    if ref.endswith("-BEFORE"):
+        dropped.add(ref[:-7])
+    elif ref.endswith("-AFTER"):
+        last = ref[:-6]
+        after[last] = unbanner(cell, last)
+    else:
+        extras.setdefault(last, []).append(unbanner(cell, ref))
+
+# S4f, S4g: the Wan2.2 VAE "compiled is slower" example; for LingBot compiling wins (S4e). Dropped.
+dropped.update(("S4f", "S4g"))   # S4g: the same Wan2.2 example (12% vs 75% of peak)
+full_cells, kept = [], 0
+for ref, cell in split_cells(orig[first:end_cells]):
+    if ref in after:
+        full_cells.append(after[ref])
+        full_cells.extend(extras.get(ref, []))
+    elif ref in dropped:
+        continue
+    else:
+        full_cells.append(cell)
+        kept += 1
+assert not set(after) - {r for r, _ in split_cells(orig[first:end_cells])}, "AFTER without an original slide"
+
+# ───────────── S7b: right panel redrawn as the trn3 node (Neuron docs, trn3-arch) ─────────────
+# One Trn3 server: 16 Trainium3 chips. Chips are paired ([0]-[1] ... [14]-[15]) by a direct NeuronLink-v4
+# link, 1,024 GB/s; every chip also connects to a NeuronSwitch-v1, 1,024 GB/s. No 2-D torus on trn3.
+# The left panel (one chip, 8 NeuronCore-v4) already matches the Trainium3 page.
+def s7b_node_svg():
+    out = ['<text class="lbl" x="584" y="12">SEQUENCE PARALLEL · ACROSS CHIPS</text>',
+           '<text class="t" x="867" y="44" text-anchor="middle">one Trn3 server · 16 Trainium3 chips</text>']
+    xs = []
+    for pr in range(4):
+        x0 = 584 + pr * 148
+        xs += [x0, x0 + 66]
+    sw_y, sw_h = 152, 30
+    for row, y in ((0, 70), (1, 220)):
+        for k, x in enumerate(xs):
+            used = row == 0
+            out.append('<rect class="%s" x="%d" y="%d" width="56" height="44" rx="6"/>' % ("bx" if used else "bx", x, y))
+            if used:
+                out.append('<rect class="bx-a" x="%d" y="%d" width="20" height="20" rx="4"/>' % (x + 18, y + 12))
+            # to the switch
+            out.append('<line class="br" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (x + 28, y + 44 if row == 0 else y, x + 28, sw_y if row == 0 else sw_y + sw_h))
+        for k in range(0, 8, 2):   # the direct pair link
+            out.append('<line stroke="#199e70" stroke-width="3" x1="%d" y1="%d" x2="%d" y2="%d"/>' % (xs[k] + 56, y + 22, xs[k + 1], y + 22))
+    out.append('<rect class="bx-h" x="584" y="%d" width="566" height="%d" rx="6"/>' % (sw_y, sw_h))
+    out.append('<text class="t-m" x="867" y="%d" text-anchor="middle">NeuronSwitch-v1</text>' % (sw_y + 20))
+    out.append('<text class="t-s" x="584" y="292"><tspan fill="#199e70">━</tspan> paired chips: direct NeuronLink-v4 · '
+               '│ every chip: the switch · 1,024 GB/s each</text>')
+    out.append('<text class="t-s" x="584" y="312">highlighted: the 8 chips of one video (TP4 × CP8)</text>')
+    out.append('<text class="t-s" x="584" y="336">the K/V all-gather crosses NeuronLink — the slower link</text>')
+    return "\n    ".join(out)
+
+
+def s7b(cell):
+    svg = re.search(r"<svg\b.*?</svg>", cell, re.S).group(0)
+    k = svg.index('<text class="tk" x="480" y="190" text-anchor="middle">×</text>')
+    head = svg[:k + len('<text class="tk" x="480" y="190" text-anchor="middle">×</text>')]
+    head = head.replace("Right: sixteen chips in a torus, one core highlighted in each, hold the sequence-parallel group, "
+                        "whose key and value all-gather crosses NeuronLink between chips.",
+                        "Right: one Trn3 server, sixteen Trainium3 chips, paired by direct NeuronLink links and all joined by "
+                        "a NeuronSwitch; eight highlighted chips hold the sequence-parallel group, whose key and value "
+                        "all-gather crosses NeuronLink between chips.")
+    head = head.replace('<text class="lbl" x="580" y="12">SEQUENCE PARALLEL · ONE CORE PER CHIP</text>', '')
+    assert "sixteen chips in a torus" not in head
+    return cell.replace(svg, head + "\n    " + s7b_node_svg() + "\n  </svg>", 1)
+
+
+full_cells = [s7b(c) if CELL.match(c).group(1) == "S7b" else c for c in full_cells]
+
+# ───────────── S11b / S11d: LingBot's server (serve.py) and deployment, not Wan2.2's serve_ti2v.py ─────────────
+GHM = "https://github.com/yahavb/lingbot-world-v2/blob/main/"
+S11_OPS = {
+    "S11b": [
+        ("on all 8 ranks", "on all 32 ranks"),
+        ("8 ranks, one torchrun", "32 ranks, one torchrun"),
+        ('<b>Fixed shape</b><p>no compile per request</p>',
+         '<b>Every graph compiled at start-up</b><p>a warm-up session runs each prompt switch and camera move</p>'),
+        ('<b>Collectives on one thread</b><p>the one that compiled</p>',
+         '<b>Every rank in lockstep</b><p>rank 0 broadcasts each chunk’s camera and prompt</p>'),
+        ('<b>T5 on the CPU</b><p>with a prompt cache</p>',
+         '<b>One graph for any prompt</b><p>text padded to one length, embeddings cached</p>'),
+        ("Fix the input shapes, so no request ever triggers a compile.",
+         "Compile every graph at start-up, so no request waits for the compiler."),
+    ],
+    "S11d": [
+        ("Close the host gaps, then deploy like any pod", "Stream every chunk, then deploy like any pod"),
+        ('<b>Scheduler step on the device:</b> busy 96.9% → 99.5%',
+         '<b>VAE in its own pod:</b> decodes a chunk while the DiT makes the next'),
+        ('<b>Encode the mp4</b> while the VAE decodes', '<b>Frames stream</b> to the browser as each one decodes'),
+        ('<b>ffmpeg with vfork:</b> no 90 ms stall', '<b>Controls apply next chunk:</b> about 1.1 s to see a key press'),
+        ('NeuronCore claim<br>weights cached on a PVC<br>readiness probes',
+         'Neuron devices by resource claim<br>weights and graphs cached on the node<br>startup and readiness probes'),
+        ("Find host gaps in the system trace, and move that work off the device’s path.",
+         "Stream each chunk as it is ready, so a key press shows on screen in about a second."),
+    ],
+}
+S11_NOTES = {
+    "S11b": ('<p class="meta">Section 8 · about 2 minutes · 5 clicks</p>'
+             '<p><a href="%sserve.py">serve.py</a> runs FastAPI on rank 0 (POST /session, /control, /health, /readiness), with all '
+             '32 ranks (TP4 × CP8 on 8 chips) in one torchrun.</p><ol>'
+             '<li>Every graph compiled at start-up: a warm-up session runs three segments, switching the prompt at both '
+             'boundaries and stepping through every camera action, so each graph a real session uses compiles before the pod is ready.</li>'
+             '<li>Every rank in lockstep: rank 0 decides each chunk’s camera move and prompt and broadcasts it, so all ranks '
+             'switch at the same chunk.</li>'
+             '<li>One graph for any prompt: T5 embeddings are zero-padded to the text length, so a new prompt length is not a new '
+             'graph, and cached by prompt (the scene prompts are encoded at start-up).</li>'
+             '<li>Health before readiness: /health answers while the model loads; /readiness turns true only after warm-up.</li></ol>'
+             '<p>Click 5, the takeaway.</p>' % GHM),
+    "S11d": ('<p class="meta">Section 8 · about 2 minutes · 2 clicks</p><ol>'
+             '<li>The VAE runs in its own pod (<a href="%slbw-v2-vae-deploy.yaml">lbw-v2-vae-deploy.yaml</a>). Rank 0 sends each '
+             'chunk’s latents to it from a background thread, off the DiT’s path (RemoteDecoder in serve.py).</li>'
+             '<li>Each decoded frame goes to the browser as a JPEG over server-sent events.</li>'
+             '<li>A camera key or a prompt applies from the next chunk: about 1.1 s from the key press to its frames at the browser, '
+             'at 17.3 fps (<a href="%slbw-v2-dit-t5-deploy.yaml">lbw-v2-dit-t5-deploy.yaml</a> header).</li></ol>'
+             '<p>Click 1: deploy on EKS: a DRA resource claim for the Neuron devices, the checkpoint and compiled graphs cached on the node, '
+             'startup and readiness probes.</p><p>Click 2, the takeaway.</p>' % (GHM, GHM)),
+}
+
+
+def s11(cell):
+    ref = CELL.match(cell).group(1)
+    for a, b in S11_OPS[ref]:
+        assert a in cell, (ref, a[:50])
+        cell = cell.replace(a, b)
+    k = cell.index('<div class="nt">') + len('<div class="nt">')
+    return cell[:k] + S11_NOTES[ref] + "</div></div>\n"
+
+
+full_cells = [s11(c) if CELL.match(c).group(1) in S11_OPS else c for c in full_cells]
+
+# ───────────── S11c removed; S11m: S1c's parts, each mapped to the EKS object that runs it ─────────────
+# The objects are the live KEEP-trn3-dev1 deployment: dev1-ing.yaml, lbw-web, lbw-v2-dit-t5, lbw-v2-vae.
+def s11m():
+    cols = [("you", "prompt and camera keys", "Ingress → ALB", "AWS Load Balancer Controller", "path /lbw"),
+            ("web app", "page, relays the stream", "Deployment lbw-web", "CPU node", "FastAPI"),
+            ("T5 + DiT", "KV cache in HBM", "Deployment lbw-v2-dit-t5", "claim xl-lnc2 · 8 trn3 chips", "32 ranks, TP4 × CP8"),
+            ("VAE", "latents → frames", "Deployment lbw-v2-vae", "claim l-lnc1 · 4 trn3 chips", "32 ranks")]
+    W, G = 252, 48
+    o = ['<text class="lbl" x="0" y="12">THE MODEL (S1c)</text>',
+         '<g data-step="1"><text class="lbl" x="0" y="168">ON AMAZON EKS</text></g>']
+    for i, (m1, m2, e1, e2, e3) in enumerate(cols):
+        x = i * (W + G)
+        o.append('<rect class="bx" x="%d" y="26" width="%d" height="84" rx="9"/>' % (x, W))
+        o.append('<text class="tk" x="%d" y="62" text-anchor="middle">%s</text>' % (x + W // 2, m1))
+        o.append('<text class="t-s" x="%d" y="90" text-anchor="middle">%s</text>' % (x + W // 2, m2))
+        g = ['<line class="br" stroke-dasharray="4 4" x1="%d" y1="110" x2="%d" y2="182"/>' % (x + W // 2, x + W // 2),
+             '<rect class="bx-a" x="%d" y="182" width="%d" height="118" rx="9"/>' % (x, W),
+             '<text class="tk" x="%d" y="218" text-anchor="middle">%s</text>' % (x + W // 2, e1),
+             '<text class="t-s" x="%d" y="250" text-anchor="middle">%s</text>' % (x + W // 2, e2),
+             '<text class="t-s" x="%d" y="276" text-anchor="middle">%s</text>' % (x + W // 2, e3)]
+        if i < 3:
+            g.append('<path class="ar" d="M%d,241 L%d,241"/>' % (x + W + 4, x + W + G - 4))
+        o.append('<g data-step="1">%s</g>' % "".join(g))
+    o.append('<g data-step="1"><text class="t-s" x="0" y="338">each arrow is a Kubernetes Service · '
+             'on the trn3 node the Neuron DRA driver hands each claim its chips · weights and compiled graphs stay cached on the node</text></g>')
+    svg = ('<svg viewBox="0 0 1152 350" width="1152" height="350" role="img" aria-label="Top: the world model parts from S1c: '
+           'you, the web app, T5 and the DiT with its KV cache, the VAE. Below each, the EKS object that runs it: an Ingress and ALB, '
+           'the lbw-web Deployment on a CPU node, the lbw-v2-dit-t5 Deployment with a claim for 8 trn3 chips, and the lbw-v2-vae '
+           'Deployment with a claim for 4 trn3 chips, joined by Services.">%s</svg>' % "".join(o))
+    return ('<div class="cell" data-ref="S11m"><section class="slide"><p class="kicker">Cloud deployment · on Amazon EKS</p>'
+            '<h1>The world model, mapped to EKS</h1><div class="body">%s</div>'
+            '<p class="takeaway" data-step="2"><span class="k">Takeaway</span><span>Each part of the model is a Deployment, '
+            'and a resource claim gives it its Trainium chips.</span></p></section>'
+            '<div class="nt"><p class="meta">Section 8 · about 1 minute · 2 clicks</p>'
+            '<p>The same parts as S1c, top row. Click 1: the EKS object under each one, as deployed on the demo cluster.</p><ol>'
+            '<li>The browser reaches an Ingress; the AWS Load Balancer Controller turns it into an ALB that routes /lbw.</li>'
+            '<li>The web app (lbw-web) is a plain Deployment on a CPU node: it serves the page and relays the frame stream.</li>'
+            '<li>T5 and the DiT run in one Deployment, lbw-v2-dit-t5: a resource claim (xl-lnc2) for 8 trn3 chips, 32 ranks, '
+            'TP4 × CP8. The KV cache lives in its HBM.</li>'
+            '<li>The VAE is its own Deployment, lbw-v2-vae: a claim (l-lnc1) for 4 trn3 chips. The DiT sends each chunk’s latents to it.</li></ol>'
+            '<p>Each arrow is a Service. The Neuron DRA driver on the trn3 node allocates the chips for each claim; the checkpoint and '
+            'compiled graphs are cached on the node, so a restart does not download or recompile. Click 2, the takeaway.</p></div></div>\n'
+            % svg)
+
+
+# S11c removed (user, 2026-11-15); S11m was tried in its place and dropped too. s11m() kept for reference.
+full_cells = [c for c in full_cells if CELL.match(c).group(1) != "S11c"]
+
+# ───────────── B6b and its two profile slides move from the backups to right after S7d ─────────────
+MOVE = ("B6b", "B6b-COPY", "B6b-INPLACE")
+moved = [c for c in full_cells if CELL.match(c).group(1) in MOVE]
+assert len(moved) == 3
+moved = [re.sub(r"<h1>Backup: (\w)", lambda m: "<h1>" + m.group(1).upper(), c, count=1) for c in moved]
+full_cells = [c for c in full_cells if CELL.match(c).group(1) not in MOVE]
+i = [CELL.match(c).group(1) for c in full_cells].index("S7d") + 1
+# Main slides now, so main-slide refs: S7e, S7f, S7g (typing "7e" jumps there; no "B" in the counter).
+for a, b in zip(MOVE, ("S7e", "S7f", "S7g")):
+    moved = [c.replace('data-ref="%s"' % a, 'data-ref="%s"' % b, 1) for c in moved]
+full_cells[i:i] = moved
+
+# ───────────── S1a removed; S1c takes its place (right after the S1 divider) ─────────────
+_refs = [CELL.match(c).group(1) for c in full_cells]
+_s1c = full_cells.pop(_refs.index("S1c"))
+_refs = [CELL.match(c).group(1) for c in full_cells]
+full_cells[_refs.index("S1a")] = _s1c
+
+# ───────────── S5h: the same 4.37 ms profile as S5a-KERNEL, so the same Explorer link ─────────────
+def s5h_link(cell):
+    k = cell.index('<div class="nt">')
+    b, n = cell[:k], cell[k:]
+    m = re.search(r"<img\b[^>]*>", b)
+    a = ('<div style="display:flex;flex-direction:column"><a href="%s" target="_blank" rel="noopener">%s</a>'
+         '<a class="xlink" href="%s" target="_blank" rel="noopener" style="display:block;text-align:center;margin-top:6px">'
+         'Open this profile in Neuron Explorer</a></div>') % (S5H_URL, m.group(0), S5H_URL)
+    return b[:m.start()] + a + b[m.end():] + n
+
+
+full_cells = [s5h_link(c) if CELL.match(c).group(1) == "S5h" else c for c in full_cells]
+
+# S5h right after S5a-KERNEL: S5a (without, 8.98 ms) -> S5a-KERNEL (with, 4.37 ms) -> S5h (8.98 -> 4.37 ms)
+_refs = [CELL.match(c).group(1) for c in full_cells]
+_s5h = full_cells.pop(_refs.index("S5h"))
+_refs = [CELL.match(c).group(1) for c in full_cells]
+full_cells.insert(_refs.index("S5a-KERNEL") + 1, _s5h)
+
+# ───────────── S5c: the "why it is slow" animation, before S5a; no Wan2.2 numbers left in it ─────────────
+def s5c(cell):
+    m = re.search(r'srcdoc="([^"]*)"', cell)
+    src = html.unescape(m.group(1))
+    for a, b in [("  [0, 10, 20, 30, 40, 50, 56].forEach(t => g.fillText(t + ' ms', xOf(t), LANE_Y + 3 * (LANE_H + LANE_GAP) + 12));\n", ""),
+                 ("g.fillText('Tensor idle ≈ 21 ms of 56', W / 2, H - 28);",
+                  "g.fillText('Without the kernel, Tensor sits idle while the softmax runs', W / 2, H - 28);")]:
+        assert a in src, a[:40]
+        src = src.replace(a, b)
+    cell = cell[:m.start(1)] + html.escape(src, quote=True) + cell[m.end(1):]
+    for a, b in [("<h1>Simplified: Tensor waits for the softmax</h1>", "<h1>Without the kernel, the block is slow</h1>"),
+                 ('<p class="dek">In the trace, max, exp and sum run tile by tile, so Vector and Scalar overlap. Either way, Tensor waits.</p>',
+                  '<p class="dek">Simplified: per head, Tensor computes Q×K, then waits while Vector and Scalar run the softmax.</p>')]:
+        assert a in cell, a[:40]
+        cell = cell.replace(a, b)
+    k = cell.index('<div class="nt">') + len('<div class="nt">')
+    return cell[:k] + ('<p class="meta">Section 5 · about 1 minute · the animation plays when the slide opens (R restarts it)</p>'
+                       '<p>Why the block without the kernel is slow, simplified. Per attention head, Tensor computes Q×K, then sits '
+                       'idle while Vector (row max), Scalar (exp) and Vector (row sum) run the softmax, then multiplies by V. '
+                       'After the heads, cross-attention and the FFN keep Tensor busy.</p>'
+                       '<p>The animation draws 3 heads and no times; LingBot runs 10 heads per rank. The next slide is the real '
+                       'profile: 8.98 ms without the kernel. Then the same block with the kernel: 4.37 ms.</p>') + "</div></div>\n"
+
+
+_refs = [CELL.match(c).group(1) for c in full_cells]
+_c = s5c(full_cells.pop(_refs.index("S5c")))
+_refs = [CELL.match(c).group(1) for c in full_cells]
+full_cells.insert(_refs.index("S5a"), _c)
+
+# No "idea" wording on the slides (kickers, divider labels, "→ Idea N:" pointers, titles). Notes untouched.
+NO_IDEA = [(r'(<p class="kicker">)Idea \d+ · ', r'\1'),
+           (r'\s*<p class="sec-k">Idea</p>', ''),
+           (r'→ Ideas? \d+(?: and \d+)?: (\w)', lambda m: '→ ' + m.group(1).upper()),
+           (r' — (?:both are|that is) idea \d\.', '.'),
+           (r'Four ideas, one worked example', 'One worked example'),
+           (r'Backup: four ideas for Trainium performance', 'Backup: Trainium performance'),
+           (r'The same four ideas', 'The same techniques'),
+           # S9b chart: the IDEAS column (1, 2, 3, 3) goes with the framing
+           (r'<text class="lbl" x="352" y="12">IDEAS</text>', ''),
+           (r'<rect class="ichip"[^>]*/>', ''),
+           (r'<text class="ichip-t"[^>]*>[^<]*</text>', ''),
+           (r'<text[^>]*x="366"[^>]*>\d</text>', ''),
+           # OI: the to-do about the four-ideas framing is moot once the framing is gone
+           (r'\s*<li class="new"><b>Four ideas:</b>.*?</li>', '')]
+
+
+def no_idea(cell):
+    k = cell.index('<div class="nt">')
+    b = cell[:k]
+    for pat, rep in NO_IDEA:
+        b = re.sub(pat, rep, b)
+    return b + cell[k:]
+
+
+full_cells = [no_idea(c) for c in full_cells]
+for c in full_cells:
+    vis = re.sub(r"data:[^\"')]+", "", c[:c.index('<div class="nt">')])
+    assert not re.search(r"\bideas?\b", re.sub(r"<[^>]+>", " ", vis), re.I), CELL.match(c).group(1)
+
+# ───────────── re:Invent template (template/*.jpg, from the RIV26 speaker template) ─────────────
+TITLE = "AIM323 - Serving World Model at scale with AWS Trainium and Native PyTorch"
+
+
+def _jpg(name):
+    return "data:image/jpeg;base64," + base64.b64encode(open(os.path.join(HERE, "template", name + ".jpg"), "rb").read()).decode()
+
+
+# Slide is 1280x720; the 16:10 template images are cover-fit (cropped evenly top and bottom).
+# Title: text sits under the re:Invent logo, left of the color blocks. Divider: text sits in the band
+# between the white box (left) and the color blocks (right). Agenda: the word "Agenda" is in the image.
+RIV_CSS = (".slide.riv{background:#000 center/cover no-repeat}"
+           ".slide.riv-title{background-image:url(%s);justify-content:flex-start;padding:340px 0 0 96px}"
+           ".slide.riv-title h1{font-size:34px;line-height:1.2;max-width:440px}"
+           ".slide.riv-title .byline{max-width:440px}"
+           ".slide.riv-divider{background-image:url(%s);justify-content:center;padding:30px 280px 0 150px}"
+           ".slide.riv-agenda{background-image:url(%s);justify-content:center;padding:0 80px 40px 520px}"
+           ".slide.riv-agenda ol{margin:0;padding-left:28px;font-size:25px;line-height:1.55}"
+           ".slide.riv-agenda li span{color:var(--ink-2);font-size:17px;letter-spacing:.12em;text-transform:uppercase;margin-right:12px}"
+           ".slide.riv-thanks{background-image:url(%s)}.slide.riv-thanks>*{visibility:hidden}"
+           % (_jpg("riv-title"), _jpg("riv-divider"), _jpg("riv-agenda"), _jpg("riv-thanks")))
+
+
+def riv(cell, kind):
+    return re.sub(r'<section class="slide ([^"]*)"', lambda m: '<section class="slide %s riv riv-%s"' % (m.group(1), kind), cell, count=1)
+
+
+agenda_items = []
+for i, c in enumerate(full_cells):
+    ref = CELL.match(c).group(1)
+    if ref == "S0":
+        h1 = re.search(r"<h1>.*?</h1>", c, re.S).group(0)
+        spk = ('<div class="riv-spk" style="margin-top:22px;font-size:19px;line-height:1.45;color:#fff">'
+               '<b>Lingfan Yu</b><br><span style="color:var(--ink-2)">Senior Applied Scientist</span><br>'
+               '<b style="display:inline-block;margin-top:10px">Yahav Biran</b><br><span style="color:var(--ink-2)">Principal Solutions Architect</span></div>')
+        c = c.replace(h1, "<h1>%s</h1>" % html.escape(TITLE), 1)
+        c = c.replace("</section>", spk + "</section>", 1)
+        full_cells[i] = riv(c, "title")
+    elif ref == "S12":
+        qr = "".join('<div style="display:flex;flex-direction:column;align-items:center;gap:10px">'
+                     '<img src="data:image/png;base64,%s" alt="QR code: %s" style="width:170px;height:170px;border-radius:6px">'
+                     '<div style="font-size:17px;color:#fff;text-align:center;line-height:1.3">%s</div></div>'
+                     % (base64.b64encode(open(os.path.join(HERE, "template", f + ".png"), "rb").read()).decode(), url, cap)
+                     for f, url, cap in [("qr-neuron-quickstarts", "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/quickstarts.html",
+                                          "Neuron quickstarts"),
+                                         ("qr-lingbot-world-v2", "https://github.com/yahavb/lingbot-world-v2", "LingBot-World v2 on Trainium")])
+        qr = ('<div class="riv-qr" style="position:absolute;left:760px;top:430px;display:flex;gap:56px;visibility:visible">%s</div>' % qr)
+        c = c.replace("</section>", qr + "</section>", 1)
+        full_cells[i] = riv(c, "thanks")
+    elif 'class="slide divider"' in c:
+        full_cells[i] = riv(c, "divider")
+        if ref.startswith("S"):
+            k = re.search(r'<p class="sec-k">(.*?)</p>', c, re.S)
+            agenda_items.append('<li><span>%s</span>%s</li>' % (k.group(1) if k else "", re.search(r"<h1>(.*?)</h1>", c, re.S).group(1)))
+agenda = ('<div class="cell" data-ref="AG"><section class="slide riv riv-agenda"><ol>%s</ol></section>'
+          '<div class="nt"><p class="meta">Agenda</p><p>The sections, in order. Built from the section slides.</p></div></div>\n'
+          % "".join(agenda_items))
+full_cells.insert(1, agenda)
+full = PREFIX.replace("</style>", CSS + RIV_CSS + "</style>", 1) + "".join(full_cells) + SUFFIX
+assert "-BEFORE" not in full and 'class="bab' not in full
+open(FULL, "w", encoding="utf-8").write(full)
+print("wrote", FULL, "slides:", len(full_cells), "· replaced:", len(after), "· new:", sum(map(len, extras.values())),
+      "· removed:", sorted(dropped - set(after)), "· unchanged:", kept)

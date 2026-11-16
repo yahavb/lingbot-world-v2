@@ -27,6 +27,8 @@ spec:
       labels:
         app: lbw-web
     spec:
+      nodeSelector:
+        node-type: m5
       containers:
         - name: app
           image: public.ecr.aws/docker/library/python:3.11-slim
@@ -42,25 +44,29 @@ spec:
           env:
             - name: BRANCH
               value: "main"
-            # in-pod bind; the Service is ClusterIP and nothing is published (kubectl port-forward)
+            # in-pod bind; the Service is ClusterIP. Reached through the KEEP-trn3-dev1 ALB at /lbw
+            # (corp-only security group, ~/k8s/clusters/KEEP-trn3-dev1/dev1-ing.yaml) or kubectl port-forward.
             - name: HOST
               value: "0.0.0.0"
             - name: VLM_URL
               value: "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1"
             - name: LBW_URL
-              value: "http://lbw.default.svc.cluster.local:8000"
+              value: "http://lbw-v2-dit-t5.default.svc.cluster.local:8000"
+            # serve under /lbw so the ALB routes straight here (web_app.py URL_PREFIX)
+            - name: URL_PREFIX
+              value: "/lbw"
           ports:
             - containerPort: 7860
           readinessProbe:
             httpGet:
-              path: /
+              path: /lbw/
               port: 7860
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             requests:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "10"
+              memory: 10Gi
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "20"
+              memory: 20Gi
