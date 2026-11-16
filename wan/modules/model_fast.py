@@ -757,6 +757,8 @@ _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
 # forward becomes x -> matmul_mxfp8(x, W_mx) + b; the bf16 weights are freed at load.
 _LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
 _FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
+# LINGBOT_LIN_MX_SKIP="self_attn.o,cross_attn.o": these Linears stay bf16 under LINGBOT_LIN_MX.
+_MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
                  "cam_injector_layer1", "cam_injector_layer2", "cam_scale_layer", "cam_shift_layer")
@@ -876,11 +878,14 @@ def _prequantize_linears_mx(blocks):
     for blk in blocks:
         b_ = getattr(blk, "_orig_mod", blk)
         for name in _MX_LIN_NAMES:
+            if name in _MX_LIN_SKIP:
+                continue
             lin = b_.get_submodule(name)
             _mx_quantize_linear(lin)
             lin.forward = types.MethodType(_mx_linear_forward, lin)
             n += 1
-    _q(f"[model_fast] LINGBOT_LIN_MX: {n} Linears in MXFP8 ({len(_MX_LIN_NAMES)} per block); bf16 copies freed")
+    _q(f"[model_fast] LINGBOT_LIN_MX: {n} Linears in MXFP8 ({len(_MX_LIN_NAMES) - len(_MX_LIN_SKIP)} per "
+       f"block, kept bf16: {list(_MX_LIN_SKIP)}); bf16 copies freed")
 
 
 def _prequantize_ffn_mx(blocks):
