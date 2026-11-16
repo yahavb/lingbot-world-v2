@@ -749,6 +749,10 @@ _QKV_XT = os.environ.get("LINGBOT_QKV_XT", "0") == "1"
 # transpose turns back into [S, C]. Same bias (row-parallel bias on rank 0 only) and fp32 reduction
 # as _tp_row_parallel(scatter=True).
 _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
+# LINGBOT_FFN_MX=1: the SP FFN's two matmuls in MXFP8 (kernels/ffn_mx.py, nkilib matmul_mxfp8).
+# Weights are quantized once before compile (_prequantize_ffn_mx); the activation per call. The
+# down projection's K (local ffn dim, 3456 at TP4) is zero-padded to a multiple of 512.
+_FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1"
 # LINGBOT_ATTN_FMAJ=1: merged self-attention returns d-major output (kernel tp_out) into a
 # d-major o-projection (_out_proj_fmaj), the attention-side twin of LINGBOT_FFN_FMAJ.
 _ATTN_FMAJ = os.environ.get("LINGBOT_ATTN_FMAJ", "0") == "1"
@@ -803,6 +807,55 @@ def _ffn_feature_major(ffn, h):
         y2 = y2.float()
     r = fc.reduce_scatter_tensor(y2, "sum", 0, m)                              # [C, S] own tokens
     return r.to(yd).t().unsqueeze(0)
+
+
+def _prequantize_ffn_mx(blocks):
+    from kernels import ffn_mx
+    for i, blk in enumerate(blocks):
+        ffn = getattr(blk, "_orig_mod", blk).ffn
+        if getattr(ffn[0], "_mxq_data", None) is not None:
+            continue
+        with torch.no_grad():
+            for lin in (ffn[0], ffn[2]):
+                w = lin.weight.to(torch.bfloat16)
+                kp = -(-w.shape[1] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
+                if kp != w.shape[1]:
+                    w = torch_F.pad(w, (0, kp - w.shape[1]))
+                d, sc = ffn_mx.prequantize_weight(w.contiguous())
+                lin.register_buffer("_mxq_data", d, persistent=False)
+                lin.register_buffer("_mxq_scales", sc, persistent=False)
+                lin._mxq_k = kp
+        if i == 0:
+            # The compiled path (wrap_nki) must match the eager LNC launch the bench measured.
+            x = torch.randn(256, ffn[0].in_features, device=ffn[0].weight.device).to(torch.bfloat16)
+            ref = ffn_mx.mm_eager(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)
+            got = torch.compile(lambda a, d, s_: ffn_mx.mm(a, d, s_), backend="neuron",
+                                fullgraph=True, dynamic=False)(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)
+            dense = x.float() @ ffn[0].weight.float().t()
+            torch.neuron.synchronize()
+            dd = (got.float() - ref.float()).abs().max().item()
+            rel = ((ref.float() - dense).norm() / dense.norm()).item()
+            _q(f"[model_fast] LINGBOT_FFN_MX: {ffn_mx.FP8}, compiled vs eager max|d| {dd:.3e}, "
+               f"eager vs bf16-weight fp32 matmul rel {rel:.3e}")
+            if dd > 0 or not rel < 0.1:
+                raise RuntimeError(f"LINGBOT_FFN_MX self-check failed: compiled vs eager {dd}, rel {rel}")
+    _q(f"[model_fast] LINGBOT_FFN_MX: quantized the FFN weights of {len(blocks)} blocks")
+
+
+def _ffn_mx(ffn, hf):
+    """SP FFN on MXFP8 matmuls: hf [1, M, C] all-gathered -> [1, M, C] partial sums (+ bias)."""
+    from kernels import ffn_mx
+    x = hf[0]
+    u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)
+    if ffn[0].bias is not None:
+        u = u + ffn[0].bias
+    u = ffn[1](u)
+    if ffn[2]._mxq_k != u.shape[1]:
+        u = torch_F.pad(u, (0, ffn[2]._mxq_k - u.shape[1]))
+    y = ffn_mx.mm(u.contiguous(), ffn[2]._mxq_data, ffn[2]._mxq_scales)
+    if ffn[2].bias is not None:
+        y = y + ffn[2].bias
+    return y.unsqueeze(0)
 
 
 def _fuse_qkv_weights(blocks):
@@ -1752,7 +1805,9 @@ class CausalWanAttentionBlock(nn.Module):
                                       _sp_scatter=True)
             h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
                 self.ffn[0].weight.dtype)
-            if _FFN_FMAJ:
+            if _FFN_MX:
+                y = tp.reduce_scatter_tokens(_ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")), "tp").to(h.dtype)
+            elif _FFN_FMAJ:
                 y = _ffn_feature_major(self.ffn, h)
             else:
                 hf = tp.all_gather_tokens(h, "tp")
@@ -2982,6 +3037,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
             _fuse_qkv_weights(self.blocks)
         if _WT_PRE:
             _pretranspose_weights(self.blocks)
+        if _FFN_MX:
+            _prequantize_ffn_mx(self.blocks)
         _scope = os.environ.get("COMPILE_SCOPE", "blocks").strip().lower()
         if _scope in ("block", "blocks"):
             _n = _PROFILE_BLOCK_CAP or len(self.blocks)
