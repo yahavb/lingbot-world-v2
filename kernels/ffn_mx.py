@@ -49,7 +49,7 @@ mm = wrap_nki(_mm_pq)        # the same, traceable inside a fullgraph torch.comp
 #            (5120, 3456) ffn.0:                                       192.9 vs 407.7 (default 251.9)
 #            (3584, 5120) ffn.2:                                       173.0 vs 425.9 (default 192.0)
 _TUNED = {
-    (5120, 1280): dict(tn=1280, bm=4, bn=1, bk=10, lm=4, ln=1, sr=False, extra={"load_with_PE_swizzle": True}),
+    (5120, 1280): dict(tn=1280, bm=4, bn=1, bk=10, lm=4, ln=1, sr=False, extra={}),  # PE swizzle: NCC_ILMM003 in-graph
     (1536, 5120): dict(tn=512, bm=4, bn=4, bk=3, lm=4, ln=2, sr=True, extra={}),
     (5120, 3456): dict(tn=512, bm=4, bn=4, bk=10, lm=4, ln=2, sr=True, extra={"load_with_PE_swizzle": True}),
     (3584, 5120): dict(tn=512, bm=4, bn=4, bk=7, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
