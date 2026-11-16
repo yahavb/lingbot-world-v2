@@ -66,7 +66,7 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "90"
+              cpu: "40"
               memory: 600Gi
               ephemeral-storage: 300Gi
             limits:
