@@ -607,6 +607,10 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             _tag = ("compile+warmup, NOT latency" if _r == 0 and _runs > 1
                     else "steady state" if _runs > 1 else "single pass")
             print(f"[BENCH] GEN run{_r + 1} time: {_gen_ms[-1]:.1f} ms  ({_tag})")
+            if hasattr(torch, "neuron"):
+                print(f"[BENCH] device memory rank 0: peak allocated "
+                      f"{torch.neuron.max_memory_allocated() / (1 << 30):.2f} GiB, peak reserved "
+                      f"{torch.neuron.max_memory_reserved() / (1 << 30):.2f} GiB")
     # RELEASE THE DiT. Both GEN passes are done and run_causal returns latents, so the
     # DiT is never needed again -- yet its weights (5.15 GB/rank) and every NEFF stayed
     # resident through the VAE decode, and at 768*1152 that ran the device out:
