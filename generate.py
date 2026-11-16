@@ -580,6 +580,11 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
         if dist.is_initialized():
             dist.barrier()
         _prof_ctx.__enter__()
+        if rank == 0 and _r == 0 and os.environ.get("LINGBOT_MEM_HISTORY", "0") == "1":
+            # Memory profile: every device allocation with its Python stack (rank 0, first pass).
+            torch.neuron._record_memory_history(True, context="alloc", stacks="python",
+                                                max_entries=500000)
+            print("[MEM] recording allocation history (rank 0)", flush=True)
         if rank == 0 and hasattr(torch, "neuron"):
             print(f"[MEM] before generate rank 0: allocated "
                   f"{torch.neuron.memory_allocated() / (1 << 30):.2f} GiB", flush=True)
@@ -610,6 +615,11 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             _tag = ("compile+warmup, NOT latency" if _r == 0 and _runs > 1
                     else "steady state" if _runs > 1 else "single pass")
             print(f"[BENCH] GEN run{_r + 1} time: {_gen_ms[-1]:.1f} ms  ({_tag})")
+            if _r == 0 and os.environ.get("LINGBOT_MEM_HISTORY", "0") == "1":
+                _snap = os.environ.get("LINGBOT_MEM_SNAPSHOT", "/tmp/results/mem_snapshot.pickle")
+                torch.neuron.memory._dump_snapshot(_snap)
+                torch.neuron._record_memory_history(None)
+                print(f"[MEM] snapshot after GEN pass 1: {_snap}", flush=True)
             if hasattr(torch, "neuron"):
                 print(f"[BENCH] device memory rank 0: peak allocated "
                       f"{torch.neuron.max_memory_allocated() / (1 << 30):.2f} GiB, peak reserved "
@@ -903,6 +913,13 @@ if __name__ == "__main__":
             print(f"[MEM] at failure rank 0: allocated {torch.neuron.memory_allocated() / g:.2f} GiB, "
                   f"reserved {torch.neuron.memory_reserved() / g:.2f} GiB, peak allocated "
                   f"{torch.neuron.max_memory_allocated() / g:.2f} GiB", flush=True)
+            if os.environ.get("LINGBOT_MEM_HISTORY", "0") == "1":
+                _snap = os.environ.get("LINGBOT_MEM_SNAPSHOT", "/tmp/results/mem_snapshot.pickle")
+                try:
+                    torch.neuron.memory._dump_snapshot(_snap)
+                    print(f"[MEM] snapshot at failure: {_snap}", flush=True)
+                except Exception as e:
+                    print(f"[MEM] snapshot failed: {e}", flush=True)
             try:
                 print(torch.neuron.memory_summary(), flush=True)
             except Exception as e:
