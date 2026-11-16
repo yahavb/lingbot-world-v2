@@ -155,6 +155,14 @@ def main():
     torch._dynamo.config.accumulated_cache_size_limit = 2048
     if hasattr(torch._dynamo.config, "do_not_emit_runtime_asserts"):
         torch._dynamo.config.do_not_emit_runtime_asserts = True
+    # The pipeline's weight preparation (WanModelFast compile path / load): pre-transposed weights,
+    # then the MXFP8 FFN / every Linear when those flags are on.
+    if mf._WT_PRE:
+        mf._pretranspose_weights([blk])
+    if mf._FFN_MX:
+        mf._prequantize_ffn_mx([blk])
+    if mf._LIN_MX:
+        mf._prequantize_linears_mx([blk])
     film_fn = torch.compile(blk.cam_film, backend="neuron", fullgraph=True, dynamic=False)
     cblk = torch.compile(blk, backend="neuron", fullgraph=True, dynamic=False)
     kw = dict(e=e0, seq_lens=torch.tensor([L_loc], dtype=torch.long), grid_sizes=grid,
