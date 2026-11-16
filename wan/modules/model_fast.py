@@ -758,7 +758,7 @@ _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
 _LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
 _FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
 # LINGBOT_LIN_MX_SKIP="self_attn.o,cross_attn.o": these Linears stay bf16 under LINGBOT_LIN_MX.
-_MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").split(",") if x)
+_MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").replace(":", ",").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
                  "cam_injector_layer1", "cam_injector_layer2", "cam_scale_layer", "cam_shift_layer")
