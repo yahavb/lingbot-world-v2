@@ -138,7 +138,7 @@ spec:
             - name: LINGBOT_COMMIT_NOHEAD
               value: "1"
             - name: LINGBOT_EMPTY_CACHE_SEQ
-              value: "1000000000"
+              value: "4096"
             - name: LINGBOT_PREUPLOAD
               value: "1"
             - name: LINGBOT_CROSS_NMAJOR
