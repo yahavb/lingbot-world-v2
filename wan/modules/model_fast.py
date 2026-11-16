@@ -839,7 +839,14 @@ def _prequantize_ffn_mx(blocks):
                f"eager vs bf16-weight fp32 matmul rel {rel:.3e}")
             if dd > 0 or not rel < 0.1:
                 raise RuntimeError(f"LINGBOT_FFN_MX self-check failed: compiled vs eager {dd}, rel {rel}")
-    _q(f"[model_fast] LINGBOT_FFN_MX: quantized the FFN weights of {len(blocks)} blocks")
+        # Free the bf16 copies (weight, and LINGBOT_WT_PRE's transposed _wt): only the MXFP8 data
+        # and scales serve the FFN from here on. The empty weight keeps .dtype for the callers.
+        for lin in (ffn[0], ffn[2]):
+            lin.weight = nn.Parameter(torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                                      requires_grad=False)
+            if getattr(lin, "_wt", None) is not None:
+                del lin._wt
+    _q(f"[model_fast] LINGBOT_FFN_MX: quantized the FFN weights of {len(blocks)} blocks; bf16 copies freed")
 
 
 def _ffn_mx(ffn, hf):
