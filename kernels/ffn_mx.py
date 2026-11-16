@@ -55,6 +55,10 @@ _TUNED = {
     (3584, 5120): dict(tn=512, bm=4, bn=4, bk=7, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
 }
 _TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1" and LNC == 1
+# LINGBOT_MX_TUNED_KEYS="5120x1280,1536x5120": tune only these (K, N) (bisecting in-graph failures)
+_TUNED_KEYS = os.environ.get("LINGBOT_MX_TUNED_KEYS", "")
+if _TUNED_KEYS:
+    _TUNED = {k: v for k, v in _TUNED.items() if f"{k[0]}x{k[1]}" in _TUNED_KEYS.split(",")}
 _TUNED_MM = {}
 
 
