@@ -752,7 +752,14 @@ _FFN_FMAJ = os.environ.get("LINGBOT_FFN_FMAJ", "0") == "1"
 # LINGBOT_FFN_MX=1: the SP FFN's two matmuls in MXFP8 (kernels/ffn_mx.py, nkilib matmul_mxfp8).
 # Weights are quantized once before compile (_prequantize_ffn_mx); the activation per call. The
 # down projection's K (local ffn dim, 3456 at TP4) is zero-padded to a multiple of 512.
-_FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1"
+# LINGBOT_LIN_MX=1: EVERY block Linear in MXFP8 -- self-attn q/k/v/o, cross-attn q/k/v/o,
+# cam_injector_layer1/2, cam_scale/shift_layer, ffn.0/2 (implies LINGBOT_FFN_MX). Each Linear's
+# forward becomes x -> matmul_mxfp8(x, W_mx) + b; the bf16 weights are freed at load.
+_LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
+_FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
+_MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+                 "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
+                 "cam_injector_layer1", "cam_injector_layer2", "cam_scale_layer", "cam_shift_layer")
 # LINGBOT_ATTN_FMAJ=1: merged self-attention returns d-major output (kernel tp_out) into a
 # d-major o-projection (_out_proj_fmaj), the attention-side twin of LINGBOT_FFN_FMAJ.
 _ATTN_FMAJ = os.environ.get("LINGBOT_ATTN_FMAJ", "0") == "1"
@@ -807,6 +814,56 @@ def _ffn_feature_major(ffn, h):
         y2 = y2.float()
     r = fc.reduce_scatter_tensor(y2, "sum", 0, m)                              # [C, S] own tokens
     return r.to(yd).t().unsqueeze(0)
+
+
+def _mx_quantize_linear(lin):
+    """Quantize lin.weight [N, K] once (K zero-padded to 512) and free the bf16 copies."""
+    from kernels import ffn_mx
+    if getattr(lin, "_mxq_data", None) is not None:
+        return
+    with torch.no_grad():
+        w = lin.weight.to(torch.bfloat16)
+        kp = -(-w.shape[1] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
+        if kp != w.shape[1]:
+            w = torch_F.pad(w, (0, kp - w.shape[1]))
+        d, sc = ffn_mx.prequantize_weight(w.contiguous())
+        lin.register_buffer("_mxq_data", d, persistent=False)
+        lin.register_buffer("_mxq_scales", sc, persistent=False)
+        lin._mxq_k, lin._mxq_n = kp, int(lin.weight.shape[0])
+        lin.weight = nn.Parameter(torch.empty(0, dtype=lin.weight.dtype, device=lin.weight.device),
+                                  requires_grad=False)
+        if getattr(lin, "_wt", None) is not None:
+            del lin._wt
+
+
+def _mx_matmul(lin, x2):
+    """x2 [M, K_logical] -> [M, N] bf16 via the pre-quantized weight (+ bias)."""
+    from kernels import ffn_mx
+    x2 = x2.to(torch.bfloat16)
+    if lin._mxq_k != x2.shape[-1]:
+        x2 = torch_F.pad(x2, (0, lin._mxq_k - x2.shape[-1]))
+    y = ffn_mx.mm(x2.contiguous(), lin._mxq_data, lin._mxq_scales)
+    return y + lin.bias if lin.bias is not None else y
+
+
+def _mx_linear_forward(self, x):
+    shp = x.shape
+    y = _mx_matmul(self, x.reshape(-1, shp[-1]))
+    return y.view(*shp[:-1], y.shape[-1])
+
+
+def _prequantize_linears_mx(blocks):
+    """LINGBOT_LIN_MX: every non-FFN block Linear (the FFN is _prequantize_ffn_mx's)."""
+    assert not (_QKV_FUSED or _QKV_XT), "LINGBOT_LIN_MX: QKV_FUSED / QKV_XT read q/k/v weights directly"
+    n = 0
+    for blk in blocks:
+        b_ = getattr(blk, "_orig_mod", blk)
+        for name in _MX_LIN_NAMES:
+            lin = b_.get_submodule(name)
+            _mx_quantize_linear(lin)
+            lin.forward = types.MethodType(_mx_linear_forward, lin)
+            n += 1
+    _q(f"[model_fast] LINGBOT_LIN_MX: {n} Linears in MXFP8 ({len(_MX_LIN_NAMES)} per block); bf16 copies freed")
 
 
 def _prequantize_ffn_mx(blocks):
@@ -1548,9 +1605,14 @@ class CausalWanSelfAttention(nn.Module):
         nd, L = int(xt.shape[0]) * int(xt.shape[1]), int(xt.shape[2])
         S = L // nt
         x3 = xt.reshape(nd, nt, S).permute(1, 0, 2)                       # [nt, nd, S] view
-        y = torch.matmul(_w(self.o), x3)                                   # [nt, C, S]
-        if self.o.bias is not None:
-            y = y + self.o.bias.view(-1, 1)
+        if getattr(self.o, "_mxq_data", None) is not None:
+            nt_, k_, s_ = x3.shape
+            y = _mx_matmul(self.o, x3.transpose(1, 2).reshape(nt_ * s_, k_))  # [nt * S, C] (+ bias)
+            y = y.view(nt_, s_, -1).transpose(1, 2)                            # [nt, C, S]
+        else:
+            y = torch.matmul(_w(self.o), x3)                                   # [nt, C, S]
+            if self.o.bias is not None:
+                y = y + self.o.bias.view(-1, 1)
         yd = y.dtype
         C = int(y.shape[1])
         y2 = y.reshape(nt * C, S)
@@ -3046,6 +3108,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
             _pretranspose_weights(self.blocks)
         if _FFN_MX:
             _prequantize_ffn_mx(self.blocks)
+        if _LIN_MX:
+            _prequantize_linears_mx(self.blocks)
         _scope = os.environ.get("COMPILE_SCOPE", "blocks").strip().lower()
         if _scope in ("block", "blocks"):
             _n = _PROFILE_BLOCK_CAP or len(self.blocks)
@@ -3726,6 +3790,8 @@ def load_tp_wan_model_fast(checkpoint_dir, subfolder, tp_degree, dtype,
                 _gib = 1 << 30
                 _m0 = torch.neuron.memory_allocated() / _gib
                 _prequantize_ffn_mx(model.blocks)
+                if _LIN_MX:
+                    _prequantize_linears_mx(model.blocks)
                 torch.neuron.synchronize()
                 _q(f"[model_fast] LINGBOT_FFN_MX at load: device memory allocated {_m0:.2f} -> "
                    f"{torch.neuron.memory_allocated() / _gib:.2f} GiB (rank 0)")
