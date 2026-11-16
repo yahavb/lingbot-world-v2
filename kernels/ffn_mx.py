@@ -67,7 +67,8 @@ def _tuned_kernel(key):
     kw = dict(TILES_IN_BLOCK_M=t["bm"], TILES_IN_BLOCK_N=t["bn"], TILES_IN_BLOCK_K=t["bk"],
               TILES_IN_LOAD_M=t["lm"], TILES_IN_LOAD_N=t["ln"],
               lhs_matmul_tile_shape_logical=(512, 128), rhs_matmul_tile_shape_logical=(512, t["tn"]),
-              spill_reload=t["sr"], **t["extra"])
+              spill_reload=t["sr"],
+              **({} if os.environ.get("LINGBOT_MX_TUNED_NOEXTRA", "0") == "1" else t["extra"]))
 
     @nki.jit
     def k(lhs, w_data, w_scales):
