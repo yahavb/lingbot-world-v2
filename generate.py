@@ -580,6 +580,9 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
         if dist.is_initialized():
             dist.barrier()
         _prof_ctx.__enter__()
+        if rank == 0 and hasattr(torch, "neuron"):
+            print(f"[MEM] before generate rank 0: allocated "
+                  f"{torch.neuron.memory_allocated() / (1 << 30):.2f} GiB", flush=True)
         _gen_start = time.perf_counter()
         _result = wan_i2v.generate(
             args.prompt,
@@ -891,4 +894,17 @@ def generate(args):
 
 if __name__ == "__main__":
     args = _parse_args()
-    generate(args)
+    try:
+        generate(args)
+    except Exception:
+        # Out-of-memory diagnosis: what the torch allocator held when it failed (rank 0).
+        if int(os.environ.get("RANK", "0")) == 0 and hasattr(torch, "neuron"):
+            g = 1 << 30
+            print(f"[MEM] at failure rank 0: allocated {torch.neuron.memory_allocated() / g:.2f} GiB, "
+                  f"reserved {torch.neuron.memory_reserved() / g:.2f} GiB, peak allocated "
+                  f"{torch.neuron.max_memory_allocated() / g:.2f} GiB", flush=True)
+            try:
+                print(torch.neuron.memory_summary(), flush=True)
+            except Exception as e:
+                print(f"[MEM] memory_summary unavailable: {e}", flush=True)
+        raise
