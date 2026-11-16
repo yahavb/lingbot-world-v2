@@ -816,6 +816,23 @@ def _ffn_feature_major(ffn, h):
     return r.to(yd).t().unsqueeze(0)
 
 
+def _seq_fp32_sliced(seq, x, slice_bytes=64 << 20):
+    """Run an nn.Sequential in fp32 with each Linear's weight cast to fp32 in row slices of
+    ~slice_bytes, output columns concatenated. Under the fp32 autocast the whole bf16 weight was
+    cast at once: time_projection (5120 -> 30720) made a 600 MiB fp32 copy per uncached timestep,
+    the allocation that ran LNC1 (18 GiB per rank) out of device memory under async launches."""
+    for m in seq:
+        if isinstance(m, nn.Linear):
+            w, b = m.weight, m.bias
+            rows = max(1, slice_bytes // (int(w.shape[1]) * 4))
+            x = torch.cat([torch_F.linear(x.float(), w[i:i + rows].float(),
+                                          None if b is None else b[i:i + rows].float())
+                           for i in range(0, int(w.shape[0]), rows)], dim=-1)
+        else:
+            x = m(x)
+    return x
+
+
 def _mx_quantize_linear(lin):
     """Quantize lin.weight [N, K] once (K zero-padded to 512) and free the bf16 copies."""
     from kernels import ffn_mx
@@ -2263,10 +2280,10 @@ class WanModelFast(ModelMixin, ConfigMixin):
           with torch.amp.autocast('neuron', dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
-            e = self.time_embedding(
+            e = _seq_fp32_sliced(self.time_embedding,
                 sinusoidal_embedding_1d(self.freq_dim,
                                         t).unflatten(0, (bt, e_seq)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            e0 = _seq_fp32_sliced(self.time_projection, e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
             e = e.to(device)
             e0 = e0.to(device)
