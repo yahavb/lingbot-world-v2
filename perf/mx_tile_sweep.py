@@ -23,6 +23,7 @@ import torch_neuronx  # noqa: F401
 import nki
 import nki.language as nl
 
+from nkilib.experimental.matmul_mxfp8 import matmul_mxfp8_config as _cfgmod
 from nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (MatmulMxfp8KernelConfig,
                                                                   generate_autotune_candidates)
 from nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_kernel import matmul_mxfp8
@@ -44,14 +45,15 @@ def _quant(w):
     return quantize_block_mxfp8_kernel(w, FP8, LNC == 2, True)
 
 
-def make_kernel(c):
-    kw = {}
+def make_kernel(c, extra=None):
+    kw = dict(extra or {})
     if c is not None:
         kw = dict(TILES_IN_BLOCK_M=c.TILES_IN_BLOCK_M, TILES_IN_BLOCK_N=c.TILES_IN_BLOCK_N,
                   TILES_IN_BLOCK_K=c.TILES_IN_BLOCK_K, TILES_IN_LOAD_M=c.TILES_IN_LOAD_M,
                   TILES_IN_LOAD_N=c.TILES_IN_LOAD_N,
                   lhs_matmul_tile_shape_logical=(c.tile_k, c.tile_m),
-                  rhs_matmul_tile_shape_logical=(c.tile_k, c.tile_n))
+                  rhs_matmul_tile_shape_logical=(c.tile_k, c.tile_n),
+                  spill_reload=bool(getattr(c, "spill_reload", False)))
 
     @nki.jit
     def k(lhs, w_data, w_scales):
@@ -91,14 +93,17 @@ def sweep(name, K, N):
           f"{fl / us / 1e6:6.1f} TFLOPS  rel {rel(y, ref):.2e}", flush=True)
     s, d = _quant[LNC](wd)
     torch.neuron.synchronize()
-    cands = generate_autotune_candidates(MatmulMxfp8KernelConfig(M=M, K=K, N=N, run_with_lnc2=(LNC == 2)))
+    # this nkilib: lnc_sharding enum instead of run_with_lnc2 (OFF at LNC1)
+    _kw = {} if LNC == 2 else {"lnc_sharding": _cfgmod.LncShardingMode.OFF}
+    cands = generate_autotune_candidates(MatmulMxfp8KernelConfig(M=M, K=K, N=N, **_kw))
     step = max(1, len(cands) // MAXC)
     pick = [None] + cands[::step][:MAXC]
     print(f"[tile] {name}: {len(cands)} autotune candidates, timing {len(pick)} (default first)", flush=True)
     best = None
     for c in pick:
         tag = "default" if c is None else (f"tn{c.tile_n} B{c.TILES_IN_BLOCK_M}/{c.TILES_IN_BLOCK_N}/"
-                                           f"{c.TILES_IN_BLOCK_K} L{c.TILES_IN_LOAD_M}/{c.TILES_IN_LOAD_N}")
+                                           f"{c.TILES_IN_BLOCK_K} L{c.TILES_IN_LOAD_M}/{c.TILES_IN_LOAD_N}"
+                                           f"{' sr' if getattr(c, 'spill_reload', False) else ''}")
         try:
             t0 = time.perf_counter()
             k = make_kernel(c)
@@ -109,11 +114,24 @@ def sweep(name, K, N):
                 best = (us_c, tag, c)
         except Exception as e:  # noqa: BLE001
             print(f"[tile] {name} {tag:28s} FAILED: {str(e).splitlines()[0][:150]}", flush=True)
+    # transpose placement on the best tiles: DMA transpose variants / PE swizzle loads
+    if best:
+        for extra in ({"fast_dma_transpose": True}, {"disable_dma_transpose": True},
+                      {"load_with_PE_swizzle": True}):
+            tag = best[1] + " " + ",".join(extra)
+            try:
+                us_c, yc = bench(make_kernel(best[2], extra), xd, d, s)
+                print(f"[tile] {name} {tag:40s} {us_c:7.1f} us  {fl / us_c / 1e6:6.1f} TFLOPS  "
+                      f"rel {rel(yc, ref):.2e}", flush=True)
+                if us_c < best[0]:
+                    best = (us_c, tag, best[2])
+            except Exception as e:  # noqa: BLE001
+                print(f"[tile] {name} {tag:40s} FAILED: {str(e).splitlines()[0][:150]}", flush=True)
     if best:
         c = best[2]
         cfg = None if c is None else {k_: getattr(c, k_) for k_ in (
             "tile_m", "tile_k", "tile_n", "TILES_IN_BLOCK_M", "TILES_IN_BLOCK_N", "TILES_IN_BLOCK_K",
-            "TILES_IN_LOAD_M", "TILES_IN_LOAD_N")}
+            "TILES_IN_LOAD_M", "TILES_IN_LOAD_N", "spill_reload")}
         print(f"[tile] BEST {name}: {best[0]:.1f} us ({best[1]}) vs bf16 {min(us, us2):.1f} us  "
               f"config {json.dumps(cfg)}", flush=True)
 
