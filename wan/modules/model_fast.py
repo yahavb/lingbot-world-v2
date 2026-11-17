@@ -988,6 +988,8 @@ def _tp_row_parallel(linear, x, scatter=False, bf16_sum=False):
     # Left as-is only because removing it is a no-op either way. The docstring's claim
     # about "paying fp32 matmul rates on bf16-stored weights" and the per-forward weight
     # upcast does not survive this: there was no upcast.
+    if scatter and getattr(linear, "_bias_full", None) is not None:
+        return _mx_rp_scatter(linear, x).to(orig_dtype)          # LINGBOT_MX_RP_POST
     with torch.amp.autocast('neuron', dtype=torch.float32):
         y = linear(x)
     if scatter:
@@ -1042,6 +1044,21 @@ _LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
 _FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
 # LINGBOT_LIN_MX_SKIP="self_attn.o,cross_attn.o": these Linears stay bf16 under LINGBOT_LIN_MX.
 _MX_QKV_FUSED = os.environ.get("LINGBOT_MX_QKV_FUSED", "0") == "1"
+# LINGBOT_MX_RP_POST=1|fp32: the three sequence-parallel row-parallel MX Linears (self_attn.o, cross_attn.o, ffn.2)
+# leave the bias out of the [n*S, C] partial sums, reduce-scatter the kernel's bf16 output as is (=1) or cast to fp32
+# first (=fp32, the default path's reduction dtype), and add the full bias to this rank's [S, C] shard afterwards.
+# The 2-chip block profile charged each [2176, 5120] bias add + fp32 cast (add.268 / add.466 / add.531) ~45 us of PE
+# transposes and ~70 us of Vector/Scalar, serialized between the kernels. The full bias (rank 0's; the other ranks hold
+# zeros, see shard_row_parallel) is all-reduced once at load into _bias_full.
+_MX_RP_POST = os.environ.get("LINGBOT_MX_RP_POST", "0")
+_MX_RP_NAMES = ("self_attn.o", "cross_attn.o")
+# LINGBOT_FFN_EPI=1: the MX FFN's bias + GELU(tanh) + down-projection K padding as one NKI kernel (kernels/ffn_epi.py)
+# instead of compiler elementwise ops (~200 us with PE transposes between the two matmuls at the 2-chip shape).
+_FFN_EPI = os.environ.get("LINGBOT_FFN_EPI", "0") == "1"
+# LINGBOT_FFN_UP_PAD=1: ffn.0's weight gets zero output rows up to ffn.2's 512-padded K (3456 -> 3584 at TP4), so the
+# up projection writes the padded activation itself. perf/mx_tile_sweep.py FAST=1 M=2176: (5120, 3584) default tiles
+# 208-216 us vs (5120, 3456) tuned 252 us.
+_FFN_UP_PAD = os.environ.get("LINGBOT_FFN_UP_PAD", "0") == "1"
 _MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").replace(":", ",").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
@@ -1158,6 +1175,29 @@ def _mx_linear_forward(self, x):
     return y.view(*shp[:-1], y.shape[-1])
 
 
+def _mx_set_bias_full(lin):
+    """LINGBOT_MX_RP_POST: the full row-parallel bias on every TP rank (eager, once, at load)."""
+    if lin.bias is None or getattr(lin, "_bias_full", None) is not None:
+        return
+    with torch.no_grad():
+        b = tp.all_reduce_fn(lin.bias.detach().float().contiguous(), "tp")
+        lin.register_buffer("_bias_full", (b + 0).to(lin.bias.dtype), persistent=False)
+
+
+def _mx_rp_scatter(lin, x):
+    """LINGBOT_MX_RP_POST: row-parallel MX Linear on x [1, n*S, K], reduce-scatter over the TP group's tokens, then
+    the full bias on this rank's shard -> [1, S, N] fp32."""
+    from kernels import ffn_mx
+    x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+    if lin._mxq_k != x2.shape[-1]:
+        x2 = torch_F.pad(x2, (0, lin._mxq_k - x2.shape[-1]))
+    y = ffn_mx.mm(x2.contiguous(), lin._mxq_data, lin._mxq_scales)      # [n*S, N] bf16, no bias
+    if _MX_RP_POST == "fp32":
+        y = y.float()
+    r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh("tp"))      # [S, N]
+    return (r.float() + lin._bias_full.float()).unsqueeze(0)
+
+
 def _prequantize_linears_mx(blocks):
     """LINGBOT_LIN_MX: every non-FFN block Linear (the FFN is _prequantize_ffn_mx's)."""
     assert not (_QKV_FUSED or _QKV_XT), "LINGBOT_LIN_MX: QKV_FUSED / QKV_XT read q/k/v weights directly"
@@ -1184,9 +1224,13 @@ def _prequantize_linears_mx(blocks):
             lin = b_.get_submodule(name)
             _mx_quantize_linear(lin)
             lin.forward = types.MethodType(_mx_linear_forward, lin)
+            if _MX_RP_POST in ("1", "fp32") and name in _MX_RP_NAMES and tp.mesh_submesh("tp") is not None:
+                _mx_set_bias_full(lin)
             n += 1
     _q(f"[model_fast] LINGBOT_LIN_MX: {n} Linears in MXFP8 ({len(_MX_LIN_NAMES) - len(_MX_LIN_SKIP)} per "
-       f"block, kept bf16: {list(_MX_LIN_SKIP)}); bf16 copies freed")
+       f"block, kept bf16: {list(_MX_LIN_SKIP)}); bf16 copies freed"
+       + (f"; LINGBOT_MX_RP_POST={_MX_RP_POST}: o-projection biases after the reduce-scatter"
+          if _MX_RP_POST in ("1", "fp32") else ""))
 
 
 def _prequantize_ffn_mx(blocks):
@@ -1201,10 +1245,21 @@ def _prequantize_ffn_mx(blocks):
                 kp = -(-w.shape[1] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
                 if kp != w.shape[1]:
                     w = torch_F.pad(w, (0, kp - w.shape[1]))
+                if lin is ffn[0] and _FFN_UP_PAD:
+                    # LINGBOT_FFN_UP_PAD: zero output rows up to the down projection's padded K, so ffn.0 writes
+                    # [M, 3584] (GELU(0 + 0) = 0 in the pad) and nothing pads between the matmuls
+                    npad = -(-w.shape[0] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
+                    if npad != w.shape[0]:
+                        w = torch_F.pad(w, (0, 0, 0, npad - w.shape[0]))
+                        if lin.bias is not None:
+                            lin.register_buffer("_b_pad", torch_F.pad(lin.bias.detach(), (0, npad - lin.bias.shape[0])),
+                                                persistent=False)
                 d, sc = ffn_mx.prequantize_weight(w.contiguous())
                 lin.register_buffer("_mxq_data", d, persistent=False)
                 lin.register_buffer("_mxq_scales", sc, persistent=False)
                 lin._mxq_k = kp
+        if _MX_RP_POST in ("1", "fp32") and _SP_ON and tp.mesh_submesh("tp") is not None:
+            _mx_set_bias_full(ffn[2])
         if i == 0:
             # The compiled path (wrap_nki) must match the eager LNC launch the bench measured.
             x = torch.randn(256, ffn[0].in_features, device=ffn[0].weight.device).to(torch.bfloat16)
@@ -1214,7 +1269,7 @@ def _prequantize_ffn_mx(blocks):
             dense = x.float() @ ffn[0].weight.float().t()
             torch.neuron.synchronize()
             dd = (got.float() - ref.float()).abs().max().item()
-            rel = ((ref.float() - dense).norm() / dense.norm()).item()
+            rel = ((ref.float()[:, :dense.shape[1]] - dense).norm() / dense.norm()).item()   # (LINGBOT_FFN_UP_PAD)
             _q(f"[model_fast] LINGBOT_FFN_MX: {ffn_mx.FP8}, compiled vs eager max|d| {dd:.3e}, "
                f"eager vs bf16-weight fp32 matmul rel {rel:.3e}")
             # tuned tiles (LINGBOT_MX_TUNED) may sum in another order than the default eager kernel
@@ -1235,13 +1290,26 @@ def _ffn_mx(ffn, hf):
     """SP FFN on MXFP8 matmuls: hf [1, M, C] all-gathered -> [1, M, C] partial sums (+ bias)."""
     from kernels import ffn_mx
     x = hf[0]
-    u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)
-    if ffn[0].bias is not None:
-        u = u + ffn[0].bias
-    u = ffn[1](u)
-    if ffn[2]._mxq_k != u.shape[1]:
-        u = torch_F.pad(u, (0, ffn[2]._mxq_k - u.shape[1]))
+    u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)      # [M, N] (N padded under LINGBOT_FFN_UP_PAD)
+    b0 = getattr(ffn[0], "_b_pad", None)
+    b0 = ffn[0].bias if b0 is None else b0
+    if _FFN_EPI and b0 is not None:
+        # LINGBOT_FFN_EPI: bias + GELU(tanh) + the K padding of the down projection in one NKI kernel
+        from kernels import ffn_epi
+        u = ffn_epi.bias_gelu_pad(u, b0.view(1, -1).to(u.dtype).contiguous(), int(ffn[2]._mxq_k))
+    else:
+        if b0 is not None:
+            u = u + b0
+        u = ffn[1](u)
+        if ffn[2]._mxq_k != u.shape[1]:
+            u = torch_F.pad(u, (0, ffn[2]._mxq_k - u.shape[1]))
     y = ffn_mx.mm(u.contiguous(), ffn[2]._mxq_data, ffn[2]._mxq_scales)
+    if getattr(ffn[2], "_bias_full", None) is not None:
+        # LINGBOT_MX_RP_POST: no bias in the partial sums; reduce-scatter here, full bias on this rank's shard
+        if _MX_RP_POST == "fp32":
+            y = y.float()
+        r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh("tp"))
+        return (r.float() + ffn[2]._bias_full.float()).unsqueeze(0)
     if ffn[2].bias is not None:
         y = y + ffn[2].bias
     return y.unsqueeze(0)
@@ -2138,6 +2206,8 @@ class CausalWanSelfAttention(nn.Module):
         if scatter and getattr(self, 'tp_enabled', False):
             # Sequence parallel (LINGBOT_SP): reduce-scatter to this rank's token shard.
             orig_dtype = x.dtype
+            if getattr(self.o, "_bias_full", None) is not None:
+                return _mx_rp_scatter(self.o, x).to(orig_dtype)      # LINGBOT_MX_RP_POST
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 y = self.o(x)
             return tp.reduce_scatter_tokens(y, "tp").to(orig_dtype)
@@ -2403,7 +2473,9 @@ class CausalWanAttentionBlock(nn.Module):
                                       _sp_scatter=True)
             h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
                 self.ffn[0].weight.dtype)
-            if _FFN_MX:
+            if _FFN_MX and getattr(self.ffn[2], "_bias_full", None) is not None:
+                y = _ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")).to(h.dtype)   # LINGBOT_MX_RP_POST
+            elif _FFN_MX:
                 y = tp.reduce_scatter_tokens(_ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")), "tp").to(h.dtype)
             elif _FFN_FMAJ:
                 y = _ffn_feature_major(self.ffn, h)

@@ -37,7 +37,9 @@ REPS = int(os.environ.get("REPS", "30"))
 DEV = torch.device("neuron:0")
 # (name, K, N): K already padded to 512 as kernels/ffn_mx.py pads it
 SHAPES = {"qkv": (5120, 1280), "o": (1536, 5120), "ffn_up": (5120, 3456),
-          "ffn_down": (3584, 5120), "cross_kv": (5120, 1280)}
+          "ffn_down": (3584, 5120), "cross_kv": (5120, 1280), "qkv3": (5120, 3840), "ffn_up_pad": (5120, 3584)}
+# FAST=1: every candidate with fast_dma_transpose (the deployed LINGBOT_MX_FAST_DMA=1 condition)
+FAST = os.environ.get("FAST", "0") == "1"
 
 
 @nki.jit
@@ -47,8 +49,11 @@ def _quant(w):
 
 def make_kernel(c, extra=None):
     kw = dict(extra or {})
+    if FAST and not kw.get("disable_dma_transpose") and not kw.get("load_with_PE_swizzle"):
+        kw["fast_dma_transpose"] = True
     if c is not None:
-        kw = dict(TILES_IN_BLOCK_M=c.TILES_IN_BLOCK_M, TILES_IN_BLOCK_N=c.TILES_IN_BLOCK_N,
+        # (an earlier version replaced kw here, silently dropping `extra` and the transpose variants)
+        kw.update(TILES_IN_BLOCK_M=c.TILES_IN_BLOCK_M, TILES_IN_BLOCK_N=c.TILES_IN_BLOCK_N,
                   TILES_IN_BLOCK_K=c.TILES_IN_BLOCK_K, TILES_IN_LOAD_M=c.TILES_IN_LOAD_M,
                   TILES_IN_LOAD_N=c.TILES_IN_LOAD_N,
                   lhs_matmul_tile_shape_logical=(c.tile_k, c.tile_m),

@@ -111,10 +111,18 @@ def _tuned_kernel(key, table=None):
 _mm_default = mm
 
 
+# LINGBOT_MX_M2176_DEFAULT="3584x5120": these (K, N) take the default tiles at M=2176 rows even under
+# LINGBOT_MX_TUNED (perf/mx_tile_sweep.py FAST=1 M=2176: ffn.2 default 208-213 us vs the M2176 table's 243 us).
+_M2176_DEFAULT = tuple(tuple(int(v) for v in k.split("x"))
+                       for k in os.environ.get("LINGBOT_MX_M2176_DEFAULT", "").split(",") if k)
+
+
 def mm(x, w_data, w_scales):  # noqa: F811 -- tuned dispatch over the default kernel
     if _TUNED_ON and int(x.shape[0]) in _TUNED_BY_M:
         tbl = _TUNED_BY_M[int(x.shape[0])]
         key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
+        if int(x.shape[0]) == 2176 and key in _M2176_DEFAULT:
+            return _mm_default(x, w_data, w_scales)
         if key in tbl:
             mk = (int(x.shape[0]),) + key
             if mk not in _TUNED_MM:
