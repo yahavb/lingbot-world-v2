@@ -50,7 +50,6 @@
   </div>
   <p id="caption" aria-live="polite"></p>
 
-  <p id="fps">fps: not streaming. Press F to hear the fps.</p>
   <p id="status" role="status" aria-live="polite">Pick a scene and press Start.</p>
 
   <div class="row" role="group" aria-label="Camera controls">
@@ -126,8 +125,8 @@ function timing(f, shownAt) {
     `vae ${sec(local(t.x0), local(t.dec))}  net ${sec(local(t.dec), arriveEpoch)}  buf ${sec(arriveEpoch, shownEpoch)}`;
 }
 
-const fpsEl = $("fps");
-let fpsShownAt = 0;
+// the serving setup, last line of the video HUD
+const SETUP = "4x trn3-dev1   MXFP8   LNC2   480\u00d7768";
 function fpsText() {
   const g = rate(arrivals, 6000), v = rate(shown, 3000);
   return g > 0 || v > 0 ? `fps: generated ${g.toFixed(1)}, shown ${v.toFixed(1)}, chunk ${lastChunk}`
@@ -162,11 +161,8 @@ function tick(now) {
     `generated ${rate(arrivals, 6000).toFixed(1)} fps   shown ${rate(shown, 3000).toFixed(1)} fps\n` +
     `buffer ${buffer.length}   frames ${total}   chunk ${lastChunk}\n` +
     `control latency ${latencyMs === null ? "-" : (latencyMs / 1000).toFixed(2) + " s"}` +
-    (breakdown ? `\n${breakdown}` : "");
-  if (now - fpsShownAt > 1000) {   // the readable fps line (not a live region: F announces it)
-    fpsShownAt = now;
-    fpsEl.textContent = fpsText();
-  }
+    (breakdown ? `\n${breakdown}` : "") +
+    `\n${SETUP}`;
   requestAnimationFrame(tick);
 }
 
