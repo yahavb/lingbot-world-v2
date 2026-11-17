@@ -97,7 +97,8 @@ def _tuned_kernel(key, table=None):
               spill_reload=t["sr"],
               **({} if os.environ.get("LINGBOT_MX_TUNED_NOEXTRA", "0") == "1" else t["extra"]))
 
-    if _FAST_DMA:
+    # disable_dma_transpose (the 1x32 loader without a DMA transpose) excludes the DGT fast path
+    if _FAST_DMA and not kw.get("disable_dma_transpose") and not kw.get("load_with_PE_swizzle"):
         kw["fast_dma_transpose"] = True
     @nki.jit
     def k(lhs, w_data, w_scales):
