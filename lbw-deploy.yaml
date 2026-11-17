@@ -1,9 +1,10 @@
-# 4-DEVICE TEST variant (l-lnc2, 16 ranks, TP4 x CP4, 448x704, VAE inline on the same ranks), the
-# docs/perf/e2e/LEDGER.md flags. Service lbw (ClusterIP). The web
-# front end is lbw-web-deploy.yaml.
-# Original header follows.
+# lbw-v2-dit-t5 on 4 trn3 devices at LNC2 (l-lnc2, 16 ranks, TP4 x CP4, 480x768), DiT + T5 + VAE in
+# one pod (no VAE_URL). DiT block Linears in MXFP8 (K=1280 ones bf16), K/V tile DMA descriptors on the
+# Sync engine (LINGBOT_CTE_KV_DGE=hwdge_sync); the rest = the ledger flags of the 4-device 13.5 fps run.
+# Same Deployment/Service names as the other lbw-v2-dit-t5 files: apply one at a time. Serves at
+# 12.9 fps steady through the service (measured 2026-11-17, perf: docs/perf/MXFP8_LNC1.md).
 # DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
-# with the q20_kbnw flags -- the half-instance row of docs/perf/LOOP_ENGINEERING.md (17.88 fps with an
+# with the q20_kbnw flags -- the half-instance row of kiro/LOOP_ENGINEERING.md (17.88 fps with an
 # inline VAE); streaming with lbw-v2-vae it measured 17.3 fps and ~1.1 s from a control press to
 # its frames at the browser. Latent chunks go to
 # lbw-v2-vae (VAE_URL). The converted checkpoint and compiled NEFFs live on the node
@@ -11,10 +12,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: lbw
+  name: lbw-v2-dit-t5
 spec:
   selector:
-    app: lbw
+    app: lbw-v2-dit-t5
   ports:
     - port: 8000
       targetPort: 8000
@@ -22,38 +23,24 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: lbw
+  name: lbw-v2-dit-t5
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: lbw
+      app: lbw-v2-dit-t5
   template:
     metadata:
       labels:
-        app: lbw
+        app: lbw-v2-dit-t5
     spec:
       nodeSelector:
         node-type: trn3-dev1
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: l-lnc2
-      initContainers:
-        - name: neuron-healthcheck   # as wan2-i2v-14b-deploy.yaml: fail the pod early on a bad device
-          image: public.ecr.aws/neuron/neuron-observer:0.2.0
-          command: ["sh", "-c"]
-          args:
-            - |
-              ls /dev/neuron*
-              neuron-observer health-check --test matmul
-          env:
-            - name: NEURON_RT_ALLOW_LEGACY_NEFF
-              value: "1"
-          resources:
-            claims:
-              - name: neuroncores
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
@@ -61,7 +48,6 @@ spec:
             - /bin/bash
             - "-c"
             - |
-              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched (preview)" || true   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
@@ -128,7 +114,6 @@ spec:
               memory: 950Gi
               ephemeral-storage: 600Gi
           volumeMounts:
-            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}   # neuron-top-patch
             - name: node-cache
               mountPath: /node-cache
             - name: dshm
@@ -136,34 +121,6 @@ spec:
             - name: logs
               mountPath: /logs
           env:
-            - name: LINGBOT_VAE_2D
-              value: "1"
-            - name: LINGBOT_VAE_T
-              value: "6"
-            - name: LINGBOT_VAE_NORM
-              value: "mm"
-            - name: LINGBOT_VAE_CC_FLAGS
-              value: "-O1"
-            - name: LINGBOT_VAE_BF16
-              value: "1"
-            - name: LINGBOT_VAE_FUSED
-              value: "1"
-            - name: LINGBOT_WT_PRE
-              value: "1"
-            - name: LINGBOT_ATTN_FMAJ
-              value: "1"
-            - name: LINGBOT_FFN_FMAJ
-              value: "1"
-            - name: LINGBOT_BLOCK_GROUP
-              value: "2"
-            - name: LINGBOT_CTE_SCALAR_ROWMAX
-              value: "1"
-            - name: LINGBOT_CTE_PRIOR_FULL
-              value: "1"
-            - name: LINGBOT_CTE_EXP_SPLIT
-              value: "2"
-            - name: LINGBOT_T5_FP32
-              value: "1"
             - name: BRANCH
               value: "main"
             - name: SEG_CHUNKS
@@ -179,7 +136,7 @@ spec:
             - name: TP
               value: "4"
             - name: SIZE
-              value: "448*704"
+              value: "480*768"
             - name: FRAME_NUM
               value: "81"
             - name: CHUNK_SIZE
@@ -204,8 +161,6 @@ spec:
               value: "1"
             - name: ATTENTION_BACKEND
               value: "cte"
-            # loop_engineering (docs/perf/LOOP_ENGINEERING.md, q16_key); PREUPLOAD / FILM_ALL only act
-            # on the non-streaming path
             - name: LINGBOT_HOT_ATTN
               value: "cte"
             - name: LINGBOT_SP
@@ -248,7 +203,6 @@ spec:
               value: "4"
             - name: LINGBOT_IMG_BLOCK
               value: "1"
-            # q20_kbnw (perf/k8s_sweep.sh)
             - name: LINGBOT_CTE_LOCAL
               value: "1"
             - name: LINGBOT_CTE_VGROUP
@@ -285,9 +239,57 @@ spec:
                   name: hf-token
                   key: HF_TOKEN
                   optional: true
+            - name: LINGBOT_FFN_MX
+              value: "1"
+            - name: LINGBOT_LIN_MX
+              value: "1"
+            - name: LINGBOT_LIN_MX_SKIP
+              value: "self_attn.o:cross_attn.o:cam_injector_layer2"
+            - name: LINGBOT_MX_TUNED
+              value: "1"
+            - name: LINGBOT_CTE_KV_DGE
+              value: "hwdge_sync"
+            - name: LINGBOT_TEMB_SLICE
+              value: "1"
+            - name: LINGBOT_SERVE_MEM_LOG
+              value: "1"
+            - name: LINGBOT_SERVE_EMPTY_CACHE
+              value: "0"
+            - name: LINGBOT_WT_PRE
+              value: "1"
+            - name: LINGBOT_ATTN_FMAJ
+              value: "1"
+            - name: LINGBOT_FFN_FMAJ
+              value: "1"
+            - name: LINGBOT_VAE_GATHER1
+              value: "1"
+            - name: LINGBOT_FILM_ALL_CHUNKS
+              value: "3"
+            - name: LINGBOT_FILM_ALL_BLOCKS
+              value: "10"
+            - name: LINGBOT_BLOCK_GROUP
+              value: "2"
+            - name: LINGBOT_CTE_SCALAR_ROWMAX
+              value: "1"
+            - name: LINGBOT_CTE_PRIOR_FULL
+              value: "1"
+            - name: LINGBOT_CTE_EXP_SPLIT
+              value: "2"
+            - name: LINGBOT_T5_FP32
+              value: "1"
+            - name: LINGBOT_VAE_2D
+              value: "1"
+            - name: LINGBOT_VAE_T
+              value: "1"
+            - name: LINGBOT_VAE_NORM
+              value: "mm"
+            - name: LINGBOT_VAE_CC_FLAGS
+              value: "-O1"
+            - name: LINGBOT_VAE_BF16
+              value: "1"
+            - name: LINGBOT_VAE_FUSED
+              value: "1"
       volumes:
-        - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
-          configMap: {name: neuron-top-patch, optional: true}
         - name: node-cache
           hostPath:
             path: /opt/lingbot-world-v2
