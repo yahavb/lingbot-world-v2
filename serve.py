@@ -476,7 +476,39 @@ def main():
 
     remote = RemoteDecoder(VAE_URL) if (VAE_URL and rank == 0) else None
 
+    # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
+    # the same path vae_serve.py serve_fused streams with (2-D tiles with LINGBOT_VAE_2D=1). The plain
+    # width-sharded path below failed to compile its per-frame gather at 480x768 on 16 LNC2 ranks
+    # (neuronx-cc NCC_ITIN902 in vae2_1_sharded.gather_video_width).
+    _fused_vae = {}
+
+    def decode_local_fused(chunk_id, x0, emit):
+        from wan.modules import vae2_1_fused as F
+        if not _fused_vae:
+            from wan.modules.vae2_1 import Wan2_1_VAE
+            extra = F.apply_vae_cc_flags()
+            v = Wan2_1_VAE(vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=dev,
+                           dtype=torch.bfloat16)
+            _fused_vae.update(vae=v, fdec=F.FusedWidthDecoder(v.model))
+            if rank == 0:
+                logging.info(f"inline fused VAE decoder, {'2-D tiles' if F._TWO_D else 'width slices'}"
+                             + (f", compiler flags + {extra}" if extra else ""))
+        v, fdec = _fused_vae["vae"], _fused_vae["fdec"]
+        z = x0.to(dev)
+        local = F.shard_latent_2d(z) if F._TWO_D else width_shard_latent(z, rank=rank, world=world)
+
+        def step(out):
+            out = out.float().clamp_(-1, 1).squeeze(0)
+            video = F.gather_video_2d(out) if F._TWO_D else gather_video_width(out)
+            if rank == 0:
+                for t in range(video.shape[1]):
+                    emit(b64_jpeg(to_pil(video[:, t])))
+        fdec.decode_chunk(local.unsqueeze(0), v.scale, chunk_id == 0, on_step=step)
+        dist.barrier()
+
     def decode_local(chunk_id, x0, emit):
+        if world > 1 and os.environ.get("LINGBOT_VAE_FUSED", "0") == "1":
+            return decode_local_fused(chunk_id, x0, emit)
         lat_w = x0.shape[-1]
         vae, vae_world, pad_w = G._width_sharded_vae(args, cfg, dev, rank, world, lat_w)
         if vae is not None:
