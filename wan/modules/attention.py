@@ -691,6 +691,9 @@ def _cmax_kernels():
                 "part2": wrap_nki(cm3.cmax3_part_2),
                 "part3": wrap_nki(cm3.cmax3_part_3),
                 "final1": wrap_nki(cm3.cmax3_final_1),
+                # LINGBOT_C3_TOKOUT: token-major [Sq, tok_cols] output, zero columns up to the o-projection's K
+                "full1t": wrap_nki(cm3.cmax3_full_tok_1),
+                "final1t": wrap_nki(cm3.cmax3_final_tok_1),
             }
         elif _CMAX_MODE == 2:
             from kernels import attention_cmax2_lb as cm
@@ -750,11 +753,17 @@ def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=Fals
                                                    *_cmax_layout(k_blocks, v_token_major))
 
 
-def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False):
+def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0):
     """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only).
-    LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair."""
+    LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair; with tok_cols (LINGBOT_C3_TOKOUT)
+    token-major [Lq_p, tok_cols] instead, the heads' n x d columns then zeros."""
     k = _cmax_kernels()
     lay = _cmax_layout(k_blocks, v_token_major)
+    if tok_cols:
+        assert _CMAX_MODE == 3, "tok_cols: LINGBOT_CMAX=3 only"
+        if acc is None:
+            return k["full1t"](q_t, kc, vc, _cmax_arg(offset), *lay, int(tok_cols))
+        return k["final1t"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(tok_cols))
     if acc is None:
         return k["full1"](q_t, kc, vc, _cmax_arg(offset), *lay)
     if _CMAX_MODE == 3:

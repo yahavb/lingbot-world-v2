@@ -37,7 +37,9 @@ REPS = int(os.environ.get("REPS", "30"))
 DEV = torch.device("neuron:0")
 # (name, K, N): K already padded to 512 as kernels/ffn_mx.py pads it
 SHAPES = {"qkv": (5120, 1280), "o": (1536, 5120), "ffn_up": (5120, 3456),
-          "ffn_down": (3584, 5120), "cross_kv": (5120, 1280), "qkv3": (5120, 3840), "ffn_up_pad": (5120, 3584)}
+          "ffn_down": (3584, 5120), "cross_kv": (5120, 1280), "qkv3": (5120, 3840), "ffn_up_pad": (5120, 3584),
+          # full (TP-free) weights on one TP rank's token shard (M = 544 at TP4 x CP2)
+          "ffn_up_full": (5120, 13824), "ffn_down_full": (13824, 5120), "sq_full": (5120, 5120)}
 # FAST=1: every candidate with fast_dma_transpose (the deployed LINGBOT_MX_FAST_DMA=1 condition)
 FAST = os.environ.get("FAST", "0") == "1"
 

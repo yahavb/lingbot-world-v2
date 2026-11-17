@@ -65,6 +65,17 @@ def run3():
 
 us3, o3 = bench(run3)
 print(f"[c3] cmax3 part{NC}+final1 {us3:8.1f} us  rel vs fp32 {rel(o3, ref):.2e}", flush=True)
+TOK = int(os.environ.get("TOK", "0") or 0)
+if TOK:
+    # LINGBOT_C3_TOKOUT: the final call's token-major [Sq, TOK] output (heads x d, then zero columns)
+    def run3t():
+        o_acc, s_acc = part[2](qd, *kd[:NC], *vd[:NC], C, KB, True)
+        return c3.cmax3_final_tok_1[2](qd, kd[NC], vd[NC], o_acc, s_acc, C, KB, True, TOK)
+    us3t, o3t = bench(run3t)
+    ot = o3t.float().cpu()
+    ref_t = ref.permute(2, 0, 1).reshape(LQ, N * D)
+    print(f"[c3] cmax3 part{NC}+final1 tok {us3t:8.1f} us  rel vs fp32 {rel(ot[:, :N * D], ref_t):.2e}  "
+          f"pad max |x| {ot[:, N * D:].abs().max().item() if TOK > N * D else 0.0:.1e}", flush=True)
 if os.environ.get("CMP2", "1") == "1":
     from kernels import attention_cmax2_lb as c2
     part2 = {1: c2.cmax2_part_1, 2: c2.cmax2_part_2, 3: c2.cmax2_part_3}[NC]
