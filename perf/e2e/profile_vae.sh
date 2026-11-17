@@ -38,8 +38,8 @@ done
 echo "  ranks converted: $(echo $F | wc -w) of $i"
 # the timed decode only: the trace also holds compile, the warm-up decode and the gather/save tail
 VAE_MS=$(grep -oE "vae\.decode steady-state \([^)]*\): [0-9.]+" "$P/dec_systrace.log" | grep -oE "[0-9.]+$" | tail -1)
-FW=""; for f in $F; do w="${f%.parquet}_dec.parquet"; python3 "$REPO/perf/e2e/trace_window.py" "$f" "$VAE_MS" "$w" > /dev/null; FW="$FW $w"; done
-F="$FW"; echo "  window: last ${VAE_MS} ms of each rank's last busy segment"
+FW=""; for f in $F; do w="${f%.parquet}_dec.parquet"; python3 "$REPO/perf/e2e/trace_window.py" "$f" "$VAE_MS" "$w" busiest > /dev/null; FW="$FW $w"; done
+F="$FW"; echo "  window: ${VAE_MS} ms ending at each rank's busiest segment"
 python3 "$T/neuron_attribution.py" $F --names "${N#,}" --run-gap-s 2 --min-share 0.005 \
   --roles 'vae=vae|decoder|conv' --json-out "$P/manifest.json" > "$P/attr.txt" 2>&1
 head -60 "$P/attr.txt"
