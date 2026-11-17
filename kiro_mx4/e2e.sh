@@ -7,7 +7,7 @@ source kiro_mx4/common.sh
 name="${1:?name}"; shift
 export LINGBOT_BENCH_RUNS="${LINGBOT_BENCH_RUNS:-3}"
 for kv in "$@"; do export "$kv"; done
-d="/work/out/e2e/$name"; mkdir -p "$d"; env | grep -E '^(LINGBOT|NEURON|ATTENTION|COMPILE|NKI|FLASH|TP|CP)' | sort > "$d/env.txt"
+d="/work/out/e2e/$name"; mkdir -p "$d"; [ "${GATE:-0}" = 1 ] && export LINGBOT_DUMP_PRED="$d/dump:c0s0" LINGBOT_DUMP_ROLLOUT="$d/dump"; env | grep -E '^(LINGBOT|NEURON|ATTENTION|COMPILE|NKI|FLASH|TP|CP)' | sort > "$d/env.txt"
 PROMPT="gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
 ARGS=(--task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT" --size "${SIZE:-480*768}" --frame_num 81
       --chunk_size 3 --image examples/03/image.jpg --action_path examples/03 --prompt "$PROMPT"
@@ -26,3 +26,10 @@ vae=$(cat "$d/dec1.log" "$d/dec2.log" | grep -aoE "vae\.decode steady-state \([^
 fps=$(python3 -c "print(round(81 / ((${gen:-nan} + ${vae:-nan}) / 1000), 2))" 2>/dev/null)
 echo "RESULT $name GEN_ms=${gen:-NA} VAE_ms=${vae:-NA} fps=${fps:-NA} runs=${runs:-NA} wall_s=$(( $(date +%s) - t0 )) overrides=$*" | tee -a /work/out/e2e/results.txt
 grep -m3 -ahE "Traceback|Error|error:|NRT_RESOURCE|OOM" "$d/gen.log" "$d/dec1.log" | cut -c1-220
+if [ "${GATE:-0}" = 1 ]; then   # perf/e2e/gate.sh layout: gate/{frames.pt, forward_c0s0.pt, forward_x0c0.pt}
+  mkdir -p "$d/gate"; ln -sf ../frames.pt "$d/gate/frames.pt"; ln -sf ../dump/c0s0.pt "$d/gate/forward_c0s0.pt"
+  python3 -c "import torch,sys; r=torch.load(sys.argv[1]); torch.save(r['x0'][:, :r['chunk_size']].contiguous(), sys.argv[2])" \
+    "$d/dump/rollout_inputs.pt" "$d/gate/forward_x0c0.pt"
+  bash perf/e2e/gate.sh /node-cache/e2e/gate/r480_ex03_s42 /node-cache/e2e/mx-lnc1-dge-g/lnc1_4x8 "$d" > "$d/gate.txt" 2>&1
+  echo "GATE $name exit=$? $(python3 -c "import json,sys; v=json.load(open(sys.argv[1])); print(v['verdict'])" "$d/gate_verdict.json" 2>/dev/null)" | tee -a /work/out/e2e/results.txt
+fi
