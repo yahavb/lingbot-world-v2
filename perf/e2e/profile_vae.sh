@@ -10,6 +10,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$REPO"
 T="$REPO/perf/e2e/tools"
 D="${CFG_DIR:?}"; P="$D/prof_vae"; rm -rf "$P"; mkdir -p "$P"
+export NEURON_LOGICAL_NC_CONFIG="${LNC:?LNC}"   # outside k8s_sweep.sh run(): set it here
 pip install -q duckdb pyarrow 2>/dev/null || true
 echo "=== [vae 1] system trace decode ($NPROC ranks) ==="
 NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 NEURON_RT_INSPECT_DEVICE_PROFILE=0 \
