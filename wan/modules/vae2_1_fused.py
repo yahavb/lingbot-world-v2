@@ -153,6 +153,7 @@ _WAX = -2 if _SWAP else -1          # the sharded (width) axis
 # axes, width first so the height exchange carries the corners. Not combinable with SWAPHW.
 _TWO_D = os.environ.get("LINGBOT_VAE_2D", "0") == "1"
 assert not (_TWO_D and _SWAP), "LINGBOT_VAE_2D and LINGBOT_VAE_SWAPHW are exclusive"
+_HALO_BUF = os.environ.get("LINGBOT_VAE_HALO_BUF", "0") == "1"
 
 
 def _halo_2d(x, sel):
@@ -164,6 +165,20 @@ def _halo_2d(x, sel):
     g = fc.all_gather_tensor(e, 0, _MESH["dev"]).view((D,) + tuple(e.shape))
     bd = (D,) + (1,) * (e.dim() - 1)
     left, right = (g[:, 1] * wl.view(bd)).sum(0), (g[:, 0] * wr.view(bd)).sum(0)
+    if _HALO_BUF:
+        # LINGBOT_VAE_HALO_BUF=1: one [.., h + 2, w + 2] buffer written in place (tile, then its 4 edges)
+        # instead of two torch.cat copies of the whole tile. Same values (pure data movement).
+        h_, w_ = int(x.shape[-2]), int(x.shape[-1])
+        out = x.new_empty(tuple(x.shape[:-2]) + (h_ + 2, w_ + 2))
+        out[..., 1:h_ + 1, 1:w_ + 1] = x
+        out[..., 1:h_ + 1, :1] = left
+        out[..., 1:h_ + 1, w_ + 1:] = right
+        e = torch.stack([out[..., 1:2, :], out[..., h_:h_ + 1, :]], 0).contiguous()   # [2, ..., 1, w + 2]
+        g = fc.all_gather_tensor(e, 0, _MESH["core"]).view((P,) + tuple(e.shape))
+        bp = (P,) + (1,) * (e.dim() - 1)
+        out[..., :1, :] = (g[:, 1] * hu.view(bp)).sum(0)
+        out[..., h_ + 1:, :] = (g[:, 0] * hd.view(bp)).sum(0)
+        return out
     x = torch.cat([left, x, right], -1)
     e = torch.stack([x[..., :1, :], x[..., -1:, :]], 0).contiguous()      # [2, ..., 1, w + 2]
     g = fc.all_gather_tensor(e, 0, _MESH["core"]).view((P,) + tuple(e.shape))
