@@ -244,6 +244,10 @@ _ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
 # so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
 _CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
 _CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_CMAX_QSPLIT=n (kiro, 4-chip CP4: 1088 queries per rank): the constant-offset calls take at most n query rows
+# each (kernels/attention_cmax2_lb.py runs at most 640, validated at CP8's 544 with pinned PSUM), the query rows split
+# into consecutive pieces that each attend every key: the same softmax per row, more K / V loads.
+_CMAX_QSPLIT = int(os.environ.get("LINGBOT_CMAX_QSPLIT", "0") or 0)
 # LINGBOT_CMAX_GUARD=1 (LINGBOT_CMAX=2): that range was measured on one clip, not guaranteed, and outside it the output
 # breaks (inf / NaN, or 0 / 0). The final constant-offset call then checks its own result: every real query row's sum
 # of exp(score - c) must lie in [e^-60, e^78] (NaN fails), which makes the output the exact softmax up to rounding for
@@ -1728,7 +1732,15 @@ class CausalWanSelfAttention(nn.Module):
                     _kb = _cp if _K_BLOCKED else 1
                     q_t, lq = cmax_prep_q(roped_query, pad_to=_qpad)
                     lead_k, lead_v = list(k_chunks[:-1]), list(v_chunks[:-1])
-                    acc = (cmax_partial(q_t, lead_k, lead_v, _c_off, _kb, _V_TM) if lead_k else None)
+                    _lqp = int(q_t.shape[2])
+                    if _CMAX_QSPLIT and _lqp > _CMAX_QSPLIT:
+                        assert not _DIAG_BUFS, "LINGBOT_CMAX_QSPLIT: no DUMP_CMAX"
+                        _qr = [(r0, min(_CMAX_QSPLIT, _lqp - r0)) for r0 in range(0, _lqp, _CMAX_QSPLIT)]
+                        q_ps = [q_t[:, :, r0:r0 + n_].contiguous() for r0, n_ in _qr]
+                    else:
+                        _qr, q_ps = [(0, _lqp)], [q_t]
+                    accs = [(cmax_partial(q_, lead_k, lead_v, _c_off, _kb, _V_TM) if lead_k else None) for q_ in q_ps]
+                    acc = accs[0]
                     if _ATTN_EARLY != 2:
                         kg, vg = _gather_new()
                     if kv_write:
@@ -1742,16 +1754,21 @@ class CausalWanSelfAttention(nn.Module):
                     if _CMAX_GUARD:
                         # LINGBOT_CMAX_GUARD: the kernel checks every real row's sum and redoes out-of-band blocks
                         _rq = lq if _REAL_TOKENS[0] is None else min(int(_REAL_TOKENS[0]), lq)
-                        o_n, _gfl = cmax_final_guarded(q_t, kd, vd, acc, lead_k, lead_v, _c_off, _kb, _V_TM,
-                                                       real_q=_rq)
-                        _gst = getattr(self, "_cmax_guard_st", None)
-                        if _gst is not None:
-                            # [checked, out of band (flag 2), redone (flag >= 1)] blocks of this rank
-                            _gst.add_(torch.stack([_gfl.new_tensor(float(_gfl.numel())),
-                                                   torch.clamp(_gfl - 1.0, min=0.0).sum(),
-                                                   torch.clamp(_gfl, max=1.0).sum()]))
+                        _on = []
+                        for (r0, n_), q_, a_ in zip(_qr, q_ps, accs):
+                            o_p, _gfl = cmax_final_guarded(q_, kd, vd, a_, lead_k, lead_v, _c_off, _kb, _V_TM,
+                                                           real_q=max(1, min(n_, _rq - r0)))
+                            _on.append(o_p)
+                            _gst = getattr(self, "_cmax_guard_st", None)
+                            if _gst is not None:
+                                # [checked, out of band (flag 2), redone (flag >= 1)] blocks of this rank
+                                _gst.add_(torch.stack([_gfl.new_tensor(float(_gfl.numel())),
+                                                       torch.clamp(_gfl - 1.0, min=0.0).sum(),
+                                                       torch.clamp(_gfl, max=1.0).sum()]))
+                        o_n = _on[0] if len(_on) == 1 else torch.cat(_on, dim=1)
                     else:
-                        o_n = cmax_final(q_t, kd, vd, acc, _c_off, _kb, _V_TM)  # [n, Lq_p, d]
+                        _on = [cmax_final(q_, kd, vd, a_, _c_off, _kb, _V_TM) for q_, a_ in zip(q_ps, accs)]
+                        o_n = _on[0] if len(_on) == 1 else torch.cat(_on, dim=1)  # [n, Lq_p, d]
                     if _DIAG_BUFS:
                         # diagnostic (kiro/block_bench.py DUMP_CMAX): the kernel's queries, accumulator and output
                         _DIAG_BUFS["q_t"].copy_(q_t)

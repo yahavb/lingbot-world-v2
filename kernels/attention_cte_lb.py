@@ -772,7 +772,9 @@ def _attention_cte(
                       "chained calls: non-causal, no sink, no sliding window, no q_major")
         kernel_assert(tuple(chain_o.shape) == tuple(out_shape),
                       f"chain_o must have the output's shape {tuple(out_shape)}, got {tuple(chain_o.shape)}")
-        kernel_assert(not is_trn3_b1(), "chained calls: the Vector-engine exp path is not handled")
+        # kiro (trn3): the Vector-engine exp derives its max from mm1_running_max after the chained seed and
+        # the section-max update (_exp_impl), the same order as the multi-section path; validated per block
+        # against the unchained call (perf/mx_block_ab.sh REF) instead of asserting it away.
     if is_sequence_packed:
         batch_size = out_shape[0]
         kernel_assert(
