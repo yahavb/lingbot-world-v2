@@ -50,6 +50,8 @@ spec:
             - /bin/bash
             - "-c"
             - |
+              # neuron-top with op names in the memory layout and EFA traffic (ConfigMap neuron-top-patch)
+              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched" || true
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
@@ -116,6 +118,7 @@ spec:
               memory: 950Gi
               ephemeral-storage: 600Gi
           volumeMounts:
+            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}
             - name: node-cache
               mountPath: /node-cache
             - name: dshm
@@ -314,6 +317,8 @@ spec:
             - name: LINGBOT_VAE_FUSED
               value: "1"
       volumes:
+        - name: neuron-top-patch
+          configMap: {name: neuron-top-patch, optional: true}
         - name: node-cache
           hostPath:
             path: /opt/lingbot-world-v2
