@@ -9,9 +9,10 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$REPO"
 T="$REPO/perf/e2e/tools"
-D="${CFG_DIR:?}"; P="$D/prof_vae"; rm -rf "$P"; mkdir -p "$P"
+D="${CFG_DIR:?}"; P="$D/prof_vae"; [ -n "${RESUME:-}" ] || rm -rf "$P"; mkdir -p "$P"
 export NEURON_LOGICAL_NC_CONFIG="${LNC:?LNC}"   # outside k8s_sweep.sh run(): set it here
 pip install -q duckdb pyarrow 2>/dev/null || true
+if [ -z "${RESUME:-}" ]; then
 echo "=== [vae 1] system trace decode ($NPROC ranks) ==="
 NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 NEURON_RT_INSPECT_DEVICE_PROFILE=0 \
 NEURON_RT_INSPECT_OUTPUT_DIR="$P/systrace" torchrun --nproc_per_node="$NPROC" --master_port=29743 \
@@ -20,10 +21,12 @@ NEURON_RT_INSPECT_OUTPUT_DIR="$P/systrace" torchrun --nproc_per_node="$NPROC" --
 echo "  systrace decode exit=$?"
 grep -E "vae\.decode steady-state" "$P/dec_systrace.log"
 ls -d "$P"/systrace/i-* 2>/dev/null | sort -t_ -k3 -n > "$P/rankdirs.txt"
+fi   # RESUME=1: keep the trace and every rank already converted
 echo "  rank dirs: $(wc -l < "$P/rankdirs.txt")"
 echo "=== [vae 2] parquet (every rank) + attribution ==="
 i=0
 for d in $(cat "$P/rankdirs.txt"); do
+  [ -n "${RESUME:-}" ] && [ -f "$P/pq/r$i/system_profile/SystemProfileEvents.parquet" ] && { i=$((i+1)); continue; }
   bash "$T/neuron_trace_to_parquet.sh" "$d" "$P/pq/r$i" > "$P/pq_r$i.log" 2>&1 &
   i=$((i+1)); [ $((i % 8)) = 0 ] && wait
 done; wait

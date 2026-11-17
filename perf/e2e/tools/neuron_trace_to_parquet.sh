@@ -19,7 +19,7 @@ for _ in $(seq 1 900); do
   kill -0 "$pid" 2>/dev/null || { echo "converter exited"; break; }
   cur=$(du -sk "$OUT" | cut -f1)
   f=$(find "$OUT" -name SystemProfileEvents.parquet | head -1)
-  if [ -n "$f" ] && [ "$cur" = "$prev" ] && [ "$cur" -gt 2000 ]; then stable=$((stable + 1)); else stable=0; fi
+  if [ -n "$f" ] && [ "$cur" = "$prev" ] && [ "$cur" -gt 200 ]; then stable=$((stable + 1)); else stable=0; fi
   prev=$cur
   [ "$stable" -ge 15 ] && { echo "output stable at ${cur} KB"; kill "$pid"; break; }
 done
