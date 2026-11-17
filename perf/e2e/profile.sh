@@ -8,13 +8,13 @@
 # Usage: CFG_DIR=<sweep config dir> TP=4 CP=4 NPROC=16 bash perf/e2e/profile.sh   (env as the sweep)
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; cd "$REPO"
-T="$REPO/kiro/e2e/tools"
+T="$REPO/perf/e2e/tools"
 D="${CFG_DIR:?}"; P="$D/prof"; rm -rf "$P"; mkdir -p "$P"
 pip install -q duckdb pyarrow 2>/dev/null || true
 PROMPT="gentle ripples spreading across the calm lake water, tree leaves swaying softly in the breeze, clouds drifting slowly across the blue sky, cinematic slow camera push-in, serene natural motion"
 echo "=== [prof 1] system trace run ($NPROC ranks) ==="
 (
-  export LINGBOT_BENCH_RUNS=2 LINGBOT_DUMP_PRED= LINGBOT_DUMP_ROLLOUT= LINGBOT_SAVE_FRAMES=
+  export LINGBOT_BENCH_RUNS=3 LINGBOT_DUMP_PRED= LINGBOT_DUMP_ROLLOUT= LINGBOT_SAVE_FRAMES=
   export NEURON_RT_INSPECT_ENABLE=1 NEURON_RT_INSPECT_SYSTEM_PROFILE=1 NEURON_RT_INSPECT_DEVICE_PROFILE=0
   export NEURON_RT_INSPECT_OUTPUT_DIR="$P/systrace"
   torchrun --nproc_per_node="$NPROC" --master_port=29742 generate.py --task i2v-A14B --infer_mode causal_fast \
@@ -28,14 +28,20 @@ grep -E "\[BENCH\] GEN run" "$P/gen_systrace.log"
 ls -d "$P"/systrace/i-* 2>/dev/null | sort -t_ -k3 -n > "$P/rankdirs.txt"
 echo "  rank dirs: $(wc -l < "$P/rankdirs.txt")"
 echo "=== [prof 2] parquet + attribution ==="
-i=0; F=""; N=""
+# every rank (SKILL.md Step 3: the slowest rank sets the wall time), 8 conversions at a time
+i=0
 for d in $(cat "$P/rankdirs.txt"); do
-  case $i in 0|1) bash "$T/neuron_trace_to_parquet.sh" "$d" "$P/pq/r$i" > "$P/pq_r$i.log" 2>&1
-     f="$P/pq/r$i/system_profile/SystemProfileEvents.parquet"; [ -f "$f" ] && { F="$F $f"; N="$N,r$i"; };; esac
+  bash "$T/neuron_trace_to_parquet.sh" "$d" "$P/pq/r$i" > "$P/pq_r$i.log" 2>&1 &
+  i=$((i+1)); [ $((i % 8)) = 0 ] && wait
+done; wait
+F=""; N=""; i=0
+for d in $(cat "$P/rankdirs.txt"); do
+  f="$P/pq/r$i/system_profile/SystemProfileEvents.parquet"; [ -f "$f" ] && { F="$F $f"; N="$N,r$i"; }
   i=$((i+1))
 done
-GEN_MS=$(grep -oE "GEN run2 time: [0-9.]+" "$P/gen_systrace.log" | grep -oE "[0-9.]+$")
-FW=""; for f in $F; do w="${f%.parquet}_gen.parquet"; python3 "$REPO/kiro/e2e/trace_window.py" "$f" "$GEN_MS" "$w"; FW="$FW $w"; done
+echo "  ranks converted: $(echo $F | wc -w) of $i"
+GEN_MS=$(grep -oE "GEN run[0-9]+ time: [0-9.]+" "$P/gen_systrace.log" | tail -1 | grep -oE "[0-9.]+$")
+FW=""; for f in $F; do w="${f%.parquet}_gen.parquet"; python3 "$REPO/perf/e2e/trace_window.py" "$f" "$GEN_MS" "$w"; FW="$FW $w"; done
 F="$FW"
 python3 "$T/neuron_attribution.py" $F --names "${N#,}" --run-gap-s 5 --min-share 0.005 \
   --roles 'dit=model_fast|block|attention|cte|stack;vae=vae|decoder;t5=t5|umt5' \
