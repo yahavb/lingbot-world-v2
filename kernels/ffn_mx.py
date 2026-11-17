@@ -25,11 +25,16 @@ def _quant(w):
     return quantize_block_mxfp8_kernel(w, FP8, LNC == 2, True)
 
 
+# LINGBOT_MX_FAST_DMA=1: the activation's DMA gather-transpose uses the direct 4-D access pattern
+# (nkilib fast_dma_transpose / SwizzleMode.DGT_FAST) instead of vector offsets generated on GpSimd.
+# perf/mx_tile_sweep.py at the LNC2 TP4 x CP4 per-rank shapes (M=1088), us/call: qkv 137.1 -> 105.9.
+_FAST_DMA = os.environ.get("LINGBOT_MX_FAST_DMA", "0") == "1"
 @nki.jit
 def _mm_pq(lhs, w_data, w_scales):
     return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
                         output_dtype=nl.bfloat16, run_with_lnc2=(LNC == 2),
-                        use_scale_packing=True, lhs_is_swizzled=False)
+                        use_scale_packing=True, lhs_is_swizzled=False,
+                        **({"fast_dma_transpose": True} if _FAST_DMA else {}))
 
 
 def prequantize_weight(w):
@@ -54,7 +59,17 @@ _TUNED = {
     (5120, 3456): dict(tn=512, bm=4, bn=4, bk=10, lm=4, ln=2, sr=True, extra={"load_with_PE_swizzle": True}),
     (3584, 5120): dict(tn=512, bm=4, bn=4, bk=7, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
 }
-_TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1" and LNC == 1
+# LNC2 (TP4 x CP4 on 4 devices, M=1088 per rank), perf/mx_tile_sweep.py with fast_dma_transpose,
+# us/call vs bf16: qkv default tiles 105.9 vs 187.8 | ffn.0 194.7 vs 367.7 | ffn.2 192.5 vs 370.7 |
+# o 99.1 vs 170.4 (kiro_mx4, 2026-11-17). Selected by LINGBOT_MX_TUNED=1 at LNC2.
+_TUNED_LNC2 = {
+    (5120, 3456): dict(tn=1728, bm=8, bn=1, bk=4, lm=8, ln=1, sr=True, extra={}),
+    (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=8, ln=5, sr=False, extra={}),
+    (1536, 5120): dict(tn=512, bm=8, bn=5, bk=3, lm=8, ln=5, sr=False, extra={}),
+}
+if LNC == 2:
+    _TUNED = _TUNED_LNC2
+_TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1"
 # LINGBOT_MX_TUNED_KEYS="5120x1280,1536x5120": tune only these (K, N) (bisecting in-graph failures)
 _TUNED_KEYS = os.environ.get("LINGBOT_MX_TUNED_KEYS", "")
 if _TUNED_KEYS:
@@ -70,10 +85,12 @@ def _tuned_kernel(key):
               spill_reload=t["sr"],
               **({} if os.environ.get("LINGBOT_MX_TUNED_NOEXTRA", "0") == "1" else t["extra"]))
 
+    if _FAST_DMA:
+        kw["fast_dma_transpose"] = True
     @nki.jit
     def k(lhs, w_data, w_scales):
         return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
-                            output_dtype=nl.bfloat16, run_with_lnc2=False,
+                            output_dtype=nl.bfloat16, run_with_lnc2=(LNC == 2),
                             use_scale_packing=True, lhs_is_swizzled=False, **kw)
     return wrap_nki(k)
 
@@ -84,7 +101,9 @@ _mm_default = mm
 def mm(x, w_data, w_scales):  # noqa: F811 -- tuned dispatch over the default kernel
     if _TUNED_ON:
         key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
-        if key in _TUNED:
+        # tuned M blocks (bm x 128 rows) need at least that many rows: smaller calls (the load-time
+        # self-check runs M=256) take the default kernel
+        if key in _TUNED and int(x.shape[0]) >= _TUNED[key]["bm"] * 128:
             if key not in _TUNED_MM:
                 _TUNED_MM[key] = _tuned_kernel(key)
             return _TUNED_MM[key](x, w_data, w_scales)
