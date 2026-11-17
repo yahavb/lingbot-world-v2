@@ -1,4 +1,5 @@
 """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
+import logging
 import math
 import os
 import re
@@ -28,7 +29,14 @@ from wan.modules.attention import attention, flash_attention
 from wan.modules.attention import (
     const_max_ag_attention,
     const_max_ag_available,
+    cross_attention_dedup,
+    cross_dedup_bias,
     cte_cross_attention_nmajor,
+    cmax_final,
+    cmax_final_guarded,
+    cmax_partial,
+    cmax_prep_q,
+    cte_call,
     cte_merge,
     cte_merge_fmaj,
     cte_merge_rows,
@@ -36,6 +44,7 @@ from wan.modules.attention import (
     xla_attention_rows,
     cte_partial,
     cte_prep_q,
+    cte_self_layout,
     exact_attention,
     exact_attention_chunks,
     fa2_ag_attention,
@@ -155,6 +164,35 @@ _ATTN_REM = os.environ.get("LINGBOT_ATTN_REM", "0") == "1"
 _ATTN_SPLIT = os.environ.get("LINGBOT_ATTN_SPLIT", "0") == "1"
 _DUMP_BLOCKS = os.environ.get("LINGBOT_DUMP_BLOCKS", "")
 _Q_FIRST = os.environ.get("LINGBOT_Q_FIRST", "0") == "1"
+# LINGBOT_KV_FIRST=1: the opposite order: K and V (projection + norm) first, and Q takes its input
+# through a zero-valued term computed from K and V, so the K/V projections -- and the CP gathers they
+# feed -- go before the Q projection and the attention on the cached chunks. Profiled at lead 0, Q
+# went first and the K gather started ~240 us into the block; at lead 3 the cached-chunk call ran
+# (148-583 us) before the K/V projections, so the gathers started at 720 us. Q gains +0.0.
+_KV_FIRST = os.environ.get("LINGBOT_KV_FIRST", "0") == "1"
+assert not (_Q_FIRST and _KV_FIRST), "LINGBOT_Q_FIRST and LINGBOT_KV_FIRST are opposite orders"
+# LINGBOT_COMMIT_Q_FIRST (commit forwards only, kv_write=True, TP QK-norm): in the commit block the scheduler
+# projected K and V before Q (the cache write lengthens the K / V chain), so the Q norm's TP all-reduce queued behind
+# the 22 MB K / V CP all-gather on the collective cores and every engine sat idle ~300 us before the cached-chunk
+# attention, which needs only Q (CP8 lead-3 commit block 3.02 ms against 2.70 for the step block, where Q goes first).
+# 1: K and V take their input through a zero-valued term from the raw Q projection, so they cannot be projected
+# before it (block 3.11 ms: no gain). 2: the same term from the normed Q, so the Q norm's all-reduce also precedes
+# them: 2.73 ms, bitwise equal on all 32 ranks. Exact for finite Q. Constant-offset layers only: in the chained exact
+# layer 33 it is slower (3.31 vs 3.26 ms with 1) and changes rounding.
+_COMMIT_Q_FIRST = int(os.environ.get("LINGBOT_COMMIT_Q_FIRST", "0") or 0)
+# LINGBOT_COMMIT_FROM_GATHER=1 (commit forwards on the constant-offset path): the new chunk's attention call reads
+# the gathered K / V instead of the cache slot written from them (the same values), so the 22 MB slot copy has no
+# consumer inside the block.
+_COMMIT_FROM_GATHER = os.environ.get("LINGBOT_COMMIT_FROM_GATHER", "0") == "1"
+# LINGBOT_KV_REAL=1 (LINGBOT_TOKEN_PAD + TP QK-norm): the K and V projections, the K norm and RoPE run on this
+# rank's real tokens only (270 of the 288 padded rows). The padding rows used to be sliced off before the CP
+# gathers, and in the q25 block profile that slice was a copy (142 us on the Scalar DMA queue, behind the cached-
+# chunk attention's loads) which the V all-gather's trigger waited for. Same values for the real rows.
+# 2 (with LINGBOT_ATTN_EARLY=2 and LINGBOT_V_TOKEN_MAJOR): also the V projection and its CP all-gather first in
+# program order, then Q and K. 3: as 2, with Q taking its input through a zero-valued term from V and K through
+# one from Q (order V, Q, K enforced). 4: as 3 with K before Q (order V, K, Q).
+_KV_REAL = int(os.environ.get("LINGBOT_KV_REAL", "0") or 0)
+assert not (_KV_REAL and (_Q_FIRST or _KV_FIRST)), "LINGBOT_KV_REAL has its own Q/K/V orders"
 _STEP_NOWRITE = os.environ.get("LINGBOT_STEP_NOWRITE", "0") == "1"
 # LINGBOT_LEAD_AFTER_KV=1 (with LINGBOT_ATTN_EARLY): the attention calls on the cached chunks take Q
 # through a zero-valued term computed from the new chunk's local K and V shards (the inputs of the
@@ -162,12 +200,203 @@ _STEP_NOWRITE = os.environ.get("LINGBOT_STEP_NOWRITE", "0") == "1"
 # those calls, which then overlap the gathers. Profiled without it (STEP_NOWRITE + Q_FIRST), the
 # cached calls ran first (200-600 us), then the K/V projections, then both gathers with every engine
 # idle from 800 to 1100 us. Q gains +0.0, so the values are unchanged.
-_LEAD_AFTER_KV = os.environ.get("LINGBOT_LEAD_AFTER_KV", "0") == "1"
+# LINGBOT_LEAD_AFTER_KV=2 (LINGBOT_CTE_CHAIN path): the zero-valued term comes from the K gather's OUTPUT,
+# so the cached-chunk calls start once K is gathered and the V gather's trigger is issued before them.
+_LAK_LEVEL = int(os.environ.get("LINGBOT_LEAD_AFTER_KV", "0") or 0)
+_LEAD_AFTER_KV = _LAK_LEVEL >= 1
 # LINGBOT_K_BLOCKED=1 (with LINGBOT_ATTN_EARLY and LINGBOT_CTE_LOCAL): the K cache holds each chunk
 # as gathered, CP rank blocks [cp, n, d, l] viewed as [n, d, cp * l], and the vendored kernel loads
 # it with k_blocks=cp. Saves the [cp, n, d, l] -> [n, d, cp, l] permute (11 MB in 540-byte runs).
 # Key order is rank-major in both layouts, so V (still permuted) matches and the math is the same.
 _K_BLOCKED = os.environ.get("LINGBOT_K_BLOCKED", "0") == "1"
+# LINGBOT_CTE_CHAIN=1 (with LINGBOT_ATTN_EARLY and LINGBOT_CTE_LOCAL): the self-attention calls chain
+# in the vendored kernel (chain_o / chain_neg_max / chain_sum): each call continues the previous one's
+# online softmax and the last one normalizes, writing [n, d, Lq] (tp_out), the layout the output
+# projection contracts over. Replaces the per-call unnormalized results merged in the graph: at lead 3
+# that merge was ~150 us of the block's critical path (stream transposes of the [n, 128, groups]
+# statistics and the output permute), at leads 0-1 the normalization of the one call ~80 us.
+_CTE_CHAIN = os.environ.get("LINGBOT_CTE_CHAIN", "0") == "1"
+# LINGBOT_V_TOKEN_MAJOR=1 (with LINGBOT_CTE_CHAIN): V is gathered and cached token-major, [L, n, d] memory
+# under the cache's [n, L, d] shape, and the vendored kernel reads it with v_token_major: the local V
+# goes into the CP all-gather as the projection leaves it, and the gathered V reaches the kernel without
+# the [cp, n, l, d] -> [n, cp * l, d] permute (11 MB, ~80-100 us after the gather on the critical path).
+# Key order (rank-major) is the same as K's, so the attention is unchanged.
+_V_TM = os.environ.get("LINGBOT_V_TOKEN_MAJOR", "0") == "1"
+assert not _V_TM or _CTE_CHAIN, "LINGBOT_V_TOKEN_MAJOR needs LINGBOT_CTE_CHAIN (the only path that reads it)"
+# LINGBOT_ROWMAX_GRAPH=1 (diagnostic, LINGBOT_CTE_CHAIN path, compiled blocks): every self-attention
+# layer keeps, per local head, the largest and the smallest softmax row max (scaled scores, fp32 matmuls
+# inside the block graph) over its real query rows and all the keys it attends, across the forwards of a
+# generation. image2video prints them per rank after each generation ([ROWMAX] lines) and restarts them.
+# The range is what a constant softmax offset must cover. (LINGBOT_ROWMAX_STATS is the eager-only form.)
+_ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
+
+
+# LINGBOT_CMAX=1|2 (LINGBOT_CTE_CHAIN path): the self-attention of a layer in _CMAX_LAYERS runs softmax(Q K^T - c) V
+# with one fixed offset c (LINGBOT_CMAX_OFFSET, default 30) instead of the online row max: no row-max reduction and no
+# transpose of the probabilities. 1: kernels/attention_cmax_lb.py (plain K / V layouts only); 2:
+# kernels/attention_cmax2_lb.py (whole-chunk loads, the production rank-blocked K and token-major V). Exact softmax
+# up to rounding while every row max m satisfies -85 < m - c < 78 (no underflow of a row's probabilities, no
+# overflow of the exponentials or of their fp32 sums over the 17280-key window). The row maxes measured over a
+# whole generation on all 64 ranks (LINGBOT_ROWMAX_GRAPH, examples/03, 480x768, 81 frames) span
+# [-8.3, 71.5] in these 34 layers, so at c = 30 they stay at least 36 inside both limits. Layers 2,
+# 13, 33, 34, 38 and 39 reach 127 to 864 in one or two heads and keep the exact chained attention_cte calls.
+# One offset for all of them keeps it a compile-time constant; the layer's choice is a boolean attribute (use_cmax),
+# so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
+_CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
+_CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_CMAX_GUARD=1 (LINGBOT_CMAX=2): that range was measured on one clip, not guaranteed, and outside it the output
+# breaks (inf / NaN, or 0 / 0). The final constant-offset call then checks its own result: every real query row's sum
+# of exp(score - c) must lie in [e^-60, e^78] (NaN fails), which makes the output the exact softmax up to rounding for
+# any input; a 128-row block with a row outside the band is recomputed in the same kernel, behind a runtime branch,
+# with each row's own maximum (kernels/attention_cmax2_lb.py *_g*). Each layer counts its checked, out-of-band and
+# redone blocks in a device tensor (no host sync); cmax_guard_report() sums them over all ranks after a generation and
+# moves a layer whose redone blocks exceed LINGBOT_CMAX_GUARD_DEMOTE (default 0.05) of its checked ones to exact
+# attention. _CMAX_LAYERS then only decides speed, not correctness.
+_CMAX_GUARD = os.environ.get("LINGBOT_CMAX_GUARD", "0") == "1"
+assert not _CMAX_GUARD or os.environ.get("LINGBOT_CMAX", "0") == "2", "LINGBOT_CMAX_GUARD needs LINGBOT_CMAX=2"
+_CMAX_GUARD_DEMOTE = float(os.environ.get("LINGBOT_CMAX_GUARD_DEMOTE", "0.05"))
+# LINGBOT_CMAX_EXCLUDE=i,j,...: layers kept on exact attention although in _CMAX_LAYERS (e.g. ones a guard report moved)
+_CMAX_EXCLUDE = frozenset(int(t) for t in os.environ.get("LINGBOT_CMAX_EXCLUDE", "").split(",") if t.strip())
+# LINGBOT_DIAG_QK_SCALE=layer:s[,layer:s ...] (diagnostic, changes the output): those layers' queries multiplied by s
+# after RoPE, in every attention path, to drive their scores out of the constant offset's band (guard tests). A
+# per-layer tensor (1.0 elsewhere), so the 40 blocks keep sharing their compiled graphs.
+_DIAG_QK_SCALE = {int(a): float(b) for a, b in (t.split(":") for t in
+                  os.environ.get("LINGBOT_DIAG_QK_SCALE", "").split(",") if t.strip())}
+# LINGBOT_FILM_GROUP=G (with LINGBOT_FILM_ALL): the FiLM graph on G chunks per call, later groups when first needed.
+_FILM_GROUP = int(os.environ.get("LINGBOT_FILM_GROUP", "0") or 0)
+# LINGBOT_FILM_ROWS=N: the per-chunk FiLM graph (cam_film_sp) on N camera token rows per CP rank (zero-padded). At CP8
+# its 544 rows fall in a window (513 .. 576 measured) where one block's FiLM takes 2.3 ms and the graph holds 5.2 GB of
+# spill DMA rings; on 640 rows it takes 0.78 ms (256: 0.46, 512: 1.21, 1024: 0.99).
+_FILM_ROWS = int(os.environ.get("LINGBOT_FILM_ROWS", "0") or 0)
+# LINGBOT_CROSS_DEDUP=Kc (LINGBOT_CROSS_NMAJOR): the cross-attention over the first Kc rows of its 512-row cache in
+# the block graph (fp32 matmuls + softmax) instead of the kernel over all 512. The context is the prompt's T5 rows
+# zero-padded to 512, so every padding row has the same K and V, and m identical keys are one softmax term weighted
+# by m. The first call (it fills the cache) stores per slice row log(m / r) for the r padding rows inside the slice
+# (cross_dedup_bias), 0 for the others. Exact up to rounding when the prompt has fewer than Kc rows, which the
+# forward checks (_CROSS_DEDUP_ON); a longer prompt takes the kernel path.
+_CROSS_DEDUP = int(os.environ.get("LINGBOT_CROSS_DEDUP", "0") or 0)
+_CROSS_DEDUP_ON = [False]
+# LINGBOT_FILM_AR_BF16=1: the camera FiLM's row-parallel all-reduce (cam_injector_layer2, [rows, 5120] per block) on
+# bf16 partial sums instead of fp32 (its result is rounded to bf16 right after either way); half the bytes.
+_FILM_AR_BF16 = os.environ.get("LINGBOT_FILM_AR_BF16", "0") == "1"
+# LINGBOT_V_GATHER_FIRST=1: in the step forward, the new chunk's V CP all-gather issued before its K gather.
+_V_GATHER_FIRST = os.environ.get("LINGBOT_V_GATHER_FIRST", "0") == "1"
+# LINGBOT_DIAG_NOGATHER=1 (diagnostic, wrong output): the step forward attends the new chunk's cache slot instead of
+# its CP-gathered K / V (the gathers become dead code), in the constant-offset and the chained attention_cte paths.
+_DIAG_NOGATHER = os.environ.get("LINGBOT_DIAG_NOGATHER", "0") == "1"
+# Diagnostic: preallocated device buffers ("q_t", "acc", "o_n") the constant-offset path copies its kernel queries,
+# cached-chunk accumulator and output into (kiro/block_bench.py DUMP_CMAX=<dir>). Empty: nothing copied.
+_DIAG_BUFS = {}
+_CMAX_LAYERS = frozenset((
+    0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 35, 36, 37))
+
+
+def layer_uses_cmax(layer_index):
+    """Does this layer's self-attention take the constant-offset path (LINGBOT_CMAX)?"""
+    return _CMAX and int(layer_index) in _CMAX_LAYERS and int(layer_index) not in _CMAX_EXCLUDE
+
+
+def cmax_guard_alloc(blocks, device):
+    """LINGBOT_CMAX_GUARD: every layer's [checked, out-of-band, redone] block counters (zero), and
+    LINGBOT_DIAG_QK_SCALE's per-layer query scales. Before the first compiled block call, so the graphs take them;
+    idempotent."""
+    for i, blk in enumerate(blocks):
+        sa = getattr(blk, "self_attn", None)
+        if sa is None:
+            continue
+        layer = getattr(sa, "layer_index", None)
+        layer = i if layer is None else int(layer)
+        if _CMAX_GUARD and getattr(sa, "_cmax_guard_st", None) is None:
+            sa._cmax_guard_st = torch.zeros(3, dtype=torch.float32, device=device)
+        if _DIAG_QK_SCALE and getattr(sa, "_diag_qscale", None) is None:
+            sa._diag_qscale = torch.full((1,), _DIAG_QK_SCALE.get(layer, 1.0), dtype=torch.float32, device=device)
+
+
+def cmax_guard_reset(blocks):
+    for blk in blocks:
+        st = getattr(getattr(blk, "self_attn", None), "_cmax_guard_st", None)
+        if st is not None:
+            st.zero_()
+
+
+def cmax_guard_report(blocks, tag=""):
+    """LINGBOT_CMAX_GUARD, after a generation (outside its timed window; a collective, so on every rank): the per-layer
+    block counters summed over all ranks, logged by rank 0, then zeroed. A constant-offset layer whose redone blocks
+    exceed LINGBOT_CMAX_GUARD_DEMOTE of its checked ones moves to exact attention on every rank (the counts are the
+    same everywhere, so is the decision). Returns {layer: (checked, out of band, redone)} of the layers checked."""
+    sas = [getattr(b, "self_attn", None) for b in blocks]
+    sts = [(j, sa) for j, sa in enumerate(sas) if getattr(sa, "_cmax_guard_st", None) is not None]
+    if not sts:
+        return {}
+    a = torch.stack([sa._cmax_guard_st for _, sa in sts])
+    if dist.is_initialized():
+        dist.all_reduce(a)
+    a = a.cpu()
+    for _, sa in sts:
+        sa._cmax_guard_st.zero_()
+    layer_of = {j: (j if getattr(sa, "layer_index", None) is None else int(sa.layer_index)) for j, sa in sts}
+    res = {layer_of[j]: tuple(int(v) for v in a[r].tolist()) for r, (j, _) in enumerate(sts) if a[r, 0] > 0}
+    demoted = []
+    for j, sa in sts:
+        n, _, r = res.get(layer_of[j], (0, 0, 0))
+        if n > 0 and r > _CMAX_GUARD_DEMOTE * n and getattr(sa, "use_cmax", False):
+            sa.use_cmax = False
+            demoted.append(layer_of[j])
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        n_all = sum(v[0] for v in res.values())
+        hit = {i: v for i, v in res.items() if v[1] or v[2]}
+        logging.info(f"[CMAX_GUARD]{(' ' + tag) if tag else ''} {len(res)} layers, {n_all} blocks checked, "
+                     f"{sum(v[1] for v in res.values())} out of band, {sum(v[2] for v in res.values())} redone"
+                     + ("".join(f" | layer {i}: {o} out of band, {r} redone of {n}" for i, (n, o, r) in hit.items()))
+                     + (f" | moved to exact attention: {demoted} (LINGBOT_CMAX_EXCLUDE="
+                        f"{','.join(str(i) for i in sorted(_CMAX_EXCLUDE | set(demoted)))})" if demoted else ""))
+    return res
+
+
+def rowmax_graph_reset(blocks):
+    """(Re)start every layer's [2, n] row-max statistics in place (same tensors, no recompile)."""
+    for blk in blocks:
+        for att in ("self_attn", "cross_attn"):
+            st = getattr(getattr(blk, att, None), "_rm_graph", None)
+            if st is not None:
+                st[0].fill_(-float("inf"))
+                st[1].fill_(float("inf"))
+
+
+def rowmax_graph_alloc(blocks, n_local, device):
+    for blk in blocks:
+        for att in ("self_attn", "cross_attn"):
+            sa = getattr(blk, att, None)
+            if sa is not None and getattr(sa, "_rm_graph", None) is None:
+                sa._rm_graph = torch.stack([torch.full((n_local,), -float("inf")),
+                                            torch.full((n_local,), float("inf"))]).to(device)
+
+
+def rowmax_graph_report(blocks, rank):
+    for att, tag in (("self_attn", "ROWMAX"), ("cross_attn", "ROWMAX_X")):
+        vals = [getattr(getattr(b, att, None), "_rm_graph", None) for b in blocks]
+        if not vals or any(v is None for v in vals):
+            continue
+        a = torch.stack(vals).float().cpu()                     # [layers, 2, n]
+        print(f"[{tag}] rank {rank}: " + " ".join(
+            f"{i}:" + ",".join(f"{float(a[i, 0, h]):.2f}/{float(a[i, 1, h]):.2f}" for h in range(a.shape[2]))
+            for i in range(a.shape[0])), flush=True)
+
+
+def _rowmax_graph_update(st, q, k_chunks, kb):
+    """st [2, n] <- elementwise (max, min) with this forward's per-head (max, min) over the real query
+    rows of the row max of q @ K over every chunk's keys. q [n, lq, d] pre-scaled; K chunks [n, d, L],
+    in rank-blocked memory [kb, n, d, L / kb] when kb > 1 (key order does not change a row max)."""
+    n, lq, d = (int(s) for s in q.shape)
+    qf = q.float()
+    m = None
+    for kc in k_chunks:
+        L = int(kc.shape[-1])
+        kk = kc.reshape(kb, n, d, L // kb) if kb > 1 else kc.reshape(1, n, d, L)
+        s = torch.einsum("nqd,rndl->nqrl", qf, kk.float())
+        mx = s.amax(dim=(2, 3))
+        m = mx if m is None else torch.maximum(m, mx)
+    st.copy_(torch.stack([torch.maximum(st[0], m.amax(1)), torch.minimum(st[1], m.amin(1))]))
 # LINGBOT_STEP_NOWRITE=1 (with LINGBOT_ATTN_EARLY): a denoise-step forward (image2video passes
 # kv_commit=False) does not write the new chunk's K/V into its cache slot. The next step overwrites
 # the slot and the chunk's commit forward (t=0) writes the K/V later chunks read, so these writes
@@ -175,6 +404,11 @@ _K_BLOCKED = os.environ.get("LINGBOT_K_BLOCKED", "0") == "1"
 # LINGBOT_FILM_BATCH=1 (with LINGBOT_FILM_A2A): all 40 blocks' camera FiLM params in ONE compiled
 # graph per chunk instead of 40 (22 ms per chunk measured, mostly per-graph launch cost).
 _FILM_BATCH = os.environ.get("LINGBOT_FILM_BATCH", "0") == "1"
+# LINGBOT_FILM_SHARD=1 (LINGBOT_FILM_ALL, flat CP): precompute_films runs the camera patch embedding and its MLP on this
+# CP rank's tokens only (they are per-token, and only those rows were kept). In the q26 device timeline the full-
+# token version was two ~12.5 ms eager matmuls per generation on all 30240 tokens of every rank.
+_FILM_SHARD = os.environ.get("LINGBOT_FILM_SHARD", "0") == "1"
+assert not _FILM_SHARD or os.environ.get("LINGBOT_CP_FLAT_SEQ", "0") == "1", "LINGBOT_FILM_SHARD needs flat CP"
 # LINGBOT_HEAD_COMPILE=1 (SP + flat CP over a mesh): the head, its TP token gather, the real-token
 # slice and the CP gather as ONE compiled graph that returns the [tokens, 64] patch rows (2-D, rank
 # order = token order, so no permute after the gather); unpatchify stays eager. The eager tail was
@@ -185,6 +419,19 @@ _HEAD_COMPILE = os.environ.get("LINGBOT_HEAD_COMPILE", "0") == "1"
 # all-gather of the stacked local shards instead of two. Profiled, the two 11 MB Ring all-gathers ran
 # back to back with a ~110 us gap between them. Data movement only.
 _KV_GATHER1 = os.environ.get("LINGBOT_KV_GATHER1", "0") == "1"
+# LINGBOT_KV_COALESCE=1 (K_BLOCKED + V_TOKEN_MAJOR + ATTN_EARLY): the new chunk's K and V CP all-gathers as ONE
+# coalesced collective (all_gather_into_tensor_coalesced), same two contiguous outputs. In the q25 block profile the
+# compiler triggered the V gather ~150 us after the K gather had finished (behind the cached-chunk attention's
+# GpSimd work, whatever the program order), and every engine sat idle until V landed (720-893 us at lead 3).
+_KV_COALESCE = os.environ.get("LINGBOT_KV_COALESCE", "0") == "1"
+if _KV_COALESCE:
+    # torch-neuronx's CollectiveLegalization pass rewrites a collective's group name into explicit replica groups
+    # only for the ops in its table, which lacks the coalesced all-gather: its group then fell back to the whole world
+    # (64 ranks; the HLO verifier rejected shard_count 16 vs subgroup size 64). Same group argument index as
+    # all_gather_into_tensor (inputs, group_size, group_name).
+    from torch_neuronx.neuron_dynamo_backend.fx.passes import collective_legalization as _coll_legal
+    _coll_legal._COLLECTIVE_OPS_GROUP_INDEX.setdefault(
+        "_c10d_functional.all_gather_into_tensor_coalesced.default", 2)
 assert not (_K_BLOCKED and (_KV_GATHER1 or _ATTN_SPLIT or _ATTN_REM)), \
     "LINGBOT_K_BLOCKED: the KV_GATHER1 / ATTN_SPLIT / ATTN_REM paths read K in the plain layout"
 
@@ -400,6 +647,7 @@ def assign_layer_attention(blocks):
             continue
         sa.layer_index = i
         sa.use_const_max = layer_uses_const_max(i)
+        sa.use_cmax = layer_uses_cmax(i)
     return blocks
 
 def causal_rope_grids(freqs, grid_sizes, device, start_frame=0, dtype=torch.float32,
@@ -625,6 +873,35 @@ def _shard_w(x, f, h, w, cp, r):
     return x.reshape(x.shape[0], f * h * w_loc, *tail).contiguous()
 
 
+# LINGBOT_EMBED_LOCAL=1 (flat CP, LINGBOT_CP_FLAT_SEQ): each rank embeds only its own run of the sequence. The
+# patch embedding is a Conv3d with kernel == stride (no overlap), so token t is W @ patch(t) + b alone: patchify the
+# latent ([C, F, H, W] -> [F*Hp*Wp, C*kt*kh*kw], frame-major like flatten(2)), keep this rank's rows and multiply,
+# all in one compiled graph. Replaces the conv over every token on every rank, the flatten/transpose of the full
+# [1, 5120, F, Hp, Wp] output and the shard copy. Same products, another summation order (rounding-level).
+_EMBED_LOCAL = os.environ.get("LINGBOT_EMBED_LOCAL", "0") == "1"
+_EMBED_FNS = {}
+
+
+def _patch_embed_rows(u, weight, bias, patch, row0, rows):
+    c, f, h, w = u.shape
+    kt, kh, kw = patch
+    p = u.view(c, f // kt, kt, h // kh, kh, w // kw, kw).permute(1, 3, 5, 0, 2, 4, 6)
+    p = p.reshape(-1, c * kt * kh * kw)[row0:row0 + rows]
+    out = torch.matmul(p, weight.reshape(weight.shape[0], -1).t())
+    if bias is not None:
+        out = out + bias
+    return out.unsqueeze(0)                                            # [1, rows, C_out]
+
+
+def patch_embed_local(conv, u, row0, rows):
+    """[C, F, H, W] -> [1, rows, C_out]: conv(u) flattened frame-major, rows [row0, row0 + rows), one graph."""
+    key = (tuple(u.shape), int(row0), int(rows))
+    fn = _EMBED_FNS.get(key)
+    if fn is None:
+        fn = _EMBED_FNS[key] = torch.compile(_patch_embed_rows, backend="neuron", fullgraph=True, dynamic=False)
+    return fn(u.to(conv.weight.dtype), conv.weight, conv.bias, tuple(conv.kernel_size), int(row0), int(rows))
+
+
 def _gather_w(x, f, h, w_loc, group, cp):
     """Inverse of _shard_w: all_gather the width axis, restore frame-major.
 
@@ -666,8 +943,9 @@ def set_bf16_rope_for_forward(seq_len):
         mark_bf16_rope()
 
 
-def _tp_row_parallel(linear, x, scatter=False):
-    """Row-parallel Linear + all-reduce.
+def _tp_row_parallel(linear, x, scatter=False, bf16_sum=False):
+    """Row-parallel Linear + all-reduce. bf16_sum (mesh all-reduce path): the partial sums rounded to bf16 and
+    all-reduced in bf16 (LINGBOT_FILM_AR_BF16).
 
     The matmul dtype is an A/B knob. Default (fp32, historical behaviour) wraps
     the Linear at the weight dtype rather than in an fp32 autocast (an A/B that ran it in the
@@ -716,7 +994,8 @@ def _tp_row_parallel(linear, x, scatter=False):
         # Traceable, OUT-OF-PLACE reduce over the DeviceMesh submesh, so this
         # Linear can sit inside a fullgraph=True compiled block. dist.all_reduce
         # below is in-place and untraceable, which is what forced the DiT eager.
-        y = tp.all_reduce_fn(y, "tp")
+        y = (tp.all_reduce_fn(y.to(torch.bfloat16), "tp", native=True) if bf16_sum
+             else tp.all_reduce_fn(y, "tp"))
     else:
         y = tp.all_reduce(y, _TP_GROUP)
     return y.to(orig_dtype)
@@ -1120,6 +1399,51 @@ class CausalWanSelfAttention(nn.Module):
                 q = _tp_rms_norm(qkv[..., :nq], self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
                 k = _tp_rms_norm(qkv[..., nq:nq + nk], self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
                 return q, k, qkv[..., nq + nk:].reshape(b, s, n, d)
+            if _KV_FIRST and getattr(self, 'tp_enabled', False) and self.qk_norm:
+                k = _tp_rms_norm(self.k(x), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                v = self.v(x).view(b, s, n, d)
+                xq = x + (k[:, :1, :1, :1].float() * 0.0 + v[:, :1, :1, :1].float() * 0.0).to(x.dtype)
+                q = _tp_rms_norm(self.q(xq), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                return q, k, v
+            if (_COMMIT_Q_FIRST and kv_write and getattr(self, 'use_cmax', False)
+                    and getattr(self, 'tp_enabled', False) and self.qk_norm):
+                # LINGBOT_COMMIT_Q_FIRST: Q (and with 2 its norm) before K and V in the commit forward of a
+                # constant-offset layer (the chained exact layers, 2 / 13 / 33 / 34 / 38 / 39, are slower with it)
+                qr = self.q(x)
+                q = _tp_rms_norm(qr, self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+                _zq = (q[:, :1, :1, :1].reshape(-1) if _COMMIT_Q_FIRST >= 2 else qr[:, :1, :1].reshape(-1))
+                xk = x + (_zq.float() * 0.0).to(x.dtype)
+                k = _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, s, n, d)
+                v = self.v(xk).view(b, s, n, d)
+                return q, k, v
+            _r = _REAL_TOKENS[0]
+            if (_KV_REAL and getattr(self, 'tp_enabled', False) and self.qk_norm and _r is not None
+                    and _r < s):
+                # LINGBOT_KV_REAL: K and V of the real rows only
+                xr = x[:, :_r]
+
+                def _q(xq):
+                    return _tp_rms_norm(self.q(xq), self.norm_q.weight, self.eps, self.dim).view(b, s, n, d)
+
+                def _k(xk):
+                    return _tp_rms_norm(self.k(xk), self.norm_k.weight, self.eps, self.dim).view(b, _r, n, d)
+
+                if _KV_REAL >= 2 and _v_early:
+                    v = self.v(xr).view(b, _r, n, d)
+                    _vg_early[0] = tp.all_gather_fn(v[0].contiguous(), 0, "cp")   # [cp * r, n, d]
+                    if _KV_REAL == 2:
+                        return _q(x), _k(xr), v
+                    if _KV_REAL == 3:
+                        q = _q(x + (v[:, :1, :1, :1].float() * 0.0).to(x.dtype))
+                        k = _k(xr + (q[:, :1, :1, :1].float() * 0.0).to(x.dtype))
+                        return q, k, v
+                    k = _k(xr + (v[:, :1, :1, :1].float() * 0.0).to(x.dtype))
+                    q = _q(x + (k[:, :1, :1, :1].float() * 0.0).to(x.dtype))
+                    return q, k, v
+                q = _q(x)
+                k = _k(xr)
+                v = self.v(xr).view(b, _r, n, d)
+                return q, k, v
             if getattr(self, 'tp_enabled', False) and self.qk_norm and _QK_AR1:
                 # LINGBOT_QK_AR1=1: the Q and K RMSNorm sums of squares in ONE TP all-reduce
                 # (same per-row sums as two _tp_rms_norm calls, one collective fewer per block).
@@ -1135,6 +1459,13 @@ class CausalWanSelfAttention(nn.Module):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
 
+        # LINGBOT_KV_REAL >= 2: the new chunk's V all-gather issued inside qkv_fn, right after the V projection
+        # (only where the LINGBOT_ATTN_EARLY=2 token-major-V path below will consume it)
+        _v_early = (_KV_REAL >= 2 and _V_TM and _ATTN_EARLY == 2 and fused is None and kv_chunks is not None
+                    and sp_enabled and _SEQ_MODE == "cp" and _CP_FLAT_SEQ and tp.has_mesh()
+                    and kv_chunks[0][-1].dim() == 3 and not _KV_GATHER1
+                    and not self._const_max_here() and not self._fa2_here())
+        _vg_early = [None]
         q, k, v = qkv_fn(x)
 
         if frame_seqlen is None:
@@ -1188,6 +1519,9 @@ class CausalWanSelfAttention(nn.Module):
             roped_key = causal_rope_apply(k, rope_grid, freqs, start_frame=_csf,
                                           w_shard=cp_w_shard).type_as(v)
 
+        if _DIAG_QK_SCALE and getattr(self, "_diag_qscale", None) is not None:
+            # LINGBOT_DIAG_QK_SCALE (diagnostic): this layer's scores scaled, in every attention path
+            roped_query = (roped_query.float() * self._diag_qscale).to(roped_query.dtype)
         if _REAL_TOKENS[0] is not None and roped_key.shape[1] > _REAL_TOKENS[0]:
             roped_key = roped_key[:, :_REAL_TOKENS[0]]
             v = v[:, :_REAL_TOKENS[0]]
@@ -1328,14 +1662,16 @@ class CausalWanSelfAttention(nn.Module):
                     _lq_main = (_lq_all // 128) * 128
                 else:
                     _lq_main = _lq_all
-                q_c, lq = cte_prep_q(roped_query[:, :_lq_main])
+                _qm, _qpad = cte_self_layout()                  # LINGBOT_CTE_QMAJOR / _QPAD
+                _qm = _qm and not (_split or _lq_main < _lq_all)
+                q_c, lq = cte_prep_q(roped_query[:, :_lq_main], pad_to=_qpad)
                 # The local K / V shards in the cache layout, as the gathers take them (computed once
                 # here when LINGBOT_LEAD_AFTER_KV needs them, else inline below: the same ops).
                 _kin = _vin = None
                 if _LEAD_AFTER_KV and not _KV_GATHER1:
                     _kin = (roped_key[0].permute(1, 2, 0) if _k_ndl
                             else roped_key[0].permute(1, 0, 2)).contiguous()
-                    _vin = v[0].permute(1, 0, 2).contiguous()
+                    _vin = v[0].contiguous() if _V_TM else v[0].permute(1, 0, 2).contiguous()
 
                 def _gather_new():
                     if _KV_GATHER1:
@@ -1352,7 +1688,18 @@ class CausalWanSelfAttention(nn.Module):
                     kin = _kin if _kin is not None else (
                         roped_key[0].permute(1, 2, 0) if _k_ndl
                         else roped_key[0].permute(1, 0, 2)).contiguous()
-                    vin = _vin if _vin is not None else v[0].permute(1, 0, 2).contiguous()
+                    vin = _vin if _vin is not None else (
+                        v[0].contiguous() if _V_TM else v[0].permute(1, 0, 2).contiguous())
+                    if _KV_COALESCE and _k_ndl and _K_BLOCKED and _V_TM:
+                        # LINGBOT_KV_COALESCE: K and V in ONE coalesced all-gather (one trigger, one collective);
+                        # each output is the same contiguous tensor the two separate gathers return
+                        kg, vg = fc.all_gather_into_tensor_coalesced([kin, vin], tp.mesh_submesh("cp"))
+                        return kg.view(_n, _d, _cp * _l), vg     # K memory [cp, n, d, l]; V [cp * l, n, d]
+                    if _V_GATHER_FIRST and _k_ndl and _K_BLOCKED and _V_TM and _vg_early[0] is None:
+                        # LINGBOT_V_GATHER_FIRST=1: the V gather issued before the K gather (V needs no norm or RoPE)
+                        vg = tp.all_gather_fn(vin, 0, "cp")
+                        kg = tp.all_gather_fn(kin, 0, "cp").view(_n, _d, _cp * _l)
+                        return kg, vg
                     if _k_ndl and _K_BLOCKED:
                         kg = tp.all_gather_fn(kin, 0, "cp")
                         kg = kg.view(_n, _d, _cp * _l)          # memory: [cp, n, d, l]
@@ -1362,10 +1709,101 @@ class CausalWanSelfAttention(nn.Module):
                     else:
                         kg = tp.all_gather_fn(kin, 0, "cp")
                         kg = kg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
+                    if _vg_early[0] is not None:
+                        assert _V_TM
+                        return kg, _vg_early[0]                 # LINGBOT_KV_REAL >= 2: gathered in qkv_fn
                     vg = tp.all_gather_fn(vin, 0, "cp")
+                    if _V_TM:
+                        return kg, vg                           # [cp * l, n, d]: token-major memory
                     return kg, vg.view(_cp, _n, _l, _d).permute(1, 0, 2, 3)
                 if _ATTN_EARLY == 2:
                     kg, vg = _gather_new()
+                _c_off = _CMAX_OFFSET if (_CTE_CHAIN and getattr(self, 'use_cmax', False)) else None
+                if _c_off is not None:
+                    # LINGBOT_CMAX: the cached chunks in one constant-offset call (it needs only Q), then the
+                    # new chunk's call continues its accumulator and normalizes.
+                    assert not (_split or _lq_main < _lq_all or _qm or _KV_CLONE), \
+                        "LINGBOT_CMAX: no ATTN_SPLIT / ATTN_REM / CTE_QMAJOR / KV_CLONE"
+                    assert _k_ndl, "LINGBOT_CMAX reads K as [n, d, L]"
+                    _kb = _cp if _K_BLOCKED else 1
+                    q_t, lq = cmax_prep_q(roped_query, pad_to=_qpad)
+                    lead_k, lead_v = list(k_chunks[:-1]), list(v_chunks[:-1])
+                    acc = (cmax_partial(q_t, lead_k, lead_v, _c_off, _kb, _V_TM) if lead_k else None)
+                    if _ATTN_EARLY != 2:
+                        kg, vg = _gather_new()
+                    if kv_write:
+                        kd.copy_(kg.reshape(kd.shape))
+                        vd.copy_(vg.reshape(vd.shape))
+                        if _COMMIT_FROM_GATHER:   # the same values; the slot copy leaves the call's path
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                    else:
+                        if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                    if _CMAX_GUARD:
+                        # LINGBOT_CMAX_GUARD: the kernel checks every real row's sum and redoes out-of-band blocks
+                        _rq = lq if _REAL_TOKENS[0] is None else min(int(_REAL_TOKENS[0]), lq)
+                        o_n, _gfl = cmax_final_guarded(q_t, kd, vd, acc, lead_k, lead_v, _c_off, _kb, _V_TM,
+                                                       real_q=_rq)
+                        _gst = getattr(self, "_cmax_guard_st", None)
+                        if _gst is not None:
+                            # [checked, out of band (flag 2), redone (flag >= 1)] blocks of this rank
+                            _gst.add_(torch.stack([_gfl.new_tensor(float(_gfl.numel())),
+                                                   torch.clamp(_gfl - 1.0, min=0.0).sum(),
+                                                   torch.clamp(_gfl, max=1.0).sum()]))
+                    else:
+                        o_n = cmax_final(q_t, kd, vd, acc, _c_off, _kb, _V_TM)  # [n, Lq_p, d]
+                    if _DIAG_BUFS:
+                        # diagnostic (kiro/block_bench.py DUMP_CMAX): the kernel's queries, accumulator and output
+                        _DIAG_BUFS["q_t"].copy_(q_t)
+                        if acc is not None and "acc" in _DIAG_BUFS:
+                            _DIAG_BUFS["acc"].copy_(acc)
+                        _DIAG_BUFS["o_n"].copy_(o_n)
+                    x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)              # [1, Lq, n, d]
+                    out = self._out_proj(x, _async_out, scatter=_sp_scatter)
+                    if return_cache and not getattr(self, 'tp_enabled', False):
+                        return out, kd, vd
+                    return out
+                if _CTE_CHAIN:
+                    # LINGBOT_CTE_CHAIN: the cached chunks' calls first (they need only Q), each
+                    # continuing the previous one's softmax, then the new chunk's call normalizes.
+                    assert not (_split or _lq_main < _lq_all or _qm or _KV_CLONE), \
+                        "LINGBOT_CTE_CHAIN: no ATTN_SPLIT / ATTN_REM / CTE_QMAJOR / KV_CLONE"
+                    lead = list(zip(k_chunks[:-1], v_chunks[:-1]))
+                    last = lead.pop() if (_ATTN_PAIR and lead) else None
+                    _kb = _cp if (_K_BLOCKED and _k_ndl) else 1
+                    q_lead = q_c
+                    if _kin is not None and lead:
+                        if _LAK_LEVEL >= 2 and _ATTN_EARLY == 2:
+                            _z = kg.reshape(-1)[:1].float() * 0.0
+                        else:
+                            _z = _kin.reshape(-1)[:1].float() * 0.0 + _vin.reshape(-1)[:1].float() * 0.0
+                        q_lead = q_c + _z.to(q_c.dtype)
+                    state = None
+                    while _ATTN_PAIR and len(lead) >= 2:
+                        (ka, va), (kb, vb) = lead.pop(0), lead.pop(0)
+                        state = cte_call(q_lead, kb, vb, ka, va, k_blocks=_kb, chain=state,
+                                         v_token_major=_V_TM)
+                    for kc_, vc_ in lead:
+                        state = cte_call(q_lead, kc_, vc_, k_blocks=_kb, chain=state, v_token_major=_V_TM)
+                    if _ATTN_EARLY != 2:
+                        kg, vg = _gather_new()
+                    if kv_write:
+                        kd.copy_(kg.reshape(kd.shape))
+                        vd.copy_(vg.reshape(vd.shape))
+                    else:
+                        if not _DIAG_NOGATHER:  # diagnostic: attend the cache slot, not the gathered chunk
+                            kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
+                    if _ROWMAX_GRAPH and _k_ndl and getattr(self, "_rm_graph", None) is not None:
+                        _rq = _REAL_TOKENS[0] if _REAL_TOKENS[0] is not None else lq
+                        _rowmax_graph_update(self._rm_graph, q_c[:, :min(_rq, lq)],
+                                             list(k_chunks[:-1]) + [kd], _kb)
+                    o_n = cte_call(q_c, kd, vd, *(last if last is not None else ()), k_blocks=_kb,
+                                   chain=state, normalize=True, v_token_major=_V_TM)
+                    x = o_n[:, :, :lq].permute(2, 0, 1).unsqueeze(0)       # [n, d, Lq_p] -> [1, Lq, n, d]
+                    out = self._out_proj(x, _async_out, scatter=_sp_scatter)
+                    if return_cache and not getattr(self, 'tp_enabled', False):
+                        return out, kd, vd
+                    return out
                 if _split:
                     # remainder rows [_lq_main, _l) of every CP rank, in rank order
                     _rr = _l - _lq_main
@@ -1385,8 +1823,8 @@ class CausalWanSelfAttention(nn.Module):
                     q_lead = q_c + _z.to(q_c.dtype)
                 while _ATTN_PAIR and len(lead) >= 2:
                     (ka, va), (kb, vb) = lead.pop(0), lead.pop(0)
-                    parts.append(cte_partial(q_lead, kb, vb, ka, va, k_blocks=_kb, tp_out=_fm))
-                parts += [cte_partial(q_lead, kc, vc, k_blocks=_kb, tp_out=_fm) for kc, vc in lead]
+                    parts.append(cte_partial(q_lead, kb, vb, ka, va, k_blocks=_kb, tp_out=_fm, q_major=_qm))
+                parts += [cte_partial(q_lead, kc, vc, k_blocks=_kb, tp_out=_fm, q_major=_qm) for kc, vc in lead]
                 if _split:
                     # This rank's own shard of the new chunk (the pre-gather K/V, cache layout)
                     # into its own-shard slot; the remainder attends it straight from the graph.
@@ -1407,11 +1845,11 @@ class CausalWanSelfAttention(nn.Module):
                     # LINGBOT_STEP_NOWRITE: dead write skipped, attend the gathered chunk itself
                     kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                 parts.append(cte_partial(q_c, kd, vd, *(last if last is not None else ()),
-                                         k_blocks=_kb, tp_out=_fm))
+                                         k_blocks=_kb, tp_out=_fm, q_major=_qm))
                 if _fm:
                     # LINGBOT_ATTN_FMAJ: d-major attention output straight into the o-projection
                     return self._out_proj_fmaj(cte_merge_fmaj(parts, lq))
-                x = cte_merge(parts, lq)
+                x = cte_merge(parts, lq, q_major=_qm)
                 if _split:
                     x = torch.cat([x, x_rem] + ([x.new_zeros(1, _lq_all - _l, _n, _d)]
                                                 if _lq_all > _l else []), dim=1)
@@ -1754,11 +2192,23 @@ class WanCrossAttention(WanSelfAttention):
                 if _nmaj:
                     crossattn_cache["k"].copy_(k[0].permute(1, 2, 0))
                     crossattn_cache["v"].copy_(v[0].permute(1, 0, 2))
+                    if _CROSS_DEDUP_ON[0]:
+                        crossattn_cache["mult"].copy_(cross_dedup_bias(k[0], v[0], _CROSS_DEDUP))
                 else:
                     crossattn_cache["k"].copy_(k)
                     crossattn_cache["v"].copy_(v)
             if _nmaj:
-                x = cte_cross_attention_nmajor(q, crossattn_cache["k"], crossattn_cache["v"])
+                if _ROWMAX_GRAPH and getattr(self, "_rm_graph", None) is not None:
+                    # LINGBOT_ROWMAX_GRAPH: the cross-attention's row-max range over the real query rows
+                    _qc, _ = cte_prep_q(q)
+                    _rq = _REAL_TOKENS[0] if _REAL_TOKENS[0] is not None else int(_qc.shape[1])
+                    _rowmax_graph_update(self._rm_graph, _qc[:, :min(_rq, int(_qc.shape[1]))],
+                                         [crossattn_cache["k"]], 1)
+                if _CROSS_DEDUP_ON[0]:
+                    x = cross_attention_dedup(q, crossattn_cache["k"], crossattn_cache["v"],
+                                              crossattn_cache["mult"], _CROSS_DEDUP)
+                else:
+                    x = cte_cross_attention_nmajor(q, crossattn_cache["k"], crossattn_cache["v"])
                 x = x.flatten(2)
                 if getattr(self, 'tp_enabled', False):
                     return _tp_row_parallel(self.o, x, scatter=_sp_scatter)
@@ -1835,7 +2285,7 @@ class CausalWanAttentionBlock(nn.Module):
         camera condition and the weights only: no x, no timestep."""
         cam_hidden = torch_F.silu(self.cam_injector_layer1(c2ws_plucker_emb))
         if getattr(self, 'tp_enabled', False):
-            c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden)
+            c2ws_hidden_states = _tp_row_parallel(self.cam_injector_layer2, cam_hidden, bf16_sum=_FILM_AR_BF16)
         else:
             c2ws_hidden_states = self.cam_injector_layer2(cam_hidden)
         c2ws_hidden_states = c2ws_hidden_states + c2ws_plucker_emb
@@ -1844,7 +2294,19 @@ class CausalWanAttentionBlock(nn.Module):
     def cam_film_sp(self, c2ws_plucker_emb):
         """cam_film() already in the sequence-parallel form the SP block consumes: this rank's
         token shard at full width, via one all-to-all per tensor inside the same graph
-        (LINGBOT_FILM_A2A=1) instead of an eager full-width all-gather + slice + clone."""
+        (LINGBOT_FILM_A2A=1) instead of an eager full-width all-gather + slice + clone.
+        LINGBOT_FILM_ROWS=N: the camera tokens padded to N rows first (zero rows at the end of every TP rank's
+        token block, so the all-to-all still hands each rank its own tokens, then sliced off). Every op is per
+        token, so the real rows' params are those of the unpadded graph; the row count only changes how the
+        compiler tiles the matmuls."""
+        _, L, C = c2ws_plucker_emb.shape
+        if _FILM_ROWS > L:
+            n = tp.mesh_submesh("tp").size()
+            assert L % n == 0 and _FILM_ROWS % n == 0, f"LINGBOT_FILM_ROWS={_FILM_ROWS}: {L} tokens, tp {n}"
+            x = torch_F.pad(c2ws_plucker_emb.view(n, L // n, C), (0, 0, 0, (_FILM_ROWS - L) // n))
+            scale, shift = self.cam_film(x.reshape(1, _FILM_ROWS, C))
+            return (tp.cols_to_token_shard(scale, "tp")[:, :L // n],
+                    tp.cols_to_token_shard(shift, "tp")[:, :L // n])
         scale, shift = self.cam_film(c2ws_plucker_emb)
         return tp.cols_to_token_shard(scale, "tp"), tp.cols_to_token_shard(shift, "tp")
 
@@ -2267,13 +2729,29 @@ class WanModelFast(ModelMixin, ConfigMixin):
         sp_group = _get_dit_sp_group()
         sp_size = tp.tp_degree(_SP_GROUP)
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0).to(self.patch_embedding.weight.dtype)) for u in x]
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat(x)
+        _x_local = False
+        if (_EMBED_LOCAL and len(x) == 1 and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+                and tuple(self.patch_embedding.stride) == tuple(self.patch_embedding.kernel_size)):
+            # LINGBOT_EMBED_LOCAL: only this rank's run of the frame-major sequence (see patch_embed_local).
+            _u = x[0]
+            _kt, _kh, _kw = self.patch_embedding.kernel_size
+            _gs = (_u.shape[1] // _kt, _u.shape[2] // _kh, _u.shape[3] // _kw)
+            _L = _gs[0] * _gs[1] * _gs[2]
+            assert _L % sp_size == 0, f"token count {_L} not divisible by cp {sp_size}"
+            _loc = _L // sp_size
+            x = patch_embed_local(self.patch_embedding, _u, _sp_local_r() * _loc, _loc)
+            grid_sizes = torch.tensor([_gs], dtype=torch.long)
+            seq_lens = torch.tensor([_L], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            _x_local = True
+        else:
+            x = [self.patch_embedding(u.unsqueeze(0).to(self.patch_embedding.weight.dtype)) for u in x]
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat(x)
 
         # time embeddings
         #
@@ -2331,6 +2809,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 self._t_emb_cache = {}
             self._t_emb_cache[_tkey] = (e, e0)
 
+        # LINGBOT_CROSS_DEDUP: the deduplicated cross-attention only when the prompt's rows (before the zero padding to
+        # text_len) leave at least one padding row inside the attended slice
+        _CROSS_DEDUP_ON[0] = bool(_CROSS_DEDUP and len(context) == 1 and int(context[0].shape[0]) < _CROSS_DEDUP)
+        if _CROSS_DEDUP and getattr(self, "_cross_dedup_logged", None) != tuple(context[0].shape):
+            self._cross_dedup_logged = tuple(context[0].shape)
+            logging.info(f"LINGBOT_CROSS_DEDUP={_CROSS_DEDUP}: prompt rows {int(context[0].shape[0])}, "
+                         f"deduplicated cross-attention {'on' if _CROSS_DEDUP_ON[0] else 'off'}")
         # context: constant for the whole generation, so embed it once per context tensor.
         _ckey = (id(context[0]), tuple(context[0].shape)) if len(context) == 1 else None
         _chit = getattr(self, "_ctx_emb_cache", None)
@@ -2355,6 +2840,13 @@ class WanModelFast(ModelMixin, ConfigMixin):
         _cam_in = None
         self._films_cur = None
         _film_chk = None
+        _lz = getattr(self, "_films_lazy", None)
+        if _lz is not None and dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+            # LINGBOT_FILM_GROUP: this chunk's group of FiLM params, if it has not been computed yet
+            _c = dit_cond_dict["c2ws_plucker_emb"]
+            _k = _lz["pos"].get(id(_c))
+            if _k is not None and _lz["tuples"][_k] is _c and id(_c) not in (getattr(self, "_films_pre", None) or {}):
+                self._film_group(_k - _k % _lz["G"])
         _pre = getattr(self, "_films_pre", None)
         if (_pre and dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict
                 and id(dit_cond_dict["c2ws_plucker_emb"]) in _pre
@@ -2390,38 +2882,46 @@ class WanModelFast(ModelMixin, ConfigMixin):
             ]
             c2ws_plucker_emb = torch.cat(
                 c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+
+            def _cam_shard_cp(t):
+                # Shard the camera condition on the SAME axis as x (width),
+                # frame-major. Its spatial size is DERIVED, not assumed: the
+                # old code hardcoded rows = 2*H_patch and width = W_patch,
+                # which cannot both be right (that is 2x the rows against 1x
+                # the width). Deriving it from the actual token count keeps
+                # this correct whether patch_embedding_wancamctrl leaves the
+                # tokens on the image grid (2H x 2W) or the patch grid.
+                _g = grid_sizes[0].tolist()
+                _lc = t.shape[1] // _g[0]
+                assert _lc * _g[0] == t.shape[1], (
+                    f"c2ws tokens {t.shape[1]} not divisible by frames {_g[0]}")
+                _scale_sq = _lc // (_g[1] * _g[2])
+                assert _scale_sq in (1, 4) and _lc == _scale_sq * _g[1] * _g[2], (
+                    f"c2ws spatial {_lc} is neither the patch grid "
+                    f"{_g[1]}x{_g[2]} nor 2x it; cannot infer the width axis")
+                _sc = 1 if _scale_sq == 1 else 2
+                _h8, _w8 = _g[1] * _sc, _g[2] * _sc
+                if _CP_FLAT_SEQ:
+                    assert (_g[0] * _h8 * _w8) % sp_size == 0, (
+                        f"c2ws tokens {_g[0] * _h8 * _w8} not divisible by "
+                        f"cp {sp_size}")
+                else:
+                    assert _w8 % sp_size == 0, (
+                        f"c2ws width {_w8} not divisible by cp {sp_size}")
+                return _shard_w(t, _g[0], _h8, _w8, sp_size, _sp_local_r())
+            # LINGBOT_FILM_SHARD=1 (flat CP, the per-chunk FiLM path): this CP rank's tokens first, then the per-token
+            # camera embedding and its MLP on those rows only (8x fewer at CP8; 2 x ~2 ms per chunk on all of them)
+            _cam_early = _FILM_SHARD and sp_size > 1 and _SEQ_MODE == "cp" and _CP_FLAT_SEQ
+            if _cam_early:
+                c2ws_plucker_emb = _cam_shard_cp(c2ws_plucker_emb)
             c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
             c2ws_hidden_states = self.c2ws_hidden_states_layer2(
                 torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
             c2ws_plucker_emb = c2ws_plucker_emb + c2ws_hidden_states
-            if sp_size > 1:
+            if sp_size > 1 and not _cam_early:
                 _g = grid_sizes[0].tolist()
                 if _SEQ_MODE == "cp":
-                    # Shard the camera condition on the SAME axis as x (width),
-                    # frame-major. Its spatial size is DERIVED, not assumed: the
-                    # old code hardcoded rows = 2*H_patch and width = W_patch,
-                    # which cannot both be right (that is 2x the rows against 1x
-                    # the width). Deriving it from the actual token count keeps
-                    # this correct whether patch_embedding_wancamctrl leaves the
-                    # tokens on the image grid (2H x 2W) or the patch grid.
-                    _lc = c2ws_plucker_emb.shape[1] // _g[0]
-                    assert _lc * _g[0] == c2ws_plucker_emb.shape[1], (
-                        f"c2ws tokens {c2ws_plucker_emb.shape[1]} not divisible by frames {_g[0]}")
-                    _scale_sq = _lc // (_g[1] * _g[2])
-                    assert _scale_sq in (1, 4) and _lc == _scale_sq * _g[1] * _g[2], (
-                        f"c2ws spatial {_lc} is neither the patch grid "
-                        f"{_g[1]}x{_g[2]} nor 2x it; cannot infer the width axis")
-                    _sc = 1 if _scale_sq == 1 else 2
-                    _h8, _w8 = _g[1] * _sc, _g[2] * _sc
-                    if _CP_FLAT_SEQ:
-                        assert (_g[0] * _h8 * _w8) % sp_size == 0, (
-                            f"c2ws tokens {_g[0] * _h8 * _w8} not divisible by "
-                            f"cp {sp_size}")
-                    else:
-                        assert _w8 % sp_size == 0, (
-                            f"c2ws width {_w8} not divisible by cp {sp_size}")
-                    c2ws_plucker_emb = _shard_w(
-                        c2ws_plucker_emb, _g[0], _h8, _w8, sp_size, _sp_local_r())
+                    c2ws_plucker_emb = _cam_shard_cp(c2ws_plucker_emb)
                 else:
                     # SP: take this rank's height-row block of the camera condition
                     # (c2ws is [1, F*(H/8)*(W/8), C]; same frame-major rows as x,
@@ -2473,7 +2973,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 # examples/03 at 480*832). x is sharded AFTER RoPE/patch-embed and
                 # gathered back before norm_out, per the reference implementation neuron_cp.install_cp.
                 _r = _sp_local_r()
-                x = _shard_w(x, _nf, _pr, _pw, sp_size, _r)
+                if not _x_local:
+                    x = _shard_w(x, _nf, _pr, _pw, sp_size, _r)
                 if e0.size(1) > 1:
                     e = _shard_w(e, _nf, _pr, _pw, sp_size, _r)
                     e0 = _shard_w(e0, _nf, _pr, _pw, sp_size, _r)
@@ -2976,8 +3477,6 @@ class WanModelFast(ModelMixin, ConfigMixin):
         f, h, w = grid
         c = rearrange(c2ws_all, '1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)',
                       c1=self.patch_size[0], c2=self.patch_size[1], c3=self.patch_size[2])
-        c = self.patch_embedding_wancamctrl(c)
-        c = c + self.c2ws_hidden_states_layer2(torch_F.silu(self.c2ws_hidden_states_layer1(c)))
         L = f * h * w
         K = len(cam_tuples)
         assert c.shape[1] >= K * L or c.shape[1] % L == 0, (c.shape, L, K)
@@ -2986,30 +3485,61 @@ class WanModelFast(ModelMixin, ConfigMixin):
         r = _sp_local_r()
         n_avail = c.shape[1] // L
         toks = []
-        for k in range(K):
+        if _FILM_SHARD:
+            # LINGBOT_FILM_SHARD=1: this CP rank's tokens of each chunk first, then the per-token camera embedding
+            # and MLP on those K * R rows instead of on every chunk's L tokens (16x fewer rows at CP 16)
+            cs = torch.cat([_shard_w(c[:, min(k, n_avail - 1) * L:(min(k, n_avail - 1) + 1) * L],
+                                     f, h, w, sp_size, r) for k in range(K)], dim=1)
+            cs = self.patch_embedding_wancamctrl(cs)
+            cs = cs + self.c2ws_hidden_states_layer2(torch_F.silu(self.c2ws_hidden_states_layer1(cs)))
+            for k in range(K):
+                toks.append(torch_F.pad(cs[:, k * R:(k + 1) * R], (0, 0, 0, P - R)))
+        else:
+            c = self.patch_embedding_wancamctrl(c)
+            c = c + self.c2ws_hidden_states_layer2(torch_F.silu(self.c2ws_hidden_states_layer1(c)))
+        for k in range(K if not _FILM_SHARD else 0):
             ck = c[:, min(k, n_avail - 1) * L:(min(k, n_avail - 1) + 1) * L]
             ck = _shard_w(ck, f, h, w, sp_size, r)
             toks.append(torch_F.pad(ck, (0, 0, 0, P - R)))
-        # LINGBOT_FILM_ALL_BLOCKS=n: one compiled graph per n consecutive blocks instead of one for
-        # all 40. The single graph unrolls K chunks x 40 blocks x 4 matmuls; at 16 ranks (TP4 x CP4,
-        # twice the tokens per rank of CP8) its NEFF carried ~150 MB of PE instructions per core and
-        # failed to load ("Failed to load model with collectives, Failed to allocate resource").
-        # Same ops per block, so the result is identical.
-        _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0)
-        # LINGBOT_FILM_ALL_CHUNKS=k: precompute k chunks per call (smaller all-to-alls).
-        _kc = int(os.environ.get("LINGBOT_FILM_ALL_CHUNKS", "0") or 0) or K
-        if _kc < K:
-            per_chunk = []
-            for k0 in range(0, K, _kc):
-                part = self._films_run(torch.cat(toks[k0:k0 + _kc], dim=1), len(toks[k0:k0 + _kc]), P, _nb)
-                per_chunk += [[(sc[j:j + 1], sh[j:j + 1]) for sc, sh in part]
-                              for j in range(len(toks[k0:k0 + _kc]))]
-        else:
-            res = self._films_run(torch.cat(toks, dim=1), K, P, _nb)
-            per_chunk = [[(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res] for k in range(K)]
+        fn = getattr(self, "_films_multi_fn", None)
+        if fn is None:
+            raw = [getattr(b, "_orig_mod", b) for b in self.blocks]
+
+            def _all(c_cat, K_, P_):
+                return _films_multi(raw, c_cat, K_, P_)
+            fn = self._films_multi_fn = torch.compile(_all, backend="neuron", fullgraph=True,
+                                                      dynamic=False)
         self._films_pre = {}
-        for k, t in enumerate(cam_tuples):
-            self._films_pre[id(t)] = (t, per_chunk[k])
+        self._films_lazy = None
+        if 0 < _FILM_GROUP < K:
+            # LINGBOT_FILM_GROUP=G: the FiLM graph runs on G chunks per call, the first group now and each later one
+            # when its first chunk's forward needs it (forward -> _film_group), so at most one group's params are
+            # held. At CP8 one block's FiLM costs 2.33 ms for one chunk but 1.34 ms for two in one graph; the
+            # all-chunk graph (G = K) did not fit there.
+            self._films_lazy = {"tuples": list(cam_tuples), "toks": toks, "G": _FILM_GROUP, "P": P,
+                                "pos": {id(t): k for k, t in enumerate(cam_tuples)}}
+            self._film_group(0)
+        else:
+            # LINGBOT_FILM_ALL_BLOCKS=n: one compiled graph per n consecutive blocks instead of one for
+            # all 40. The single graph unrolls K chunks x 40 blocks x 4 matmuls; at 16 ranks (TP4 x CP4,
+            # twice the tokens per rank of CP8) its NEFF carried ~150 MB of PE instructions per core and
+            # failed to load ("Failed to load model with collectives, Failed to allocate resource").
+            # Same ops per block, so the result is identical.
+            _nb = int(os.environ.get("LINGBOT_FILM_ALL_BLOCKS", "0") or 0)
+            # LINGBOT_FILM_ALL_CHUNKS=k: precompute k chunks per call (smaller all-to-alls).
+            _kc = int(os.environ.get("LINGBOT_FILM_ALL_CHUNKS", "0") or 0) or K
+            if _kc < K:
+                per_chunk = []
+                for k0 in range(0, K, _kc):
+                    part = self._films_run(torch.cat(toks[k0:k0 + _kc], dim=1), len(toks[k0:k0 + _kc]), P, _nb)
+                    per_chunk += [[(sc[j:j + 1], sh[j:j + 1]) for sc, sh in part]
+                                  for j in range(len(toks[k0:k0 + _kc]))]
+            else:
+                res = self._films_run(torch.cat(toks, dim=1), K, P, _nb)
+                per_chunk = [[(sc[k:k + 1], sh[k:k + 1]) for sc, sh in res] for k in range(K)]
+            self._films_pre = {}
+            for k, t in enumerate(cam_tuples):
+                self._films_pre[id(t)] = (t, per_chunk[k])
         if os.environ.get("LINGBOT_FILM_CHECK", "") and not getattr(self, "_film_check_done", False):
             # First generation only, so a benchmark's timed pass is unaffected.
             self._film_check_ids = {id(t): k for k, t in enumerate(cam_tuples)}
@@ -3040,6 +3570,20 @@ class WanModelFast(ModelMixin, ConfigMixin):
                                                           dynamic=False)
             res = fn(c_cat, K, P)
         return res
+
+    def _film_group(self, k0):
+        """LINGBOT_FILM_GROUP: the FiLM params of chunks k0 .. k0 + G - 1 in one call of the FiLM graph, replacing the
+        previous group's. A short last group is padded with copies of its last chunk, so one compiled graph (K = G)
+        serves every group."""
+        lz = self._films_lazy
+        G, P = lz["G"], lz["P"]
+        ts = lz["toks"][k0:k0 + G]
+        ts = ts + [ts[-1]] * (G - len(ts))
+        self._films_pre = {}
+        with torch.amp.autocast('neuron', dtype=torch.bfloat16), torch.no_grad():
+            res = self._films_multi_fn(torch.cat(ts, dim=1), G, P)
+        for j, t in enumerate(lz["tuples"][k0:k0 + G]):
+            self._films_pre[id(t)] = (t, [(sc[j:j + 1], sh[j:j + 1]) for sc, sh in res])
 
     def _cam_films(self, dit_cond_dict):
         """Per-block camera FiLM params, computed once per chunk (LINGBOT_CAM_HOIST=1, default).

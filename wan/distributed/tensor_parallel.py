@@ -160,17 +160,18 @@ def replica_groups(dim="cp"):
     return out
 
 
-def all_reduce_fn(tensor, dim="tp"):
+def all_reduce_fn(tensor, dim="tp", native=False):
     """Traceable, OUT-OF-PLACE all_reduce(SUM) over a DeviceMesh submesh.
 
     Use this inside compiled regions. dist.all_reduce is in-place and not
     traceable, so it forces a graph break or fails to lower; fc.all_reduce
     returns a new tensor and stays in the graph. Callers MUST assign the result.
+    native=True: a bf16 / fp16 tensor is reduced in its own dtype (as with LINGBOT_AR_BF16) for this call.
     """
     m = mesh_submesh(dim)
     if m is None:
         return tensor
-    if tensor.dtype in (torch.bfloat16, torch.float16) and not _AR_NATIVE_DTYPE:
+    if tensor.dtype in (torch.bfloat16, torch.float16) and not (_AR_NATIVE_DTYPE or native):
         # Match all_reduce's fp32 promotion: stacked per-layer bf16 reductions
         # compound rounding (see all_reduce's docstring).
         return fc.all_reduce(tensor.float(), "sum", m).to(tensor.dtype)
@@ -180,6 +181,11 @@ def all_reduce_fn(tensor, dim="tp"):
 # LINGBOT_AR_BF16=1: in-graph all-reduces of bf16 tensors stay bf16 (half the bytes). Wan2.2's
 # compiled DiT reduces in bf16 and measured inside the bf16 accuracy band against an fp32 reference.
 _AR_NATIVE_DTYPE = os.environ.get("LINGBOT_AR_BF16", "0") == "1"
+# LINGBOT_RS_BF16=1: sequence-parallel reduce-scatters of fp32 tensors on bf16 payloads (reduce_scatter_tokens). In a
+# CP8 block profile the three per block (self- and cross-attention o-projections, FFN down) moved 11.1 MB of fp32 each
+# in ~57 us, against ~26 us for the bf16 token all-gathers of the same rows; LINGBOT_AR_BF16 never reached them,
+# because the projections' outputs are already fp32.
+_RS_BF16 = os.environ.get("LINGBOT_RS_BF16", "0") == "1"
 
 
 def all_gather_tokens(x, dim="tp"):
@@ -214,12 +220,16 @@ def cols_to_token_shard(x, dim="tp"):
 
 def reduce_scatter_tokens(x, dim="tp"):
     """Traceable reduce-scatter(SUM) [1, n*S, C] -> this rank's token shard [1, S, C]. Same dtype
-    policy as all_reduce_fn: bf16 is promoted to fp32 for the sum unless LINGBOT_AR_BF16=1."""
+    policy as all_reduce_fn: bf16 is promoted to fp32 for the sum unless LINGBOT_AR_BF16=1.
+    LINGBOT_RS_BF16=1: an fp32 input (the row-parallel projections' outputs under their fp32 autocast) is rounded to
+    bf16 and reduce-scattered in bf16, half the bytes; the result comes back in the input's dtype."""
     m = mesh_submesh(dim)
     if m is None:
         return x
     assert x.shape[0] == 1, "token reduce-scatter assumes batch 1"
     x2 = x[0].contiguous()
+    if _RS_BF16 and x2.dtype == torch.float32:
+        return fc.reduce_scatter_tensor(x2.to(torch.bfloat16), "sum", 0, m).to(x.dtype).unsqueeze(0)
     if x2.dtype in (torch.bfloat16, torch.float16) and not _AR_NATIVE_DTYPE:
         return fc.reduce_scatter_tensor(x2.float(), "sum", 0, m).to(x.dtype).unsqueeze(0)
     return fc.reduce_scatter_tensor(x2, "sum", 0, m).unsqueeze(0)

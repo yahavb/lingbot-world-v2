@@ -145,6 +145,7 @@ def main():
 
     latent = torch.load(args.latents_path, map_location="cpu").to(device)
     if device.type == "cpu":
+        # the fp32 reference decode (Wan2_1_VAE's autocast is CUDA-only; on CPU the weights are fp32)
         latent = latent.float()
 
     # SAME width padding as the inline path in generate.py. This script sharded on

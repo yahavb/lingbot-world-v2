@@ -77,6 +77,9 @@ def main():
     blk = blk.to(torch.bfloat16).to(dev).eval().requires_grad_(False)
     blk.self_attn.layer_index = K
     blk.self_attn.use_const_max = mf.layer_uses_const_max(K)
+    blk.self_attn.use_cmax = mf.layer_uses_cmax(K)
+    # LINGBOT_CMAX_GUARD's counters and LINGBOT_DIAG_QK_SCALE's scale for this layer (before the first compiled call)
+    mf.cmax_guard_alloc([blk], dev)
     d = config["dim"] // config["num_heads"]
     freqs = torch.cat([rope_params(mf.MAX_LATENT_FRAMES, d - 4 * (d // 6)),
                        rope_params(mf.MAX_LATENT_FRAMES, 2 * (d // 6)),
@@ -96,7 +99,13 @@ def main():
     x = torch.randn(1, L_loc, config["dim"], generator=g) * 0.5
     x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev).float()
     e0 = (torch.randn(1, 1, 6, config["dim"], generator=g) * 0.1).to(dev).float()
-    ctx = (torch.randn(1, 512, config["dim"], generator=g) * 0.5).to(dev).to(torch.bfloat16)
+    ctx = torch.randn(1, 512, config["dim"], generator=g) * 0.5
+    ctx_real = int(os.environ.get("CTX_REAL", "0") or 0)
+    if ctx_real:
+        # CTX_REAL=N: the pipeline's context, N prompt rows then 512 - N identical padding rows (its zero padding,
+        # embedded); what LINGBOT_CROSS_DEDUP relies on
+        ctx[:, ctx_real:] = ctx[:, ctx_real:ctx_real + 1]
+    ctx = ctx.to(dev).to(torch.bfloat16)
     c2ws = (torch.randn(1, L_loc, config["dim"], generator=g) * 0.5)
     c2ws = torch.nn.functional.pad(c2ws, (0, 0, 0, Lp - L_loc)).to(dev).to(torch.bfloat16)
     cos, sin = mf.causal_rope_grids(freqs, grid, dev, 2 * CHUNK, dtype=mf._rope_dtype(x), w_shard=w_shard)
@@ -126,6 +135,17 @@ def main():
         for t in kv["k"]:
             n_, d_, L_ = t.shape
             t.copy_(t.view(n_, d_, cp, L_ // cp).permute(2, 0, 1, 3).contiguous().view(n_, d_, L_))
+    if os.environ.get("LINGBOT_V_TOKEN_MAJOR", "0") == "1":
+        # the same logical V, stored token-major: [L, n, d] memory under the [n, L, d] shape
+        for t in kv["v"]:
+            t.copy_(t.permute(1, 0, 2).contiguous().view(t.shape))
+    if os.environ.get("KV_STATS", "0") == "1":
+        # diagnostic: per cache slot, the largest |K| and |V| and whether all are finite (randn: ~5)
+        torch.neuron.synchronize()
+        st = [(i, float(k_.float().abs().amax()), float(v_.float().abs().amax()),
+               bool(torch.isfinite(k_.float()).all() and torch.isfinite(v_.float()).all()))
+              for i, (k_, v_) in enumerate(zip(kv["k"], kv["v"]))]
+        print(f"[block_bench] rank {rank} KV_STATS (slot, max|K|, max|V|, finite): {st}", flush=True)
     if split:
         # each CP rank's own shard of every cached chunk = its token slice of the gathered chunk
         r_cp, l_ = mf._sp_local_r(), L_loc
@@ -135,7 +155,10 @@ def main():
             else:
                 ko_.copy_(kc_[:, r_cp * l_:(r_cp + 1) * l_])
             vo_.copy_(vc_[:, r_cp * l_:(r_cp + 1) * l_])
-    order = list(range(LEAD)) + [n_chunks - 1]
+    # ORDER=i,j,...: diagnostic, the cache slots used as the LEAD cached chunks (default 0 .. LEAD-1)
+    order = ([int(s) for s in os.environ["ORDER"].split(",")] if os.environ.get("ORDER")
+             else list(range(LEAD))) + [n_chunks - 1]
+    assert len(order) == LEAD + 1, (order, LEAD)
     ks, vs = [kv["k"][i] for i in order], [kv["v"][i] for i in order]
     own = (([kv["ko"][i] for i in order], [kv["vo"][i] for i in order]),) if split else ()
     if os.environ.get("WINDOW_KV", "0") == "1" and LEAD >= 2:
@@ -150,6 +173,11 @@ def main():
              "is_init": torch.tensor(0, dtype=torch.int32, device=dev)}
     for t in (cross["k"], cross["v"]):
         torch._dynamo.mark_static_address(t)
+    if mf._CROSS_DEDUP:
+        # LINGBOT_CROSS_DEDUP: its per-key bias buffer, and the forward's prompt-length check (needs CTX_REAL)
+        cross["mult"] = torch.zeros(mf._CROSS_DEDUP, dtype=torch.float32, device=dev)
+        torch._dynamo.mark_static_address(cross["mult"])
+        mf._CROSS_DEDUP_ON[0] = 0 < ctx_real < mf._CROSS_DEDUP
 
     torch._dynamo.config.cache_size_limit = 256
     torch._dynamo.config.accumulated_cache_size_limit = 2048
@@ -215,10 +243,112 @@ def main():
             dist.barrier()
             log(f"[block_bench] film prep {'a2a' if a2a else 'gather'}: "
                 f"{(time.perf_counter() - t0) / int(os.environ['FILM_REPS']) * 1e3:.2f} ms/block")
+        for fr in [int(s) for s in os.environ.get("FILM_ROWS", "").split(",") if s]:
+            # FILM_ROWS=512,544,...: this block's per-chunk FiLM graph (cam_film_sp) on fr camera tokens (the chunk's
+            # tokens truncated or zero-padded), to see how its cost depends on the row count
+            assert a2a and fr % tpd == 0, "FILM_ROWS needs LINGBOT_SP=1 LINGBOT_FILM_A2A=1 and rows divisible by TP"
+            c_r = c2ws[:, :fr] if fr <= c2ws.shape[1] else torch.nn.functional.pad(c2ws, (0, 0, 0, fr - c2ws.shape[1]))
+            fn_r = torch.compile(blk.cam_film_sp, backend="neuron", fullgraph=True, dynamic=False)
+            for _ in range(2):
+                fn_r(c_r)
+            torch.neuron.synchronize()
+            dist.barrier()
+            nr = int(os.environ.get("FILM_REPS", "0") or 20)
+            t0 = time.perf_counter()
+            for _ in range(nr):
+                fn_r(c_r)
+            torch.neuron.synchronize()
+            dist.barrier()
+            log(f"[block_bench] film rows={fr}: {(time.perf_counter() - t0) / nr * 1e3:.2f} ms/block")
+        if os.environ.get("FILM_PADCHECK"):
+            # FILM_PADCHECK=N: the per-chunk FiLM with LINGBOT_FILM_ROWS=N against the unpadded one, every rank, + time
+            mf._FILM_ROWS = int(os.environ["FILM_PADCHECK"])
+            fn_p = torch.compile(blk.cam_film_sp, backend="neuron", fullgraph=True, dynamic=False)
+            with torch.no_grad():
+                got = fn_p(c2ws)
+            for nm, a_, r_ in zip(("scale", "shift"), got, film):
+                a_, r_ = a_.float().cpu(), r_.float().cpu()
+                print(f"[block_bench] rank {rank} FILM_PADCHECK {nm}: shape {tuple(a_.shape)} vs {tuple(r_.shape)} "
+                      f"max|diff| {(a_ - r_).abs().max():.3e} bitwise {torch.equal(a_, r_)}", flush=True)
+            for _ in range(2):
+                fn_p(c2ws)
+            torch.neuron.synchronize()
+            dist.barrier()
+            nr = int(os.environ.get("FILM_REPS", "0") or 20)
+            t0 = time.perf_counter()
+            for _ in range(nr):
+                fn_p(c2ws)
+            torch.neuron.synchronize()
+            dist.barrier()
+            log(f"[block_bench] film padded to {mf._FILM_ROWS} rows: {(time.perf_counter() - t0) / nr * 1e3:.2f} ms/block")
+            mf._FILM_ROWS = 0
+        if os.environ.get("FILM_ARCHECK"):
+            # FILM_ARCHECK=N: the per-chunk FiLM on N rows (LINGBOT_FILM_ROWS=N) with cam_injector_layer2's all-reduce
+            # in fp32 and in bf16 (LINGBOT_FILM_AR_BF16): the params compared on every rank, both timed
+            mf._FILM_ROWS = int(os.environ["FILM_ARCHECK"])
+            outs, tms = [], []
+            for flag in (False, True):
+                mf._FILM_AR_BF16 = flag
+                fn_a = torch.compile(blk.cam_film_sp, backend="neuron", fullgraph=True, dynamic=False)
+                with torch.no_grad():
+                    outs.append([t.float().cpu() for t in fn_a(c2ws)])
+                for _ in range(2):
+                    fn_a(c2ws)
+                torch.neuron.synchronize()
+                dist.barrier()
+                nr = int(os.environ.get("FILM_REPS", "0") or 20)
+                t0 = time.perf_counter()
+                for _ in range(nr):
+                    fn_a(c2ws)
+                torch.neuron.synchronize()
+                dist.barrier()
+                tms.append((time.perf_counter() - t0) / nr * 1e3)
+            for nm, a_, r_ in zip(("scale", "shift"), outs[1], outs[0]):
+                print(f"[block_bench] rank {rank} FILM_ARCHECK {nm}: max|diff| {(a_ - r_).abs().max():.3e} rel "
+                      f"{((a_ - r_).pow(2).mean().sqrt() / r_.pow(2).mean().sqrt()).item():.3e} "
+                      f"rms {r_.pow(2).mean().sqrt():.3e}", flush=True)
+            log(f"[block_bench] film on {mf._FILM_ROWS} rows, all-reduce fp32 / bf16: {tms[0]:.2f} / {tms[1]:.2f} ms/block")
+            mf._FILM_ROWS = 0
+            mf._FILM_AR_BF16 = False
+        for fk in [int(s) for s in os.environ.get("FILM_K", "").split(",") if s]:
+            # FILM_K=1,2,4: this block's FiLM for K chunks in one graph (LINGBOT_FILM_ALL's _films_multi), so the
+            # cost per chunk can be compared with the per-chunk graph's
+            assert a2a, "FILM_K needs LINGBOT_SP=1 LINGBOT_FILM_A2A=1"
+            c_cat = c2ws.repeat(1, fk, 1)
+            fn_k = torch.compile(lambda c_, k_=fk: mf._films_multi([blk], c_, k_, Lp), backend="neuron",
+                                 fullgraph=True, dynamic=False)
+            for _ in range(2):
+                fn_k(c_cat)
+            torch.neuron.synchronize()
+            dist.barrier()
+            nr = int(os.environ.get("FILM_REPS", "0") or 20)
+            t0 = time.perf_counter()
+            for _ in range(nr):
+                fn_k(c_cat)
+            torch.neuron.synchronize()
+            dist.barrier()
+            ms_k = (time.perf_counter() - t0) / nr * 1e3
+            # every chunk of c_cat is this chunk's condition, so each chunk's params must match the per-chunk graph's
+            with torch.no_grad():
+                res = fn_k(c_cat)
+            worst = 0.0
+            for (sc, sh), ref_t in ((res[0], film), ):
+                for j in range(fk):
+                    for a_, r_ in ((sc[j:j + 1], ref_t[0]), (sh[j:j + 1], ref_t[1])):
+                        a_, r_ = a_.float().cpu(), r_.float().cpu()
+                        worst = max(worst, ((a_ - r_).pow(2).mean().sqrt() / r_.pow(2).mean().sqrt()).item())
+            print(f"[block_bench] rank {rank} film K={fk}: worst rel vs per-chunk {worst:.3e}", flush=True)
+            log(f"[block_bench] film K={fk}: {ms_k:.2f} ms/block for {fk} chunks, {ms_k / fk:.2f} ms/block per chunk")
     x_in = mf.sp_token_shard(x, tpd, tp_rank) if sp else x
 
     # KV_WRITE=0: the denoise-step variant of LINGBOT_STEP_NOWRITE (no write into the cache slot)
     kv_extra = {"kv_write": False} if os.environ.get("KV_WRITE", "1") == "0" else {}
+    dump_dir = os.environ.get("DUMP_CMAX")
+    if dump_dir:
+        # diagnostic: the constant-offset path copies its kernel queries / accumulator / output here every call
+        mf._DIAG_BUFS["q_t"] = torch.zeros(heads, d, Lp, dtype=torch.bfloat16, device=dev)
+        mf._DIAG_BUFS["acc"] = torch.zeros(heads, Lp, d + 1, dtype=torch.float32, device=dev)
+        mf._DIAG_BUFS["o_n"] = torch.zeros(heads, Lp, d, dtype=torch.bfloat16, device=dev)
 
     def run(first):
         mf._REAL_TOKENS[0] = L_loc if Lp != L_loc else None
@@ -259,6 +389,40 @@ def main():
         if sp:  # reassemble the token shards for the output check (outside the timed loop)
             out = tp.all_gather_tokens(out.contiguous(), "tp")
             torch.neuron.synchronize()
+    nblk = int(os.environ.get("NBLK", "1"))
+    if nblk > 1:
+        # NBLK=N: N copies of the block (cloned weights, own KV and cross-attention caches), called in turn, as the
+        # pipeline's 40 blocks are: the same compiled graph executed on other buffers every call.
+        import copy
+        assert not own, "NBLK: no LINGBOT_ATTN_SPLIT"
+        cops = [(cblk, ks, vs, cross)]
+        for _ in range(nblk - 1):
+            b2 = copy.deepcopy(blk)
+            ks2, vs2 = [t.clone() for t in ks], [t.clone() for t in vs]
+            cr2 = {k_: t.clone() for k_, t in cross.items()}
+            for t in ks2 + vs2 + [cr2["k"], cr2["v"]]:
+                torch._dynamo.mark_static_address(t)
+            cops.append((torch.compile(b2, backend="neuron", fullgraph=True, dynamic=False), ks2, vs2, cr2))
+
+        def run_copy(c_):
+            mf._REAL_TOKENS[0] = L_loc if Lp != L_loc else None
+            cb_, ks_, vs_, cr_ = c_
+            return cb_(x_in, kv_cache=None, kv_chunks=(list(ks_), list(vs_)), crossattn_cache=cr_, current_start=0,
+                       dit_cond_dict={"cam_film": film}, cross_attn_first_call=False, **kw, **kv_extra)
+        with torch.no_grad(), torch.amp.autocast("neuron", dtype=torch.bfloat16):
+            for c_ in cops[1:]:
+                run_copy(c_)  # cross-attention cache: copied from the initialized one
+                run_copy(c_)
+            torch.neuron.synchronize()
+            dist.barrier()
+            t0 = time.perf_counter()
+            for _ in range(REPS):
+                for c_ in cops:
+                    run_copy(c_)
+            torch.neuron.synchronize()
+            dist.barrier()
+            ms_n = (time.perf_counter() - t0) / (REPS * nblk) * 1e3
+        log(f"[block_bench] NBLK={nblk}: {ms_n:.2f} ms/block cycling {nblk} copies (one copy: {ms:.2f} ms/block)")
     if os.environ.get("ALT", "0") == "1":
         # Run once on DIFFERENT data in the same buffers (perturbed cache contents, scaled input),
         # restore the original contents, then do the compared call. Every timed rep sees identical
@@ -300,11 +464,31 @@ def main():
             if sp:
                 out = tp.all_gather_tokens(out.contiguous(), "tp")
                 torch.neuron.synchronize()
+    if dump_dir:
+        # the last call's kernel tensors plus the cache chunks it read (memory layouts as the kernel reads them)
+        torch.neuron.synchronize()
+        os.makedirs(dump_dir, exist_ok=True)
+        torch.save({"q_t": mf._DIAG_BUFS["q_t"].cpu(), "acc": mf._DIAG_BUFS["acc"].cpu(),
+                    "o_n": mf._DIAG_BUFS["o_n"].cpu(), "ks": [t.cpu() for t in ks], "vs": [t.cpu() for t in vs],
+                    "lead": LEAD, "cp": cp, "L_loc": L_loc}, os.path.join(dump_dir, f"r{rank:02d}.pt"))
+    if os.environ.get("KV_STATS", "0") == "1":
+        # diagnostic: the cache after the timed calls (they must not have written it with KV_WRITE=0)
+        torch.neuron.synchronize()
+        st = [(i, float(k_.float().abs().amax()), float(v_.float().abs().amax()),
+               bool(torch.isfinite(k_.float()).all() and torch.isfinite(v_.float()).all()))
+              for i, (k_, v_) in enumerate(zip(kv["k"], kv["v"]))]
+        print(f"[block_bench] rank {rank} KV_STATS after (slot, max|K|, max|V|, finite): {st}", flush=True)
     o = out.float().cpu()
+    guard = mf.cmax_guard_report([blk], "block_bench")      # all ranks: summed over the world
     msg = (f"[block_bench] tp={tpd} cp={cp} block={K} lead={LEAD} L_loc={L_loc}->{Lp} heads/rank={heads} "
            f"{ms:.2f} ms/block (host {t_host / REPS * 1e3:.2f} ms, first call {t_first:.1f}s) "
-           f"out_rms={o[0, :L_loc].pow(2).mean().sqrt():.4f} finite={bool(torch.isfinite(o).all())} "
+           f"out_rms={o[0, :L_loc].pow(2).mean().sqrt():.4f} finite={bool(torch.isfinite(o[0, :L_loc]).all())} "
            f"mem={torch.neuron.memory_allocated(dev) / 1e9:.2f}GB")
+    if Lp > L_loc and not bool(torch.isfinite(o[0, L_loc:]).all()):
+        msg += " (padding rows not finite)"
+    if mf._CMAX_GUARD:
+        n_, oob_, red_ = guard.get(K, (0, 0, 0))
+        msg += f" guard: {n_} blocks checked, {oob_} out of band, {red_} redone (all ranks, all calls)"
     ref, save = os.environ.get("REF"), os.environ.get("SAVE_REF")
     if rank == 0 and save:
         torch.save(o, save)

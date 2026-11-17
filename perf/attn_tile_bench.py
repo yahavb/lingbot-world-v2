@@ -124,6 +124,23 @@ def main():
         bench("lq=384 one call, prior 4320 + 4320", prior, q384, k_(L), v_(L), k_(L), v_(L))
         bench("lq=384 one call, 4320 keys", one, q384, k_(L), v_(L))
         return
+    if os.environ.get("CASES", "") == "qm":
+        # the steady block's two calls: 128-padded (384) vs 32-padded (288) queries, head-major vs
+        # query-major outputs (LINGBOT_CTE_QMAJOR; vendored kernel), with and without the merge
+        four = [t for _ in range(4) for t in (k_(L), v_(L))]
+        def pair2_qm(q, k0, v0, k1, v1, k2, v2, k3, v3, qm=False):
+            return (A.cte_partial(q, k1, v1, k0, v0, q_major=qm),
+                    A.cte_partial(q, k3, v3, k2, v2, q_major=qm))
+        def pair2_merge(q, k0, v0, k1, v1, k2, v2, k3, v3, qm=False):
+            return A.cte_merge(list(pair2_qm(q, k0, v0, k1, v1, k2, v2, k3, v3, qm=qm)), 288,
+                               q_major=qm)
+        for lq in (384, 288):
+            q = rnd(n, lq, d)
+            for qm in (False, True):
+                bench(f"lq={lq} q_major={int(qm)} pair2", lambda *a, qm=qm: pair2_qm(*a, qm=qm), q, *four)
+                bench(f"lq={lq} q_major={int(qm)} pair2 + merge", lambda *a, qm=qm: pair2_merge(*a, qm=qm),
+                      q, *four)
+        return
     if os.environ.get("CASES", "") == "contig":
         # one call over a contiguous window vs the block's two calls, and the in-graph write of
         # the new chunk into a slot of a contiguous window buffer (what a single-call cache needs)

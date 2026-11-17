@@ -624,6 +624,9 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
                 print(f"[BENCH] device memory rank 0: peak allocated "
                       f"{torch.neuron.max_memory_allocated() / (1 << 30):.2f} GiB, peak reserved "
                       f"{torch.neuron.max_memory_reserved() / (1 << 30):.2f} GiB")
+        if hasattr(wan_i2v, "cmax_guard_report"):
+            # LINGBOT_CMAX_GUARD: this pass's per-layer guard counts (a collective on every rank, outside GEN)
+            wan_i2v.cmax_guard_report(f"run{_r + 1}")
     # RELEASE THE DiT. Both GEN passes are done and run_causal returns latents, so the
     # DiT is never needed again -- yet its weights (5.15 GB/rank) and every NEFF stayed
     # resident through the VAE decode, and at 768*1152 that ran the device out:
@@ -646,6 +649,10 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             wan_i2v.model._stack_tokens = None
             wan_i2v.model._stacks_built = None
         wan_i2v.model.cpu()
+        # LINGBOT_KV_REUSE: the KV caches kept for the next generation hold ~3.5 GB of device memory
+        for _attr in ("_self_kv_reuse", "_cross_kv_reuse"):
+            if getattr(wan_i2v, _attr, None) is not None:
+                setattr(wan_i2v, _attr, None)
         try:
             torch._dynamo.reset()
         except Exception as _e:
