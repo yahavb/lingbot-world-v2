@@ -80,6 +80,14 @@ ACTIONS = {
 }
 
 
+
+def _mem(tag, rank):
+    """[MEM] rank 0 device memory after a startup phase (LINGBOT_SERVE_MEM_LOG=1)."""
+    if rank == 0 and os.environ.get("LINGBOT_SERVE_MEM_LOG", "0") == "1":
+        g = 1 << 30
+        logging.info(f"[MEM] {tag}: allocated {torch.neuron.memory_allocated() / g:.2f} GiB, "
+                     f"reserved {torch.neuron.memory_reserved() / g:.2f} GiB")
+
 def action_poses(name, n):
     """[n, 4, 4] framewise relative poses for ACTIONS[name], or None for "auto"."""
     if name not in ACTIONS:
@@ -407,6 +415,7 @@ def main():
     dist.barrier()
     if rank == 0:
         logging.info(f"pre-encoded scenes {sorted(scene_imgs)} in {time.perf_counter() - t0:.1f} s")
+    _mem("after scene pre-encode", rank)
 
     init_t5_parallel_group(world)
     t5 = T5EncoderModel(
@@ -416,6 +425,7 @@ def main():
         checkpoint_path=os.path.join(args.ckpt_dir, cfg.t5_checkpoint),
         tokenizer_path=os.path.join(args.ckpt_dir, cfg.t5_tokenizer))
     t5.model.to(dev)
+    _mem("after T5 load", rank)
 
     pipe = wan.WanI2VCausal(
         config=cfg,
@@ -433,6 +443,7 @@ def main():
         tp_degree=args.tp_degree,
         sp_size=args.sp_size,
         seq_mode=args.seq_mode)
+    _mem("after DiT pipeline load", rank)
 
     first_img = load_image(args.image)
 
@@ -547,6 +558,12 @@ def main():
     # and camera-control ones -- compiles here.
     warm_actions = ["auto"] + list(ACTIONS)
     t0 = time.perf_counter()
+    if os.environ.get("LINGBOT_SERVE_EMPTY_CACHE", "0") == "1":
+        # startup transients (scene pre-encode, T5/DiT load) stay reserved in the caching allocator;
+        # hand the free blocks back before the first session allocates the KV caches
+        torch.neuron.synchronize()
+        torch.neuron.empty_cache()
+        _mem("after empty_cache", rank)
     run_session(args.prompt, first_img, args.base_seed, args.action_path,
                 lambda i: ("stop", None, None) if i >= 3 * SEG_CHUNKS else
                 ("go", args.prompt if i in (SEG_CHUNKS, 2 * SEG_CHUNKS) else None,

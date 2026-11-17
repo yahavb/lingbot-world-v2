@@ -250,6 +250,10 @@ spec:
               value: "hwdge_sync"
             - name: LINGBOT_TEMB_SLICE
               value: "1"
+            - name: LINGBOT_SERVE_MEM_LOG
+              value: "1"
+            - name: LINGBOT_SERVE_EMPTY_CACHE
+              value: "1"
             - name: LINGBOT_WT_PRE
               value: "1"
             - name: LINGBOT_ATTN_FMAJ
