@@ -1,0 +1,56 @@
+{
+ "verdict": "PASS",
+ "mode": "pixels",
+ "checks": [
+  {
+   "check": "G0",
+   "status": "PASS",
+   "detail": "first 9 frames PSNR vs R: B 29.20 dB, C 28.75 dB (floor 20.0)"
+  },
+  {
+   "check": "G0",
+   "status": "PASS",
+   "detail": "forward_c0s0.pt rel-RMS vs R: B 0.0485, C 0.0396 (max 0.05)"
+  },
+  {
+   "check": "G0",
+   "status": "PASS",
+   "detail": "sharpness vs R: B 1.009, C 1.018 (min 0.9)"
+  },
+  {
+   "check": "G1",
+   "status": "PASS",
+   "detail": "PSNR vs R: C 20.45 dB, B 20.21 dB (allowed -0.5)"
+  },
+  {
+   "check": "G2",
+   "status": "PASS",
+   "detail": "worst frame vs R: C 16.62 dB (#59), B 14.97 dB"
+  },
+  {
+   "check": "G3",
+   "status": "PASS",
+   "detail": "forward c0s0 rel-RMS vs R: C 0.03959, B 0.04850 (allowed x1.3)"
+  },
+  {
+   "check": "G3",
+   "status": "PASS",
+   "detail": "forward x0c0 rel-RMS vs R: C 0.06733, B 0.06054 (allowed x1.3)"
+  },
+  {
+   "check": "G4",
+   "status": "PASS",
+   "detail": "decoder vs fp32 CPU decode of own latents: C 52.76 dB, B 52.74 dB"
+  },
+  {
+   "check": "D1",
+   "status": "PASS",
+   "detail": "C run twice: identical dumps"
+  },
+  {
+   "check": "D2",
+   "status": "N/A",
+   "detail": "no flags-off / main pair"
+  }
+ ]
+}
