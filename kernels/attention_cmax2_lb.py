@@ -114,6 +114,11 @@ _MAX_Q = 640  # 5 output tiles, all on pinned banks 0-4
 _PSUM_PIN_ENV = os.environ.get("LINGBOT_CMAX_PSUM_PIN", "")
 assert _PSUM_PIN_ENV in ("", "0", "1"), f"LINGBOT_CMAX_PSUM_PIN={_PSUM_PIN_ENV!r}"
 _SCORE_BANKS = (5, 6)
+# LINGBOT_CMAX_BANK_REUSE=1 (kiro, CP4 / CP2: 1088 / 2176 queries per rank): every pass puts its output tiles on the
+# same pinned banks 0-2 and evicts them into the SBUF accumulator before the next pass, as consecutive (chunk, head)
+# iterations already do, so one call takes up to _MAX_Q_REUSE queries with K and V loaded once per (chunk, head).
+_BANK_REUSE = os.environ.get("LINGBOT_CMAX_BANK_REUSE", "0") == "1"
+_MAX_Q_REUSE = 2304  # 18 output tiles: the fp32 accumulator is 18 * (d + 1) * 4 bytes per partition and head
 
 
 def _query_passes(seq_q):
@@ -311,11 +316,14 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
     (rows real_q .. Sq - 1 are padding, not checked; None: none) and out-of-band blocks redone (_redo_block)."""
     n_heads, d, seq_q = q_hbm.shape
     kernel_assert(d == _P, f"d must be {_P}, got {d}")
-    kernel_assert(seq_q <= _MAX_Q, f"seq_q={seq_q} must be <= {_MAX_Q}")
+    _max_q = _MAX_Q_REUSE if _BANK_REUSE else _MAX_Q
+    kernel_assert(seq_q <= _max_q, f"seq_q={seq_q} must be <= {_max_q}")
     passes = _query_passes(seq_q)
     pin = len(passes) > 1 if _PSUM_PIN_ENV == "" else _PSUM_PIN_ENV == "1"
-    kernel_assert(not pin or div_ceil(seq_q, _O_TILE_SIZE) <= _SCORE_BANKS[0],
-                  f"pinned PSUM: {div_ceil(seq_q, _O_TILE_SIZE)} output tiles exceed banks 0-{_SCORE_BANKS[0] - 1}")
+    _tiles_pinned = (max(div_ceil(n_, _O_TILE_SIZE) for _, n_ in passes) if _BANK_REUSE
+                     else div_ceil(seq_q, _O_TILE_SIZE))
+    kernel_assert(not pin or _tiles_pinned <= _SCORE_BANKS[0],
+                  f"pinned PSUM: {_tiles_pinned} output tiles exceed banks 0-{_SCORE_BANKS[0] - 1}")
     if normalize:
         out = nl.ndarray(shape=(n_heads, seq_q, d), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
     else:
@@ -362,7 +370,7 @@ def _cmax2(q_hbm, k_chunks, v_chunks, softmax_max, acc_in=None, normalize=True, 
             for pi, (r0, rows_p) in enumerate(passes):
                 # one pass of the chunk's key tiles per query range; K and V stay in SBUF across passes
                 if pin:
-                    b0 = r0 // _O_TILE_SIZE
+                    b0 = 0 if _BANK_REUSE else r0 // _O_TILE_SIZE
                     o_psums = nt.psum_pool(tile_size=(_O_TILE_SIZE, d + 1), element_shape=(rows_p, d + 1),
                                            bank_ids=tuple(range(b0, b0 + div_ceil(rows_p, _O_TILE_SIZE))))
                 else:
