@@ -41,6 +41,20 @@ _S_BANKS = (2, 3, 4, 5, 6, 7)   # S^T tiles (rotating) and the per-super-group s
 _SUM_BANK = 7
 if _SUMMODE in ("pe", "pef"):
     _S_BANKS = (2, 3, 4, 5, 6)
+# LINGBOT_C3_ADD2=1 (pef): exps stay one key tile per instruction (5-bank rotation), but the probabilities of two
+# full key tiles land side by side ([128, 2, 512]) and the row-sum chain adds both in one Vector instruction (the
+# bf16 add costs ~196 ns fixed + 0.42 ns per element: 623 ns per pair vs 2 x 409), freeing Vector for exps.
+# LINGBOT_C3_DVE_BANK=1 (with LINGBOT_C3_DVE_EXP_EVERY=k): the Vector-exp tiles take PSUM bank 6 of their own, the
+# Scalar-exp tiles rotate over banks 2-5, so a Vector exp's latency never holds a bank the Scalar engine needs next.
+_ADD2 = os.environ.get("LINGBOT_C3_ADD2", "0") == "1"
+_DVE_BANK = os.environ.get("LINGBOT_C3_DVE_BANK", "0") == "1"
+_DVE_BANK_ID = 6
+# diagnostics (wrong output): LINGBOT_C3_DIAG=nomm2 (no P@V matmuls), noexp (the probabilities' tile is never
+# computed: P@V and the sums read a stale buffer), nomm1 (no score matmuls: the exp reads a stale PSUM bank)
+_DIAG = os.environ.get("LINGBOT_C3_DIAG", "")
+assert not (_ADD2 or _DVE_BANK) or _SUMMODE == "pef", "LINGBOT_C3_ADD2 / DVE_BANK need LINGBOT_C3_SUMMODE=pef"
+if _DVE_BANK:
+    _S_BANKS = (2, 3, 4, 5)
 
 
 # LINGBOT_C3_GPS_EVERY=k: every k-th key tile's row-sum add runs on GpSimd (its own chain) instead of Vector;
@@ -162,6 +176,10 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
     ones_b = nl.ndarray(shape=(_P, _P), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.memset(dst=ones_b, value=1.0)
     red_sink = nl.ndarray(shape=(_P, 8), dtype=nl.float32, buffer=nl.sbuf)
+    diag_pt = None
+    if _DIAG == "noexp":
+        diag_pt = nl.ndarray(shape=(_P, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=diag_pt, value=0.001)
 
     q_bufs = [nl.ndarray(shape=(d, seq_q), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(2)]
     k_bufs = [[nl.ndarray(shape=(d, seq_ks[ci]), dtype=nl.bfloat16, buffer=nl.sbuf) for ci in range(n_ch)]
@@ -195,7 +213,7 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
         if ti == 0:
             if _SUMMODE == "pef":
                 sg_state[(hl, sg)] = (_psum((d, _SG * _P), _O_BANKS[(hl * n_sg + sg) % len(_O_BANKS)]),
-                                      {"first": True, "ps": _psum((d, _SG * _P), _SUM_BANK),
+                                      {"first": True, "ps": _psum((d, _SG * _P), _SUM_BANK), "half": None,
                                        "chains": {eng: {"n": 0, "prev": None, "spb": None}
                                                   for eng in _sum_engines()}})
             else:
@@ -205,12 +223,71 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
                                        for eng in _sum_engines()})
         sums = sg_state[(hl, sg)][1]
         w = min(_P, seq_ks[ci] - t * _P)
+        if _ADD2:
+            dve = bool(_DVE_EXP_EVERY) and ti % _DVE_EXP_EVERY == _DVE_EXP_EVERY - 1
+            if _DVE_BANK and dve:
+                s_ps = _psum((_P, _SG * _P), _DVE_BANK_ID)
+            else:
+                s_ps = _psum((_P, _SG * _P), _S_BANKS[cnt["s"] % len(_S_BANKS)])
+                cnt["s"] += 1
+            nisa.nc_matmul(s_ps[0:w, 0:nq], stationary=k_bufs[st][ci][:, nl.ds(t * _P, w)],
+                           moving=q_bufs[st][:, nl.ds(q0, nq)])
+            if w < _P:
+                buf, slot = nl.ndarray(shape=(_P, 1, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf), 0
+            elif sums["half"] is None:
+                buf, slot = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf), 0
+                sums["half"] = buf
+            else:
+                buf, slot = sums["half"], 1
+                sums["half"] = None
+            if dve:
+                nisa.exponential(dst=buf[0:w, slot, 0:nq], src=s_ps[0:w, 0:nq], max_value=c)
+            else:
+                nisa.activation(dst=buf[0:w, slot, 0:nq], op=nl.exp, data=s_ps[0:w, 0:nq], bias=-c, scale=1.0)
+
+            def qf(b_, j_, rows):
+                flush_q.setdefault(item, []).append((b_, j_, rows))
+
+            ch = sums["chains"]["dve"]
+
+            def flush_chain():
+                src = ch["prev"] if ch["n"] == 1 else ch["spb"]
+                qf(src, 0, _P)
+                qf(src, 1, _P)
+                ch["n"] = 0
+
+            if w < _P:
+                qf(buf, 0, w)
+            elif slot == 1:
+                if ch["n"] == 0:
+                    ch["prev"], ch["n"] = buf, 1
+                elif ch["n"] == 1:
+                    spb = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=spb[:, 0:2, 0:nq], data1=ch["prev"][:, 0:2, 0:nq],
+                                       data2=buf[:, 0:2, 0:nq], op=nl.add, engine=nisa.engine.vector)
+                    ch["spb"], ch["n"] = spb, 2
+                else:
+                    nisa.tensor_tensor(dst=ch["spb"][:, 0:2, 0:nq], data1=ch["spb"][:, 0:2, 0:nq],
+                                       data2=buf[:, 0:2, 0:nq], op=nl.add, engine=nisa.engine.vector)
+                    ch["n"] += 1
+                if ch["n"] == _SUM_GROUP:
+                    flush_chain()
+            if ti == n_t - 1:
+                if sums["half"] is not None:          # the super-group's last full tile had no partner
+                    qf(sums["half"], 0, _P)
+                    sums["half"] = None
+                if ch["n"]:
+                    flush_chain()
+            return (buf, slot)
         s_ps = _psum((_P, _SG * _P), _S_BANKS[cnt["s"] % len(_S_BANKS)])
         cnt["s"] += 1
-        nisa.nc_matmul(s_ps[0:w, 0:nq], stationary=k_bufs[st][ci][:, nl.ds(t * _P, w)],
-                       moving=q_bufs[st][:, nl.ds(q0, nq)])
+        if _DIAG != "nomm1":
+            nisa.nc_matmul(s_ps[0:w, 0:nq], stationary=k_bufs[st][ci][:, nl.ds(t * _P, w)],
+                           moving=q_bufs[st][:, nl.ds(q0, nq)])
         pt = nl.ndarray(shape=(_P, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf)
-        if (_EXPALT and ti % 2 == 1) or (_DVE_EXP_EVERY and ti % _DVE_EXP_EVERY == _DVE_EXP_EVERY - 1):
+        if _DIAG == "noexp":
+            pt = diag_pt
+        elif (_EXPALT and ti % 2 == 1) or (_DVE_EXP_EVERY and ti % _DVE_EXP_EVERY == _DVE_EXP_EVERY - 1):
             nisa.exponential(dst=pt[0:w, 0:nq], src=s_ps[0:w, 0:nq], max_value=c)
         elif _EXP_RED:
             # LINGBOT_C3_EXP_RED=1 (experiment): the same exp with a (discarded) fused free-dim sum
@@ -284,12 +361,22 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
         nq = min(_SG * _P, seq_q - q0)
         o_ps, sums = sg_state[(hl, sg)][:2]
         w = min(_P, seq_ks[ci] - t * _P)
-        nisa.nc_matmul(o_ps[:, 0:nq], stationary=v_bufs[st][ci][0:w, t, :], moving=pt[0:w, 0:nq],
-                       accumulate=ti != 0)
-        for src, rows in flush_q.pop(item, []):
-            nisa.nc_matmul(sums["ps"][:, 0:nq], stationary=ones_b[0:rows, :], moving=src[0:rows, 0:nq],
-                           accumulate=not sums["first"])
-            sums["first"] = False
+        if _ADD2:
+            buf, slot = pt
+            nisa.nc_matmul(o_ps[:, 0:nq], stationary=v_bufs[st][ci][0:w, t, :], moving=buf[0:w, slot, 0:nq],
+                           accumulate=ti != 0)
+            for b_, j_, rows in flush_q.pop(item, []):
+                nisa.nc_matmul(sums["ps"][:, 0:nq], stationary=ones_b[0:rows, :], moving=b_[0:rows, j_, 0:nq],
+                               accumulate=not sums["first"])
+                sums["first"] = False
+        else:
+            if _DIAG != "nomm2" or ti == 0:
+                nisa.nc_matmul(o_ps[:, 0:nq], stationary=v_bufs[st][ci][0:w, t, :], moving=pt[0:w, 0:nq],
+                               accumulate=ti != 0)
+            for src, rows in flush_q.pop(item, []):
+                nisa.nc_matmul(sums["ps"][:, 0:nq], stationary=ones_b[0:rows, :], moving=src[0:rows, 0:nq],
+                               accumulate=not sums["first"])
+                sums["first"] = False
         if _SUMMODE == "pe":
             if ti == 0:
                 sg_state[(hl, sg)] = sg_state[(hl, sg)] + (_psum((d, _SG * _P), _SUM_BANK),)
