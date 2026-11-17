@@ -27,5 +27,14 @@ LNC2-tuned MX tiles (0), `NEURON_RT_IO_RING_CACHE_SIZE=1024` (0), `LINGBOT_CROSS
 ## Reproduce
 `kubectl create -f lbw-mx-lnc2-4chip-job.yaml` (l-lnc2 claim), or in a dev pod `bash kiro_mx4/e2e.sh <name> <K=V ...>`.
 ## Accuracy
-Gate (`perf/e2e/gate.sh` vs the CPU fp32 rollout `/node-cache/e2e/gate/r480_ex03_s42`, B = Yahav's approved MX LNC1
-config `mx-lnc1-dge-g`): running, see the next commit.
+`perf/e2e/gate.sh` against the CPU fp32 rollout `/node-cache/e2e/gate/r480_ex03_s42`, B = Yahav's approved MX LNC1 config
+(`mx-lnc1-dge-g`), on the 16.54 fps repeat of the 16.53 fps config (`g4_dedup`): **PASS** (`kiro_mx4/gate/verdict_g4_dedup.json`).
+| Check | B (approved MX LNC1) | C (this, 4 chips LNC2) |
+|---|---|---|
+| G0 first 9 frames PSNR vs R | 28.75 dB | 31.54 dB |
+| G0 chunk-0 noise prediction rel-RMS vs R | 0.0396 | 0.0391 |
+| G1 whole-video PSNR vs R | 20.55 dB | 20.51 dB (allowed -0.5) |
+| G2 worst frame vs R | 15.99 dB | 15.50 dB (#75, allowed -1.0) |
+| G3 first-chunk x0 rel-RMS vs R | 0.0673 | 0.0555 |
+Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). This is the MX gate (floor 20 dB); the bf16
+4-device approved base scored 39.4 dB on the first 9 frames.

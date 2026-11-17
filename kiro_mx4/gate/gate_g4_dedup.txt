@@ -1,0 +1,13 @@
+════════ ACCURACY GATE (pixels, vs CPU fp32 reference /node-cache/e2e/gate/r480_ex03_s42) ════════
+  PASS  G0   first 9 frames PSNR vs R: B 28.75 dB, C 31.54 dB (floor 20.0)
+  PASS  G0   forward_c0s0.pt rel-RMS vs R: B 0.0396, C 0.0391 (max 0.05)
+  PASS  G0   sharpness vs R: B 1.000, C 1.000 (min 0.9)
+  PASS  G1   PSNR vs R: C 20.51 dB, B 20.55 dB (allowed -0.5)
+  PASS  G2   worst frame vs R: C 15.50 dB (#75), B 15.99 dB
+        C vs R: max |diff| 255 LSB; PSNR per 12 frames: 29.2 24.5 22.7 23.6 20.5 17.8 15.7
+  PASS  G3   forward c0s0 rel-RMS vs R: C 0.03906, B 0.03959 (allowed x1.3)
+  PASS  G3   forward x0c0 rel-RMS vs R: C 0.05552, B 0.06733 (allowed x1.3)
+  N/A   G4   no fp32 CPU decodes given
+  N/A   D1   no repeat run
+  N/A   D2   no flags-off / main pair
+  VERDICT: PASS  (not covered: G4, D1, D2)
