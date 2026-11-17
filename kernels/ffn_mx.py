@@ -67,8 +67,20 @@ _TUNED_LNC2 = {
     (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=8, ln=5, sr=False, extra={}),
     (1536, 5120): dict(tn=512, bm=8, bn=5, bk=3, lm=8, ln=5, sr=False, extra={}),
 }
+# LNC2 at M=2176 rows (TP4 x CP2 on 2 devices), perf/mx_tile_sweep.py M=2176, best vs default vs bf16 us/call:
+#   qkv 161.7 / 341.8 / 276.1 | ffn.0 283.6 / 781.5 / 647.9 | ffn.2 269.7 / 410.2 / 667.3 | o 125.4 / 149.4 / 301.9
+# (the default tiles lose to bf16 on q/k/v and ffn.0 at this M). LINGBOT_MX_TUNED_M2176=1, selected by the call's rows.
+_TUNED_LNC2_M2176 = {
+    (5120, 1280): dict(tn=1280, bm=8, bn=1, bk=10, lm=4, ln=1, sr=True, extra={"disable_dma_transpose": True}),
+    (5120, 3456): dict(tn=128, bm=16, bn=13, bk=2, lm=8, ln=13, sr=True, extra={"disable_dma_transpose": True}),
+    (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=4, ln=5, sr=True, extra={"disable_dma_transpose": True}),
+    (1536, 5120): dict(tn=512, bm=16, bn=4, bk=3, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
+}
+_TUNED_BY_M = {}
 if LNC == 2:
     _TUNED = _TUNED_LNC2
+    if os.environ.get("LINGBOT_MX_TUNED_M2176", "0") == "1":
+        _TUNED_BY_M[2176] = _TUNED_LNC2_M2176
 _TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1"
 # LINGBOT_MX_TUNED_KEYS="5120x1280,1536x5120": tune only these (K, N) (bisecting in-graph failures)
 _TUNED_KEYS = os.environ.get("LINGBOT_MX_TUNED_KEYS", "")
@@ -77,8 +89,8 @@ if _TUNED_KEYS:
 _TUNED_MM = {}
 
 
-def _tuned_kernel(key):
-    t = _TUNED[key]
+def _tuned_kernel(key, table=None):
+    t = (table or _TUNED)[key]
     kw = dict(TILES_IN_BLOCK_M=t["bm"], TILES_IN_BLOCK_N=t["bn"], TILES_IN_BLOCK_K=t["bk"],
               TILES_IN_LOAD_M=t["lm"], TILES_IN_LOAD_N=t["ln"],
               lhs_matmul_tile_shape_logical=(512, 128), rhs_matmul_tile_shape_logical=(512, t["tn"]),
@@ -99,6 +111,14 @@ _mm_default = mm
 
 
 def mm(x, w_data, w_scales):  # noqa: F811 -- tuned dispatch over the default kernel
+    if _TUNED_ON and int(x.shape[0]) in _TUNED_BY_M:
+        tbl = _TUNED_BY_M[int(x.shape[0])]
+        key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
+        if key in tbl:
+            mk = (int(x.shape[0]),) + key
+            if mk not in _TUNED_MM:
+                _TUNED_MM[mk] = _tuned_kernel(key, tbl)
+            return _TUNED_MM[mk](x, w_data, w_scales)
     if _TUNED_ON:
         key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
         # tuned M blocks (bm x 128 rows) need at least that many rows: smaller calls (the load-time
