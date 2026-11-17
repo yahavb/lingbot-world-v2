@@ -1923,7 +1923,7 @@ requestAnimationFrame(tick);
     <text class="t-s" x="275" y="52" text-anchor="middle">actions</text>
     <rect class="bx-a" x="334" y="20" width="320" height="84" rx="10"/>
     <text class="tk" x="494" y="58" text-anchor="middle">DiT + T5</text>
-    <text class="t-s" x="494" y="84" text-anchor="middle">half a trn3 · 0.554 s per chunk</text>
+    <text class="t-s" x="494" y="84" text-anchor="middle">4 trn3 chips · MXFP8</text>
     <path class="ar" d="M654,62 L756,62"/>
     <text class="t-s" x="705" y="52" text-anchor="middle">chunks</text>
     <rect class="bx-w" x="760" y="20" width="240" height="84" rx="10"/>
@@ -1931,15 +1931,14 @@ requestAnimationFrame(tick);
     <path class="ar-g" d="M880,104 L880,136 L110,136 L110,110"/>
     <text class="t-s c-good" x="495" y="160" text-anchor="middle">frames, as soon as each step decodes</text>
   </svg>
-<div style="width:100%"><div class="stats c2">
+<div style="width:100%"><div class="stats">
   <div class="stat big g"><div class="v">15.2 <small>fps</small></div><div class="l">live stream</div></div>
-  <div class="stat big g"><div class="v">2.05 <small>s</small></div><div class="l">key press to new frames</div></div>
 </div></div>
 </div>
   </div>
   <p class="takeaway" data-step="1"><span class="k">Takeaway</span><span>In a stream, measure what the user waits for: key press to new frames.</span></p>
 </section>
-<div class="nt"><p class="meta">Section 7 · about 2 minutes · 1 click</p><p><b>These numbers, and what they replaced:</b> ~0.58 s per chunk → 0.554 s (DiT, measured server-side); fused VAE on its own deployment → on the same 8 chips (a separate VAE needs more than the 8-chip budget); 17.3 fps → 11.8 fps (8 chips) → 15.2 fps on the current lbw-v2 (4 trn3 chips, MXFP8, VAE inline, streaming, warm, measured 2026-11-17); ~1.07 s → 2.05 s key press to new frames (VAE inline: DiT and VAE run one after the other).</p><p>With the VAE on other chips the chunk period would be about the DiT's 0.55 s: not measured.</p></div></div>
+<div class="nt"><p class="meta">Section 7 · about 2 minutes · 1 click</p><p><b>These numbers, and what they replaced:</b> ~0.58 s per chunk → 0.554 s (DiT, measured server-side); fused VAE on its own deployment → on the same 8 chips (a separate VAE needs more than the 8-chip budget); 17.3 fps → 11.8 fps (8 chips) → 15.2 fps on the current lbw-v2 (4 trn3 chips, MXFP8, VAE inline, streaming, warm, measured 2026-11-17); key press to new frames: see S11d (about 1.1 s with the VAE in its own pod).</p><p>With the VAE on other chips the chunk period would be about the DiT's 0.55 s: not measured.</p></div></div>
 <!-- ═══════════════════════════ S11 · cloud deployment ═══════════════════════════ -->
 <div class="cell" data-ref="S11"><section class="slide divider riv riv-divider">
   <h1>Cloud deployment</h1>
