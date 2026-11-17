@@ -71,9 +71,9 @@ _TUNED_LNC2 = {
 #   qkv 161.7 / 341.8 / 276.1 | ffn.0 283.6 / 781.5 / 647.9 | ffn.2 269.7 / 410.2 / 667.3 | o 125.4 / 149.4 / 301.9
 # (the default tiles lose to bf16 on q/k/v and ffn.0 at this M). LINGBOT_MX_TUNED_M2176=1, selected by the call's rows.
 _TUNED_LNC2_M2176 = {
-    (5120, 1280): dict(tn=1280, bm=8, bn=1, bk=10, lm=4, ln=1, sr=True, extra={"disable_dma_transpose": True}),
-    (5120, 3456): dict(tn=128, bm=16, bn=13, bk=2, lm=8, ln=13, sr=True, extra={"disable_dma_transpose": True}),
-    (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=4, ln=5, sr=True, extra={"disable_dma_transpose": True}),
+    (5120, 1280): dict(tn=1280, bm=8, bn=1, bk=10, lm=4, ln=1, sr=True, extra={}),
+    (5120, 3456): dict(tn=128, bm=16, bn=13, bk=2, lm=8, ln=13, sr=True, extra={}),
+    (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=4, ln=5, sr=True, extra={}),
     (1536, 5120): dict(tn=512, bm=16, bn=4, bk=3, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
 }
 _TUNED_BY_M = {}

@@ -15,8 +15,10 @@ ARGS=(--task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT" --size "${SIZE
 t0=$(date +%s)
 torchrun --nproc_per_node="$NPROC" --master_port=29740 generate.py "${ARGS[@]}" \
   --save_file "$d/out.mp4" --save_latents_path "$d/latents.pt" 2>&1 | grep -avE "AliasingInfo|Mutated inputs|Detected collective" > "$d/gen.log"
+# VAE_LNC=1 VAE_NPROC=16: decode at LNC1 (on 2 devices the LNC2 8-rank 2-D tiling (4 x 2) decodes black frames)
 for i in 1 2; do
-  LINGBOT_SAVE_FRAMES="$d/frames.pt" torchrun --nproc_per_node="${VAE_NPROC:-$NPROC}" --master_port=29740 decode_latents_width_sharded.py \
+  NEURON_LOGICAL_NC_CONFIG="${VAE_LNC:-$NEURON_LOGICAL_NC_CONFIG}" LINGBOT_SAVE_FRAMES="$d/frames.pt" \
+  torchrun --nproc_per_node="${VAE_NPROC:-$NPROC}" --master_port=29740 decode_latents_width_sharded.py \
     --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$d/latents.pt" --save_file "$d/out.mp4" \
     --timing --warmup 2>&1 | grep -avE "AliasingInfo|Mutated inputs" > "$d/dec$i.log"
 done
