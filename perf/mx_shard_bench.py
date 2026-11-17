@@ -50,7 +50,8 @@ for M in (2176, 1088):
                 continue
             for shard_rhs in (True, False):
                 try:
-                    us, y = bench(lambda: mk(shard_rhs, tiles)(x, d, s))
+                    kern = mk(shard_rhs, tiles)
+                    us, y = bench(lambda: kern(x, d, s))
                     ref = y if ref is None else ref
                     rel = ((y.float() - ref.float()).norm() / ref.float().norm()).item()
                     res.append(f"{tiles_tag}/{'N' if shard_rhs else 'M'}-shard {us:6.1f}us(rel {rel:.0e})")
