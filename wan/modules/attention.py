@@ -510,6 +510,9 @@ _CROSS_TPOUT = os.environ.get("LINGBOT_CROSS_TPOUT", "0") == "1"
 _CROSS_QPAD = int(os.environ.get("LINGBOT_CROSS_QPAD", "128"))
 
 
+_CROSS_DEDUP_BF16 = os.environ.get("LINGBOT_CROSS_DEDUP_BF16", "0") == "1"
+
+
 def cross_dedup_bias(k, v, kc):
     """LINGBOT_CROSS_DEDUP: for the first kc rows of the cross-attention K / V ([L, n, d] each), log(m / r) on the r
     rows inside the slice that equal the last row in both K and V (the context's zero padding, m such rows in all), 0
@@ -524,6 +527,13 @@ def cross_attention_dedup(q, k_ndl, v_nld, bias, kc, dtype=torch.bfloat16):
     """LINGBOT_CROSS_DEDUP: [1, Lq, n, d] queries against the first kc keys of the N-major cross cache with the
     per-key log-multiplicity bias (cross_dedup_bias), as fp32 matmuls and softmax in the block graph -> [1, Lq, n, d]."""
     d = int(q.shape[-1])
+    if _CROSS_DEDUP_BF16:
+        # LINGBOT_CROSS_DEDUP_BF16=1 (kiro_mx4): the two matmuls on bf16 operands (the PE's bf16 rate, 4x fp32),
+        # softmax and bias in fp32 on the bf16-rounded logits
+        qh = (q[0] * (1.0 / math.sqrt(d))).to(torch.bfloat16).permute(1, 0, 2)          # [n, Lq, d]
+        lg = torch.matmul(qh, k_ndl[:, :, :kc].to(torch.bfloat16)).float() + bias        # [n, Lq, kc]
+        p_ = torch.softmax(lg, dim=-1).to(torch.bfloat16)
+        return torch.matmul(p_, v_nld[:, :kc].to(torch.bfloat16)).permute(1, 0, 2).unsqueeze(0).to(dtype)
     qh = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2)                         # [n, Lq, d]
     p_ = torch.softmax(torch.matmul(qh, k_ndl[:, :, :kc].float()) + bias, dim=-1)       # [n, Lq, kc]
     return torch.matmul(p_, v_nld[:, :kc].float()).permute(1, 0, 2).unsqueeze(0).to(dtype)
