@@ -27,6 +27,10 @@ spec:
       labels:
         app: lbw-web
     spec:
+      # m5 nodes only: the ALB (target-type ip) serves us-east-2a/2c; trn nodes sit in a
+      # local zone subnet (us-east-2-sbn-1a) it cannot reach (Target.NotInUse)
+      nodeSelector:
+        node-type: m5
       containers:
         - name: app
           image: public.ecr.aws/docker/library/python:3.11-slim
