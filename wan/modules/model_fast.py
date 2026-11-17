@@ -819,6 +819,9 @@ def _ffn_feature_major(ffn, h):
     return r.to(yd).t().unsqueeze(0)
 
 
+_TEMB_SLICE = os.environ.get("LINGBOT_TEMB_SLICE", "0") == "1"
+
+
 def _seq_fp32_sliced(seq, x, slice_bytes=64 << 20):
     """Run an nn.Sequential in fp32 with each Linear's weight cast to fp32 in row slices of
     ~slice_bytes, output columns concatenated. Under the fp32 autocast the whole bf16 weight was
@@ -2310,10 +2313,16 @@ class WanModelFast(ModelMixin, ConfigMixin):
           with torch.amp.autocast('neuron', dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
-            e = _seq_fp32_sliced(self.time_embedding,
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, e_seq)).float())
-            e0 = _seq_fp32_sliced(self.time_projection, e).unflatten(2, (6, self.dim))
+            if _TEMB_SLICE:   # LINGBOT_TEMB_SLICE=1: see _seq_fp32_sliced (LNC1 memory)
+                e = _seq_fp32_sliced(self.time_embedding,
+                    sinusoidal_embedding_1d(self.freq_dim,
+                                            t).unflatten(0, (bt, e_seq)).float())
+                e0 = _seq_fp32_sliced(self.time_projection, e).unflatten(2, (6, self.dim))
+            else:
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim,
+                                            t).unflatten(0, (bt, e_seq)).float())
+                e0 = self.time_projection(e).unflatten(2, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
             e = e.to(device)
             e0 = e0.to(device)

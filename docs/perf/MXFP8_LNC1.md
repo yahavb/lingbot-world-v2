@@ -26,7 +26,7 @@ Gate: `perf/e2e/gate.sh` (validate_gate.py, pixels) vs a CPU fp32 rollout of the
    `matmul_mxfp8` + `quantize_block_mxfp8_kernel`): weights quantized once right after load, bf16
    copies (and `LINGBOT_WT_PRE` transposed copies) freed. Rank-0 device memory after load
    10.27 -> 6.16 GiB.
-2. **Time-embedding fp32 cast** (`_seq_fp32_sliced`, model_fast.py): under the fp32 autocast the
+2. **Time-embedding fp32 cast** (`LINGBOT_TEMB_SLICE=1`, `_seq_fp32_sliced`, model_fast.py): under the fp32 autocast the
    whole `time_projection` weight (5120 x 30720) was cast to fp32 per uncached timestep, a 600 MiB
    allocation (plus 100 MiB for time_embedding). With async launches the freed block could not be
    reused in time (`alloc_deferred -> drain_retry_fail -> oom`, memory snapshot). Now cast in 64 MiB
