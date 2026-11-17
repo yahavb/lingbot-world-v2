@@ -522,6 +522,9 @@ def cte_prep_q(q, dtype=torch.bfloat16):
     return q_c, lq
 
 
+_CTE_QT = os.environ.get("LINGBOT_CTE_QT", "0") == "1"
+
+
 def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, tp_out=False):
     """Unnormalized attention (out, row max, row sum) of one KV chunk -- or of two, with the
     second given as the kernel's prefix-caching prior (k_prior/v_prior, all of it used) -- for
@@ -537,8 +540,15 @@ def cte_partial(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, tp_out=Fals
         lp = int(v_prior.shape[1])
         kw.update(k_prior=k_prior, v_prior=v_prior,
                   prior_used_len=torch.full((1,), lp, dtype=torch.int32, device=q_c.device))
-    o, neg_max, s = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False,
-                                   tp_q=True, tp_k=tp_k, tp_out=tp_out,
+    if _CTE_QT:
+        # LINGBOT_CTE_QT=1: Q handed over d-major [n, d, Lq] (tp_q=False), so the kernel skips its
+        # per-call DMA transpose of Q (attention_cte_lb.py dma_transpose, on the serial path at
+        # call start); the graph's one transpose of the shared Q can run where an engine is idle.
+        q_in, tpq = q_c.transpose(-1, -2).contiguous(), False
+    else:
+        q_in, tpq = q_c, True
+    o, neg_max, s = _attention_cte(q_in, kc, vc, scale=1.0, causal_mask=False,
+                                   tp_q=tpq, tp_k=tp_k, tp_out=tp_out,
                                    cache_softmax=True, skip_output_normalization=True, **kw)
     return o, -neg_max.float(), s.float()
 
