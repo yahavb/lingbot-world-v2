@@ -682,7 +682,17 @@ def _cmax_kernels():
     global _CMAX_KERNELS
     if _CMAX_KERNELS is None:
         from torch_neuronx.nki_hop import wrap_nki
-        if _CMAX_MODE == 2:
+        if _CMAX_MODE == 3:
+            # LINGBOT_CMAX=3: kernels/attention_cmax3.py (512-query P@V, d-major output, (o, s) accumulators)
+            from kernels import attention_cmax3 as cm3
+            _CMAX_KERNELS = {
+                "full1": wrap_nki(cm3.cmax3_full_1),
+                "part1": wrap_nki(cm3.cmax3_part_1),
+                "part2": wrap_nki(cm3.cmax3_part_2),
+                "part3": wrap_nki(cm3.cmax3_part_3),
+                "final1": wrap_nki(cm3.cmax3_final_1),
+            }
+        elif _CMAX_MODE == 2:
             from kernels import attention_cmax2_lb as cm
             _CMAX_KERNELS = {
                 "full1": wrap_nki(cm.cmax2_full_1),
@@ -710,7 +720,7 @@ def _cmax_kernels():
 
 def _cmax_layout(k_blocks, v_token_major):
     """The extra compile-time arguments of the LINGBOT_CMAX=2 kernels (the =1 kernels take plain layouts only)."""
-    if _CMAX_MODE == 2:
+    if _CMAX_MODE in (2, 3):
         return (int(k_blocks), bool(v_token_major))
     assert k_blocks == 1 and not v_token_major, "LINGBOT_CMAX=1 reads plain K / V layouts; use LINGBOT_CMAX=2"
     return ()
@@ -741,11 +751,14 @@ def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=Fals
 
 
 def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False):
-    """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only)."""
+    """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only).
+    LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair."""
     k = _cmax_kernels()
     lay = _cmax_layout(k_blocks, v_token_major)
     if acc is None:
         return k["full1"](q_t, kc, vc, _cmax_arg(offset), *lay)
+    if _CMAX_MODE == 3:
+        return k["final1"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay)       # acc = (o [n, d, Sq], s [n, Sq])
     return k["final1"](q_t, kc, vc, acc, _cmax_arg(offset), *lay)
 
 

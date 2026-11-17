@@ -244,6 +244,8 @@ _ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
 # so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
 _CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
 _CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_CMAX=3: kernels/attention_cmax3.py (512-query P@V, d-major output) instead of attention_cmax2_lb.py
+_CMAX_MODE3 = os.environ.get("LINGBOT_CMAX", "0") == "3"
 # LINGBOT_CMAX_QSPLIT=n (kiro, 4-chip CP4: 1088 queries per rank): the constant-offset calls take at most n query rows
 # each (kernels/attention_cmax2_lb.py runs at most 640, validated at CP8's 544 with pinned PSUM), the query rows split
 # into consecutive pieces that each attend every key: the same softmax per row, more K / V loads.
@@ -1022,6 +1024,11 @@ def _tp_rms_norm(x, weight, eps, full_dim):
 
 
 _QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
+# LINGBOT_QK_POST=1 (LINGBOT_LIN_MX, flat CP with precomputed RoPE grids): the self-attention Q and K projections
+# without their bias, then kernels/qk_post.py: bias + sum of squares (one kernel), ONE TP all-reduce for both rows'
+# sums, bias + RMSNorm + RoPE (one kernel). Replaces two all-reduces and the compiler's elementwise chain, which the
+# 2-chip block profile showed serialized between the q/k/v kernels (~0.5 ms, no engine above 45% busy).
+_QK_POST = os.environ.get("LINGBOT_QK_POST", "0") == "1"
 # LINGBOT_QKV_FUSED=1: self-attention Q, K, V as ONE matmul on a [Wq; Wk; Wv] buffer (q/k/v
 # weights become views into it, no extra memory). The block profile charged ~0.3 ms of compiler
 # transposes to EACH of the three projections of the same all-gathered input.
@@ -1538,7 +1545,17 @@ class CausalWanSelfAttention(nn.Module):
                     and kv_chunks[0][-1].dim() == 3 and not _KV_GATHER1
                     and not self._const_max_here() and not self._fa2_here())
         _vg_early = [None]
-        q, k, v = qkv_fn(x)
+        # LINGBOT_QK_POST: MX q/k without bias, then bias + TP RMSNorm + RoPE in two NKI kernels (kernels/qk_post.py)
+        _qkp = (_QK_POST and getattr(self, 'tp_enabled', False) and self.qk_norm and sp_enabled
+                and _SEQ_MODE == "cp" and x.shape[0] == 1 and rope_grids is not None and rope_grids[0] is not None
+                and getattr(self.q, "_mxq_data", None) is not None and getattr(self.k, "_mxq_data", None) is not None
+                and not (_Q_FIRST or _QKV_XT or _KV_FIRST or _QK_AR1 or _v_early)
+                and not (_KV_REAL and _REAL_TOKENS[0] is not None and _REAL_TOKENS[0] < x.shape[1])
+                and not (_COMMIT_Q_FIRST and kv_write and getattr(self, 'use_cmax', False)))
+        if _qkp:
+            q, k, v = self._qkv_post(x, rope_grids, rope_local_grid if rope_local_grid is not None else grid_sizes)
+        else:
+            q, k, v = qkv_fn(x)
 
         if frame_seqlen is None:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
@@ -1576,7 +1593,9 @@ class CausalWanSelfAttention(nn.Module):
         else:
             rope_grid = grid_sizes
 
-        if rope_grids is not None and rope_grids[0] is not None:
+        if _qkp:
+            roped_query, roped_key = q, k                   # LINGBOT_QK_POST: rotated in kernels/qk_post.py
+        elif rope_grids is not None and rope_grids[0] is not None:
             # Precomputed by WanModelFast.forward. Pure tensor math from here, so
             # this traces under fullgraph=True; building the grids in-block does
             # not (data-dependent start_frame -> unbacked symint).
@@ -1843,7 +1862,11 @@ class CausalWanSelfAttention(nn.Module):
                         if acc is not None and "acc" in _DIAG_BUFS:
                             _DIAG_BUFS["acc"].copy_(acc)
                         _DIAG_BUFS["o_n"].copy_(o_n)
-                    x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)              # [1, Lq, n, d]
+                    if _CMAX_MODE3:
+                        assert len(q_ps) == 1 and not _CMAX_GUARD, "LINGBOT_CMAX=3: no QSPLIT / GUARD"
+                        x = o_n[:, :, :lq].permute(2, 0, 1).unsqueeze(0)       # [n, d, Lq_p] -> [1, Lq, n, d]
+                    else:
+                        x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)          # [1, Lq, n, d]
                     out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                     if return_cache and not getattr(self, 'tp_enabled', False):
                         return out, kd, vd
@@ -2167,6 +2190,36 @@ class CausalWanSelfAttention(nn.Module):
             # the compiled graph may drop or re-allocate the write.
             return out, kv_cache["k"], kv_cache["v"]
         return out
+
+    def _qkv_post(self, x, rope_grids, lg):
+        """LINGBOT_QK_POST: q, k (normalized and rotated) and v for x [1, s, C] -> each [1, s, n, d]."""
+        from kernels import ffn_mx, qk_post
+        b, s = x.shape[:2]
+        n, d = self.num_heads, self.head_dim
+        x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16).contiguous()
+        qr = ffn_mx.mm(x2, self.q._mxq_data, self.q._mxq_scales)        # [s, F] bf16, no bias
+        kr = ffn_mx.mm(x2, self.k._mxq_data, self.k._mxq_scales)
+        v = self.v(x).view(b, s, n, d)
+        F = int(qr.shape[1])
+
+        def _row(t):
+            return (t if t is not None else torch.zeros(F, device=x.device)).reshape(1, F).to(torch.bfloat16)
+
+        bq, bk = _row(self.q.bias), _row(self.k.bias)
+        ss = qk_post.qk_ss(qr, kr, bq, bk)                                 # [s, 2] fp32, this rank's features
+        ss = tp.all_reduce_fn(ss, "tp")
+        _cos, _sin = rope_grids
+        _g = lg.tolist() if torch.is_tensor(lg) else lg
+        seq = int(_g[0][0]) * int(_g[0][1]) * int(_g[0][2])
+        c = int(_cos[0].shape[-1])
+        cos2 = _cos[0].reshape(seq, c).float()
+        sin2 = _sin[0].reshape(seq, c).float()
+        if seq < s:     # rows past the real tokens: identity rotation, as causal_rope_apply_rotation leaves them
+            cos2 = torch_F.pad(cos2, (0, 0, 0, s - seq), value=1.0)
+            sin2 = torch_F.pad(sin2, (0, 0, 0, s - seq), value=0.0)
+        q, k = qk_post.qk_norm_rope(qr, kr, bq, bk, ss, _row(self.norm_q.weight), _row(self.norm_k.weight),
+                                    cos2.contiguous(), sin2.contiguous(), 1.0 / float(self.dim), float(self.eps))
+        return q.view(b, s, n, d), k.view(b, s, n, d), v
 
     def _out_proj_fmaj(self, xt):
         """LINGBOT_ATTN_FMAJ: o-projection of the d-major attention output xt [n, d, L] (L = the
