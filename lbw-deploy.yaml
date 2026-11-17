@@ -1,6 +1,8 @@
 # lbw-v2-dit-t5 on 4 trn3 devices at LNC2 (l-lnc2, 16 ranks, TP4 x CP4, 480x768), DiT + T5 + VAE in
 # one pod (no VAE_URL). DiT block Linears in MXFP8 (K=1280 ones bf16), K/V tile DMA descriptors on the
-# Sync engine (LINGBOT_CTE_KV_DGE=hwdge_sync); the rest = the ledger flags of the 4-device 13.5 fps run.
+# Sync engine (LINGBOT_CTE_KV_DGE=hwdge_sync), plus the kiro_mx4 16 fps flags (kiro_mx4/RESULTS.md: MX_FAST_DMA,
+# all 12 Linears MX, CTE_CHAIN, V_TOKEN_MAJOR, CTE_QPAD=32, CROSS_DEDUP=128, POST_LEAN KV_REUSE START_OVERLAP=4
+# FILM_SHARD SCHED_FUSE GC_OFF); the rest = the ledger flags of the 4-device 13.5 fps run.
 # Same Deployment/Service names as the other lbw-v2-dit-t5 files: apply one at a time. Serves at
 # 12.9 fps steady through the service (measured 2026-11-17, perf: docs/perf/MXFP8_LNC1.md).
 # DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
@@ -244,8 +246,30 @@ spec:
             - name: LINGBOT_LIN_MX
               value: "1"
             - name: LINGBOT_LIN_MX_SKIP
-              value: "self_attn.o:cross_attn.o:cam_injector_layer2"
+              value: ""
             - name: LINGBOT_MX_TUNED
+              value: "1"
+            - name: LINGBOT_MX_FAST_DMA
+              value: "1"
+            - name: LINGBOT_CTE_CHAIN
+              value: "1"
+            - name: LINGBOT_V_TOKEN_MAJOR
+              value: "1"
+            - name: LINGBOT_CTE_QPAD
+              value: "32"
+            - name: LINGBOT_CROSS_DEDUP
+              value: "128"
+            - name: LINGBOT_POST_LEAN
+              value: "1"
+            - name: LINGBOT_KV_REUSE
+              value: "1"
+            - name: LINGBOT_START_OVERLAP
+              value: "4"
+            - name: LINGBOT_FILM_SHARD
+              value: "1"
+            - name: LINGBOT_SCHED_FUSE
+              value: "1"
+            - name: LINGBOT_GC_OFF
               value: "1"
             - name: LINGBOT_CTE_KV_DGE
               value: "hwdge_sync"
