@@ -8,7 +8,7 @@ node .137 devices 4-7, torch-neuronx 2.14.3 / SDK 2.33. Every number: `kiro_mx4/
 | + MX loads by direct-pattern DMA transpose, MX on all 12 block Linears | 4 | 4736.2 | 630 | 15.09 |
 | + chained CTE attention calls, token-major V, queries padded to 32 | 4 | 4407.3 | 631 | 16.08 |
 | **+ cross-attention over the 128 distinct context rows (`CROSS_DEDUP=128`)** | 4 | **4270.9** | 630 | **16.53** |
-| + trn2 start/pipeline flags (pending: pass 2 was 6.8 s) | 4 | 4160.0 | 630 | 16.91 |
+| **+ trn2 start/pipeline flags (`POST_LEAN KV_REUSE START_OVERLAP=4 FILM_SHARD SCHED_FUSE GC_OFF`), 5 passes, gate PASS** | 4 | **4166.9** | 630 | **16.89** |
 | same flags, TP4 x CP2 | 2 | 7362.4 | 1173 | 9.49 |
 Decoding at LNC1 (32 ranks, same devices) takes 557-566 ms instead of 630 (+0.4 fps), not counted above: the serving
 path decodes inline at the DiT's LNC.
