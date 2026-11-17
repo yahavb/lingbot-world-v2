@@ -343,7 +343,7 @@ pair("S4e", "Wan2.2 VAE; for LingBot the result is the opposite",
       ("table", '<table class="tbl big"><thead><tr><th>VAE</th><th class="r">Run time</th><th class="r">vs fp32 decode</th></tr></thead><tbody>'
                 '<tr class="bad"><td>Eager, upstream decoder (per conv)</td><td class="r">2.03 s</td><td class="r">56.3 dB</td></tr>'
                 '<tr><td>Whole decoder blocks compiled</td><td class="r">1.38 s</td><td class="r">56.3 dB</td></tr>'
-                '<tr class="win"><td><b>+ bf16, -O1, 2-D tiles, 6 frames per step</b></td><td class="r"><b>0.41 s</b></td><td class="r">52.7 dB</td></tr>'
+                '<tr class="win"><td><b>+ bf16, each core decodes one tile, 6 frames per call</b></td><td class="r"><b>0.41 s</b></td><td class="r">52.7 dB</td></tr>'
                 '</tbody></table>'),
       ("code", 0, code_panel("One graph per decoder block", "wan/modules/vae2_1_fused.py", 325,
                              ['return torch.compile(fn, backend="neuron", dynamic=False, fullgraph=True)'])),
@@ -518,7 +518,7 @@ pair("B4h", "64 ranks on trn2",
                         dict(label="Whole blocks compiled", v=1.38, text="1.38 s", bar="bar", t="t-v", extra=[(1010, "56.3 dB", "t-v")]),
                         dict(label="bf16 convolutions", v=0.86, text="0.86 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
                         dict(label="-O1, norm as a matmul", v=0.65, text="0.65 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
-                        dict(label="2-D tiles", v=0.46, text="0.46 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
+                        dict(label="tile per core", v=0.46, text="0.46 s", bar="bar", t="t-v", extra=[(1010, "52.7 dB", "t-v")]),
                         dict(label="6 frames per step", v=0.41, text="0.41 s", bar="bar-g", t="t-g", extra=[(1010, "52.7 dB", "t-g")])],
                        maxw=480, rowh=56))],
      ["64 ranks trn2 → 32 ranks trn3", "3.01 / 1.36 / 0.80 / 0.55 / 0.33 / 0.31 s → 2.03 / 1.38 / 0.86 / 0.65 / 0.46 / 0.41 s",
@@ -862,6 +862,7 @@ full_cells.insert(_refs.index("S5a"), _c)
 
 # No "idea" wording on the slides (kickers, divider labels, "→ Idea N:" pointers, titles). Notes untouched.
 NO_IDEA = [(r'(<p class="kicker">)Idea \d+ · ', r'\1'),
+           (r'after more tuning: bf16 convolutions, 2-D tiles', 'after more tuning: bf16 convolutions, one tile per core'),
            (r'\s*<p class="sec-k">Idea</p>', ''),
            (r'→ Ideas? \d+(?: and \d+)?: (\w)', lambda m: '→ ' + m.group(1).upper()),
            (r' — (?:both are|that is) idea \d\.', '.'),
