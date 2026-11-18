@@ -304,6 +304,41 @@ _NKI_HALO = os.environ.get("LINGBOT_VAE_NKI_HALO", "0") == "1"
 _NKI_HALO_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_HALO_CMAX", "128"))
 if _NKI_HALO:
     from kernels.vae_norm_halo import norm_halo as _nki_norm_halo
+# LINGBOT_VAE_NKI_HEAD=1 (with LINGBOT_VAE_NKI_HALO and LINGBOT_VAE_HEAD_BF16): the output conv (96 -> 3, causal 3x3x3)
+# as kernels/vae_head_conv.py on the halo kernel's buffer: each tap one matmul with the [96, 3] tap weight stationary
+# and an offset slice of the SBUF band as the moving operand (flat-shift over the padded width), 27 taps accumulating
+# in PSUM. One core, stage-3 shape: 1098 us vs 1636 for the compiler's conv, bit-identical (perf/vae_head_bench.py
+# VARIANT=nki; for a 96 -> 96 conv it is 1198 vs 1133 us, so only the head uses it).
+_NKI_HEAD = os.environ.get("LINGBOT_VAE_NKI_HEAD", "0") == "1"
+if _NKI_HEAD:
+    from kernels.vae_head_conv import head_conv as _nki_head_conv, head_conv_weights as _nki_head_conv_w
+# LINGBOT_VAE_NKI_CONV=head|all (with LINGBOT_VAE_NKI_HALO; takes precedence over LINGBOT_VAE_NKI_HEAD): the head's
+# conv (head) or every conv LINGBOT_VAE_NKI_HALO feeds (all: + the stage-3 ResidualBlocks) as one NKI kernel with its
+# norm, halo and cache, kernels/vae_norm_halo_conv.py: the tile in bands of rows, each band normalized in SBUF and
+# convolved from SBUF, so the conv input never goes through HBM and the compiler's conv is replaced by flat-shift
+# matmuls (kernels/vae_head_conv.py). Kernel options (LINGBOT_VAE_NKI_CONV_SQ / _EDGE / _LA / _R) in the kernel's
+# docstring. One core, stage-3 shape (perf/vae_head_bench.py VARIANT=fused, vs the LINGBOT_VAE_NKI_HALO path):
+#   head (96 -> 3):            2941 -> 1683 us (bit-identical conv and cache), + SQ=bf16 1614
+#   96 -> 96 conv unit:        1828 -> 1705 us (bit-identical), + SQ=bf16 1580
+#   stage-3 ResidualBlock:     3497 -> 3136 us (perf/vae_rb_bench.py), + SQ=bf16 2956, + RES 2931
+# (EDGE=copy: another -50..-100 us per conv in the benches, but it broke the decode's accuracy: see the kernel.)
+# SQ=bf16 (bf16 squares + one-pass ones-matmul) moves ~2% of the normalized values by one bf16 ulp; the decode's
+# vs_R stays 52.87 dB. Decode (2-chip LNC1 16 ranks, T=1, HEAD_BF16, -O1 unet-inference, NKI_HALO): 647 / 645 ms
+# (start / end) -> NKI_HEAD=1 624, NKI_CONV=head 616, =all 602-607, =all + SQ=bf16 + LA=1 587 (52.87 dB).
+# LINGBOT_VAE_NKI_CONV_CMAX=c (with =all): also the ResidualBlock convs of up to c in / out channels (default 128;
+# 192 adds the stage-2 ResidualBlocks, whose norm is otherwise the compiled torch form). Not useful: stage-2
+# ResidualBlock 2845 (torch path) -> 2879 us; the fused conv unit there is 1470 vs 1532 for halo kernel + conv.
+_NKI_CONV = os.environ.get("LINGBOT_VAE_NKI_CONV", "0")
+assert _NKI_CONV in ("0", "head", "all"), _NKI_CONV
+_NKI_CONV_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_CMAX", "128"))
+# LINGBOT_VAE_NKI_CONV_RES=1 (with =all): the ResidualBlock's shortcut add (y + h) in the second conv's kernel, on
+# the PSUM evacuation (bf16 conv output + bf16 h, rounded once more, as torch's bf16 add). Bit-identical
+# (perf/vae_head_bench.py VARIANT=rbres), stage-3 ResidualBlock -27..-34 us; decode neutral (587-589 vs 587 ms with
+# NKI_CONV=all SQ=bf16 LA=1, 52.87 dB), so not in the best flag set.
+_NKI_CONV_RES = os.environ.get("LINGBOT_VAE_NKI_CONV_RES", "0") == "1"
+if _NKI_CONV != "0":
+    from kernels.vae_norm_halo_conv import norm_halo_conv as _nki_norm_halo_conv
+    from kernels.vae_head_conv import head_conv_weights as _nki_conv_w
 
 
 def _raw_edges_2d(x, sel):
@@ -325,16 +360,35 @@ def _raw_edges_2d(x, sel):
 
 
 def _use_nh(x, w):
+    if _NKI_CONV == "all" and _NKI_HALO and _TWO_D and w.dtype == torch.bfloat16 and x.shape[0] == 1 and \
+            max(x.shape[1], w.shape[0]) <= _NKI_CONV_CMAX:
+        return True
     return _NKI_HALO and _TWO_D and w.dtype == torch.bfloat16 and x.shape[0] == 1 and x.shape[1] <= _NKI_HALO_CMAX
 
 
-def _nh_conv(x, cache, gamma, scale, w, b, sel):
-    """_cconv(_halo(_norm_silu(x, gamma, scale, bf16), sel), cache, w, b) via kernels/vae_norm_halo.py."""
+def _nh_fused(x, w, b, head=False):
+    """Does _nh_conv take kernels/vae_norm_halo_conv.py (LINGBOT_VAE_NKI_CONV)?"""
+    return (_NKI_CONV == "all" or (_NKI_CONV == "head" and head)) and b is not None and \
+        max(x.shape[1], w.shape[0]) <= max(_NKI_CONV_CMAX, 128)
+
+
+def _nh_conv(x, cache, gamma, scale, w, b, sel, nki_conv=False, head=False, res=None):
+    """_cconv(_halo(_norm_silu(x, gamma, scale, bf16), sel), cache, w, b) via kernels/vae_norm_halo.py; nki_conv: the
+    conv as kernels/vae_head_conv.py (LINGBOT_VAE_NKI_HEAD)."""
     xb = x.to(torch.bfloat16)
     l, r, u, d = _raw_edges_2d(xb, sel)
     c = x.shape[1]
+    if _nh_fused(x, w, b, head):
+        y, nc = _nki_norm_halo_conv(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
+                                    gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1),
+                                    None if res is None else res[0])
+        return y.unsqueeze(0), nc.unsqueeze(0)
     buf = _nki_norm_halo(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
-                         gamma.float().reshape(c, 1) * scale).unsqueeze(0)
+                         gamma.float().reshape(c, 1) * scale)
+    if nki_conv:
+        y = _nki_head_conv(buf, _nki_head_conv_w(w), b.float().reshape(-1, 1))
+        return y.unsqueeze(0), buf[:, -2:].unsqueeze(0)
+    buf = buf.unsqueeze(0)
     return F.conv3d(buf, w, b), buf[:, :, -2:]
 
 
@@ -359,6 +413,9 @@ def _res_unit(x, c1, c2, g1, s1, w1, b1, g2, s2, w2, b2, wsc, bsc, sel):
         y = _norm_silu(x, g1, s1, w1.dtype)
         y, c1 = _cconv(_halo(y, sel), c1, w1, b1)
     if _use_nh(y, w2):
+        if _NKI_CONV_RES and _nh_fused(y, w2, b2) and h.dtype == torch.bfloat16 and h.shape[1] == w2.shape[0]:
+            y, c2 = _nh_conv(y, c2, g2, s2, w2, b2, sel, res=h)
+            return y, c1, c2
         y, c2 = _nh_conv(y, c2, g2, s2, w2, b2, sel)
     else:
         y = _norm_silu(y, g2, s2, w2.dtype)
@@ -451,7 +508,8 @@ def _up3d_unit(x, cache_t, wt, bt, w2, b2, sel):
 
 def _head_unit(x, cache, g, s, w, b, sel):
     if _use_nh(x, w):
-        return _nh_conv(x, cache, g, s, w, b, sel)
+        return _nh_conv(x, cache, g, s, w, b, sel, nki_conv=_NKI_HEAD and b is not None and w.shape[0] <= 128,
+                        head=True)
     return _cconv(_halo(_norm_silu(x, g, s, w.dtype), sel), cache, w, b)
 
 
