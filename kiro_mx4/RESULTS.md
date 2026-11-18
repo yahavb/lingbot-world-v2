@@ -47,8 +47,30 @@ so from that step on the 1080 tokens per CP rank pad to 1152 (`LINGBOT_TOKEN_PAD
 | Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
 |---|---|---|---|---|---|
 | u0 | `flags_2chip.txt` (the 16.89 fps GEN flags), today's decode | 4134.1 | 353 | 18.05 | PASS (G1 21.03, G2 15.76) |
-| **u_full2** | **+ every 2-chip GEN flag (`flags_2chip_best.txt`, t28 set) + `TOKEN_PAD=128 CTE_QPAD=128`** | **2947.6** | **342** | **24.62** | **PASS** (G1 21.01, G2 16.32, c0s0 0.0408) |
-Cumulative steps (u1 .. u8) are being measured.
+| u1 | + `MX_RP_POST` (2-chip rp1) | 3794.1 | 350 | 19.55 | FAIL (G1 19.94, G2 14.64) |
+| u2 | + `FFN_EPI FFN_UP_PAD QK_POST` (h1; its `M2176_DEFAULT` tiles do not apply at M=1088) | 3599.4 | 344 | 20.54 | PASS (G1 20.43) |
+| u3 | + `CMAX=3` (k1) + `TOKEN_PAD=128 CTE_QPAD=128` | 3388.7 | 342 | 21.71 | FAIL (G1 19.73, G2 14.16) |
+| u4 | + `C3_SUMMODE=pef C3_SUMGROUP=16 C3_DEPTH=4 VBIAS_FOLD QK_POST_T` (p1, r1) | 3106.8 | 357 | 23.38 | PASS (G1 20.32) |
+| u5 | + `FILM_ALL` (r5) | 3067.6 | 352 | 23.69 | FAIL (G1 19.50) |
+| u6 | + `BLOCK_GROUP=8` (r9) | 3041.8 | 344 | 23.92 | FAIL (G1 18.74) |
+| u7 | + `FILM_TPFREE CROSS_TPFREE` (t1, t2) | 2989.0 | 353 | 24.24 | PASS (G1 20.46) |
+| u8 | + `HOT_HEADS=default MX_QKV_FUSED MX_NSHARD=5120x3840 FILM_ALL_CHUNKS=7 MX_TUNED_M544` (t3, t5) | 2968.5 | 352 | 24.39 | PASS (G1 20.64) |
+| **u_full2** | **+ `C3_DEPTH=3 RESIDUAL_BF16 COMMIT_KV_ONLY` (t8, t14, t22) = every 2-chip GEN flag** | **2947.6** | **342** | **24.62** | **PASS** (G1 21.01, G2 16.32, c0s0 0.0408) |
+GEN 4134.1 -> 2947.6 ms (-28.7%). The gate flips at intermediate steps (as it did at 2 chips: small numeric changes
+move G1 by ~1 dB); the final set passes above B. The decode ladder (same 4 devices, LNC1 32 ranks, one process of 6
+scored decodes per step, fastest shown; perf/vae_repeat_check.sh VNPROC=32):
+| Step | Decode flags | VAE (ms) | vs R |
+|---|---|---|---|
+| v0 | env default (`VAE_T=6`) | 558 | 52.76 dB |
+| v1 | `VAE_T=1` | 555 | 52.76 dB |
+| v2 | + `VAE_HEAD_BF16`, `-O1 --model-type=unet-inference` | 485 | 52.87 dB |
+| v3 | + `VAE_NKI_HALO` | 481 | 52.87 dB |
+| v4 | + `VAE_NKI_CONV=all SQ=bf16 CMAX=192 LA=0` | 458 | 52.88 dB |
+| v5 | + `VAE_NKI_UP=all UP_FOLD` | 445 | 52.87 dB |
+| v6 | + `VAE_LOW_T=20` | 404 | 52.87 dB |
+| v7 | + `VAE_T=3` (24 decodes, none with a frame below 50 dB) | 341 | 52.87 dB |
+4 chips before the 2-chip work, measured today: GEN 4134.1 + decode 558 = 17.26 fps (16.89 with the LNC2 decode in
+the table above); after: 24.62 fps (+43%).
 
 # 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks): 16.16 fps, gate PASS (t28)
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
