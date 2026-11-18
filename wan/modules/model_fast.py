@@ -1091,6 +1091,10 @@ _FFN_UP_PAD = os.environ.get("LINGBOT_FFN_UP_PAD", "0") == "1"
 # (before MX quantization), so the kernel's LayerNorm has none. The 2-chip block profile had these chains at
 # 110-190 us each between the collectives (~0.55 ms per block), latency-bound compiler ops.
 _GLUE = os.environ.get("LINGBOT_GLUE", "0") == "1"
+# LINGBOT_GLUE_LN1=0 (with LINGBOT_GLUE): norm1 + modulation stays the compiler's ops (the post-attention residual /
+# FiLM / LayerNorm steps keep the kernels). bb_gl: the ln_mod kernel moved the pre-attention schedule and opened a
+# 95 us idle window before the attention, cancelling the ~18 us each post-attention glue kernel saved.
+_GLUE_LN1 = os.environ.get("LINGBOT_GLUE_LN1", "1") == "1"
 _MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").replace(":", ",").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
@@ -2635,6 +2639,7 @@ class CausalWanAttentionBlock(nn.Module):
                 # LINGBOT_GLUE: kernels/glue.py for the residual / modulation / LayerNorm steps
                 from kernels import glue as _gl
                 _ev = [t_.reshape(1, _C).float() for t_ in e]
+            if _glue and _GLUE_LN1:
                 h = _gl.ln_mod(xs[0], (1.0 + _ev[1]).contiguous(), _ev[0].contiguous()).unsqueeze(0)
             else:
                 h = self.norm1(xs).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
