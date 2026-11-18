@@ -504,6 +504,10 @@ def _films_multi(raw_blocks, c_cat, K, P):
 
 
 _BLOCK_GROUP = int(os.environ.get("LINGBOT_BLOCK_GROUP", "1") or 1)
+# LINGBOT_COMMIT_KV_ONLY=1 (LINGBOT_BLOCK_GROUP, SP): in a KV-cache commit forward (skip_head: the output is
+# discarded) the last block stops after writing its K / V: its attention, o-projection, cross-attention and FFN
+# only fed the skipped head (dead code once the block returns its input).
+_COMMIT_KV_ONLY = os.environ.get("LINGBOT_COMMIT_KV_ONLY", "0") == "1"
 
 
 class _BlockGroup(nn.Module):
@@ -515,8 +519,12 @@ class _BlockGroup(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
     def forward(self, x, kvcs, crosses, films, kw):
+        kv_only_last = bool(kw.get("kv_only_last", False))
         for j, blk in enumerate(self.blocks):
             kwj = dict(kw)
+            kwj.pop("kv_only_last", None)
+            if kv_only_last and j == len(self.blocks) - 1:
+                kwj["kv_only"] = True               # LINGBOT_COMMIT_KV_ONLY
             if films is not None:
                 kwj["dit_cond_dict"] = {"cam_film": films[j]}
             x = blk(x, kv_cache=None, kv_chunks=kvcs[j], crossattn_cache=crosses[j],
@@ -1253,6 +1261,12 @@ _FFN_EPI = os.environ.get("LINGBOT_FFN_EPI", "0") == "1"
 # up projection writes the padded activation itself. perf/mx_tile_sweep.py FAST=1 M=2176: (5120, 3584) default tiles
 # 208-216 us vs (5120, 3456) tuned 252 us.
 _FFN_UP_PAD = os.environ.get("LINGBOT_FFN_UP_PAD", "0") == "1"
+# LINGBOT_FFN_TP2=1 (SP, FFN_MX, RP_POST, TP 4): the FFN tensor-parallel over PAIRS of TP ranks (the "tpl" mesh of
+# tensor_parallel): each rank holds half of the hidden features (6912, the TP4 shards of its pair gathered at load),
+# all-gathers the normed tokens of its pair only (2 x 544 rows) and reduce-scatters its partial sums over the pair.
+# The same FLOPs per rank; the all-gather receives 5.6 instead of 16.7 MB and the reduce-scatter sends a half instead
+# of three quarters of 11 instead of 22 MB (block profile: ~50 + ~52 us of idle engines per block at the two).
+_FFN_TP2 = os.environ.get("LINGBOT_FFN_TP2", "0") == "1"
 # LINGBOT_GLUE=1 (LINGBOT_SP, LINGBOT_LIN_MX): the block's residual / gate / camera FiLM / LayerNorm / modulation steps
 # on the token shard as kernels/glue.py NKI kernels; norm3's affine is folded into cross_attn.q's weight and bias
 # (before MX quantization), so the kernel's LayerNorm has none. The 2-chip block profile had these chains at
@@ -1456,6 +1470,40 @@ def _prequantize_linears_mx(blocks):
           if _MX_RP_POST in ("1", "fp32") else ""))
 
 
+def _ffn_tp2_weights(blocks):
+    """LINGBOT_FFN_TP2 (eager, once, at load, before _prequantize_ffn_mx): each block's ffn.0 / ffn.2 rebuilt with half of
+    the hidden features (member m = TP rank % 2 of its pair holds features [m * H/2, (m + 1) * H/2)), gathered from the
+    TP4 shards; ffn.2's full bias goes to _bias_full (added once after the pair's reduce-scatter)."""
+    m4 = tp.mesh_submesh("tp")
+    assert m4 is not None and tp.mesh_submesh("tpl") is not None, "LINGBOT_FFN_TP2 needs the TP and pair meshes"
+    mem = tp.tp_rank(_TP_GROUP) % 2
+    for blk in blocks:
+        ffn = getattr(blk, "_orig_mod", blk).ffn
+        if getattr(ffn, "_tp2", False):
+            continue
+        l0, l2 = ffn[0], ffn[2]
+        with torch.no_grad():
+            w0 = fc.all_gather_tensor(l0.weight.contiguous(), 0, m4) + 0              # [H, C]
+            b0 = fc.all_gather_tensor(l0.bias.contiguous(), 0, m4) + 0 if l0.bias is not None else None
+            w2t = fc.all_gather_tensor(l2.weight.t().contiguous(), 0, m4) + 0         # [H, C] (= W2^T)
+            b2 = (tp.all_reduce_fn(l2.bias.float().contiguous(), "tp") + 0).to(l2.bias.dtype) \
+                if l2.bias is not None else None
+            hh = int(w0.shape[0]) // 2
+            n0 = nn.Linear(int(w0.shape[1]), hh, bias=b0 is not None, device=w0.device, dtype=w0.dtype)
+            n0.weight = nn.Parameter(w0[mem * hh:(mem + 1) * hh].contiguous(), requires_grad=False)
+            if b0 is not None:
+                n0.bias = nn.Parameter(b0[mem * hh:(mem + 1) * hh].contiguous(), requires_grad=False)
+            n2 = nn.Linear(hh, int(w2t.shape[1]), bias=b2 is not None, device=w0.device, dtype=w0.dtype)
+            n2.weight = nn.Parameter(w2t[mem * hh:(mem + 1) * hh].t().contiguous(), requires_grad=False)
+            if b2 is not None:
+                n2.bias = nn.Parameter(torch.zeros_like(b2), requires_grad=False)
+                n2.register_buffer("_bias_full", b2.contiguous(), persistent=False)
+            del w0, w2t
+        ffn[0], ffn[2] = n0, n2
+        ffn._tp2 = True
+    torch.neuron.synchronize()
+
+
 def _prequantize_ffn_mx(blocks):
     from kernels import ffn_mx
     for i, blk in enumerate(blocks):
@@ -1509,8 +1557,9 @@ def _prequantize_ffn_mx(blocks):
     _q(f"[model_fast] LINGBOT_FFN_MX: quantized the FFN weights of {len(blocks)} blocks; bf16 copies freed")
 
 
-def _ffn_mx(ffn, hf):
-    """SP FFN on MXFP8 matmuls: hf [1, M, C] all-gathered -> [1, M, C] partial sums (+ bias)."""
+def _ffn_mx(ffn, hf, mesh="tp"):
+    """SP FFN on MXFP8 matmuls: hf [1, M, C] all-gathered -> [1, M, C] partial sums (+ bias). mesh: the submesh of the
+    reduce-scatter (LINGBOT_FFN_TP2: "tpl", the TP pairs)."""
     from kernels import ffn_mx
     x = hf[0]
     u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)      # [M, N] (N padded under LINGBOT_FFN_UP_PAD)
@@ -1531,7 +1580,7 @@ def _ffn_mx(ffn, hf):
         # LINGBOT_MX_RP_POST: no bias in the partial sums; reduce-scatter here, full bias on this rank's shard
         if _MX_RP_POST == "fp32":
             y = y.float()
-        r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh("tp"))
+        r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh(mesh))
         return (r.float() + ffn[2]._bias_full.float()).unsqueeze(0)
     if ffn[2].bias is not None:
         y = y + ffn[2].bias
@@ -2830,6 +2879,7 @@ class CausalWanAttentionBlock(nn.Module):
         grid_ints=None,
         fused=None,
         kv_write=True,
+        kv_only=False,
     ):
         r"""
         Args:
@@ -2874,6 +2924,8 @@ class CausalWanAttentionBlock(nn.Module):
                 kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
                 kv_current_end=kv_current_end, kv_chunks=kv_chunks,
                 grid_ints=grid_ints, _sp_scatter=True, fused=fused, kv_write=kv_write)
+            if kv_only:
+                return xs                           # LINGBOT_COMMIT_KV_ONLY: the cache writes are all this block owes
             if _glue:
                 cam_scale, cam_shift = dit_cond_dict["cam_film"]
                 xs2, h3 = _gl.res_film_ln(xs[0], y[0].contiguous(), _ev[2].contiguous(), cam_scale[0].contiguous(),
@@ -2905,7 +2957,8 @@ class CausalWanAttentionBlock(nn.Module):
                 h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
                     self.ffn[0].weight.dtype)
             if _FFN_MX and getattr(self.ffn[2], "_bias_full", None) is not None:
-                y = _ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")).to(h.dtype)   # LINGBOT_MX_RP_POST
+                _fm = "tpl" if getattr(self.ffn, "_tp2", False) else "tp"           # LINGBOT_FFN_TP2: pairs
+                y = _ffn_mx(self.ffn, tp.all_gather_tokens(h, _fm), mesh=_fm).to(h.dtype)   # LINGBOT_MX_RP_POST
             elif _FFN_MX:
                 y = tp.reduce_scatter_tokens(_ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")), "tp").to(h.dtype)
             elif _FFN_FMAJ:
@@ -3708,9 +3761,11 @@ class WanModelFast(ModelMixin, ConfigMixin):
                         _kw["kv_write"] = False
                     for gi, grp in enumerate(grps):
                         idx = range(gi * _bg, min((gi + 1) * _bg, len(self.blocks)))
+                        _kwg = (dict(_kw, kv_only_last=True)
+                                if (_COMMIT_KV_ONLY and skip_head and _sp and gi == len(grps) - 1) else _kw)
                         x = grp(x, [(list(_ks[i]), list(_vs[i])) for i in idx],
                                 [crossattn_cache[i] for i in idx],
-                                [_films[i] for i in idx] if _films is not None else None, _kw)
+                                [_films[i] for i in idx] if _films is not None else None, _kwg)
                 for block_index, block in (() if _bg > 1 else enumerate(self.blocks)):
                     _kw = kwargs
                     if _films is not None:
@@ -4933,6 +4988,9 @@ def load_tp_wan_model_fast(checkpoint_dir, subfolder, tp_degree, dtype,
                     _film_full_weights(model.blocks)
                 if _HOT:
                     _permute_hot_heads(model.blocks)     # LINGBOT_HOT_HEADS, before quantization / VBIAS_FOLD
+                if _FFN_TP2:
+                    assert n_turns == 1, "LINGBOT_FFN_TP2 needs LINGBOT_LOAD_CONCURRENCY >= world size"
+                    _ffn_tp2_weights(model.blocks)
                 if _CROSS_TPFREE:
                     assert n_turns == 1, "LINGBOT_CROSS_TPFREE needs LINGBOT_LOAD_CONCURRENCY >= world size"
                     assert not _GLUE, "LINGBOT_CROSS_TPFREE: no LINGBOT_GLUE (norm3 fold, glue path)"

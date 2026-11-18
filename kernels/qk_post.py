@@ -11,12 +11,20 @@ q/k/v kernels and the attention at the 2-chip shape, with no engine above 45% bu
 Rows (tokens) on partitions, features contiguous; LNC2 splits the rows. Same math as _tp_rms_norm +
 causal_rope_apply_rotation, with fp32 bias add and RoPE.
 """
+import os
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
 from torch_neuronx.nki_hop import wrap_nki
 
 P = 128
+# LINGBOT_QK_POST_GPS=1: the bias adds (and k's norm-weight multiply) on the GpSimd engine instead of Vector. In the
+# 2-chip block profile (bb_qfp) qk_norm_rope_t is Vector-bound on the attention's critical path (111 us of Vector in a
+# 269 us call, Scalar 50, Tensor 25, GpSimd idle); the bias adds also do not wait for the sums' all-reduce.
+_GPS = os.environ.get("LINGBOT_QK_POST_GPS", "0") == "1"
+_E_BIAS = nisa.engine.gpsimd if _GPS else nisa.engine.vector
+_E_WK = nisa.engine.gpsimd if _GPS else nisa.engine.vector
 
 
 def _bcast_rows(vec, F, dtype):
@@ -56,7 +64,8 @@ def _qk_ss_body(qs, ks, bq, bk):
             x = nl.ndarray((P, F), dtype=src.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=x[0:sz, 0:F], src=src[nl.ds(r_base + t * P, sz), c0:c0 + F])
             y = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=y[0:sz, 0:F], data1=x[0:sz, 0:F], data2=b_sb[0:sz, 0:F], op=nl.add)
+            nisa.tensor_tensor(dst=y[0:sz, 0:F], data1=x[0:sz, 0:F], data2=b_sb[0:sz, 0:F], op=nl.add,
+                               engine=(_E_BIAS if j == 1 else nisa.engine.vector))
             sq = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(dst=sq[0:sz, 0:F], op=nl.square, data=y[0:sz, 0:F], reduce_op=nl.add,
                             reduce_res=acc[0:sz, j:j + 1], reduce_cmd=nisa.reduce_cmd.reset_reduce)
@@ -260,11 +269,13 @@ def _qk_norm_rope_t_body(qs, ks, bq, bk, ss, wq, wk, cos, sin, inv_dim, eps, q_s
             x = nl.ndarray((P, F), dtype=src.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=x[0:sz, 0:F], src=src[nl.ds(r0, sz), c0:c0 + F])
             y = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=y[0:sz, 0:F], data1=x[0:sz, 0:F], data2=b_sb[j][0:sz, 0:F], op=nl.add)
+            nisa.tensor_tensor(dst=y[0:sz, 0:F], data1=x[0:sz, 0:F], data2=b_sb[j][0:sz, 0:F], op=nl.add,
+                               engine=_E_BIAS)
             tn = nl.ndarray((P, F), dtype=src.dtype, buffer=nl.sbuf)
             nisa.activation(dst=tn[0:sz, 0:F], op=nl.copy, data=y[0:sz, 0:F], scale=rr[0:sz, j:j + 1])
             tw = nl.ndarray((P, F), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=tw[0:sz, 0:F], data1=tn[0:sz, 0:F], data2=w_sb[j][0:sz, 0:F], op=nl.multiply)
+            nisa.tensor_tensor(dst=tw[0:sz, 0:F], data1=tn[0:sz, 0:F], data2=w_sb[j][0:sz, 0:F], op=nl.multiply,
+                               engine=(_E_WK if j == 1 else nisa.engine.vector))
             t4 = tw[0:sz, 0:F].reshape((sz, H, C, 2))
             ev, od = t4.select(3, 0), t4.select(3, 1)
             a = nl.ndarray((P, H, C), dtype=nl.float32, buffer=nl.sbuf)

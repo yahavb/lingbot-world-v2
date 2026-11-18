@@ -12,7 +12,8 @@ from nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_kernel import matmul_
 from nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import quantize_block_mxfp8_kernel
 FP8 = "float8_e4m3fn"; REPS = int(os.environ.get("REPS", "30")); DEV = torch.device("neuron:0")
 SHAPES = {"qkv": (5120, 1280), "ffn_up": (5120, 3456), "ffn_down": (3584, 5120), "o": (1536, 5120),
-          "sq": (5120, 5120), "ffn_up_pad": (5120, 3584), "qkv3": (5120, 3840)}
+          "sq": (5120, 5120), "ffn_up_pad": (5120, 3584), "qkv3": (5120, 3840),
+          "up2": (5120, 7168), "down2": (7168, 5120)}   # TP2 FFN (LINGBOT_FFN_TP2 candidate) at M=1088
 # MS="544,3808" ONLY="sq": the M values / shapes to run (run with NKI_ENABLE_TRACE_CACHE=0: the trace cache keys on
 # the kernel arguments, so the N- and M-shard kernels of one shape would otherwise share one compiled kernel)
 MS = [int(v) for v in os.environ.get("MS", "2176,1088").split(",")]

@@ -191,6 +191,8 @@ def main():
         mf._pretranspose_weights([blk])
     if mf._HOT:
         mf._permute_hot_heads([blk], layer0=K)     # LINGBOT_HOT_HEADS
+    if mf._FFN_TP2:
+        mf._ffn_tp2_weights([blk])          # LINGBOT_FFN_TP2
     if mf._CROSS_TPFREE:
         mf._cross_full_modules([blk])
     if mf._FFN_MX:
