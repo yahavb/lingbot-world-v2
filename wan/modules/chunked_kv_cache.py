@@ -70,7 +70,12 @@ def chunk_routing(chunk_index, n_chunks):
     i = int(chunk_index)
     if n_chunks <= 1:
         return 0, ()
-    dest = 0 if i == 0 else 1 + (i - 1) % (n_chunks - 1)
+    if os.environ.get("LINGBOT_KV_NOSINK", "0") == "1":
+        # drift A/B: no pinned sink, a plain ring -- chunk 0 (the start image) rotates out
+        # like every other chunk, so no cached key is older than the window
+        dest = i % n_chunks
+    else:
+        dest = 0 if i == 0 else 1 + (i - 1) % (n_chunks - 1)
     written = min(i, n_chunks)
     leading = tuple(j for j in range(written) if j != dest)
     return dest, leading
