@@ -1,9 +1,11 @@
 # lbw-v2: the LingBot-World v2 streaming server (serve.py) on 2 trn3 devices at LNC2 (claim m-lnc2,
-# 8 ranks, TP4 x CP2), 480x768, DiT + T5 + VAE in one pod. Flags = the 2-chip t19 set of
-# loop_engineering_16_fps_minimal_setup (kiro_mx4/flags_2chip.txt + flags_2chip_best.txt): batch 15.95 fps,
+# 8 ranks, TP4 x CP2), 480x768, DiT + T5 + VAE in one pod. Flags = the 2-chip t22 set of
+# loop_engineering_16_fps_minimal_setup (kiro_mx4/flags_2chip.txt + flags_2chip_best.txt): batch 15.98 fps,
 # accuracy gate PASS (measured 2026-11-18). The inline VAE tiles 2 x 4 (LINGBOT_VAE_PER_DEVICE=2): the
 # default 4 x 2 tiling at 8 LNC2 ranks decodes black frames. Branch serve-2chip = main + that branch.
 # Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: tools/neuron-top (installed at start).
+# TEST (2026-11-18): FRAME_NUM=1929 + scene 06 (2-minute push-in) to compare a 2-minute online video with
+# the offline Job lbw-bench-2chip-long. Set FRAME_NUM back to 81 for the demo.
 # Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint, and cache/v<CACHE_VERSION>/{neuron-compile-cache,
 # neff_cache, hlo_cache}. Bump CACHE_VERSION when pulling new code; old versions can be deleted from the node.
 apiVersion: apps/v1
@@ -165,7 +167,7 @@ spec:
             - name: LINGBOT_VAE_NKI_CONV_SQ
               value: "bf16"
             - name: LINGBOT_VAE_NKI_CONV_LA
-              value: "1"
+              value: "0"
             - name: LINGBOT_VAE_NKI_CONV_CMAX
               value: "192"
             - name: LINGBOT_RESIDUAL_BF16
@@ -180,7 +182,7 @@ spec:
               value: "1"
             - name: CACHE_VERSION
               # bump on every pull of new model/kernel code (cache dir /opt/lingbot-world-v2/cache/v<N>)
-              value: "1"
+              value: "2"
             - name: BRANCH
               value: "serve-2chip"
             - name: SEG_CHUNKS
@@ -198,7 +200,7 @@ spec:
             - name: SIZE
               value: "480*768"
             - name: FRAME_NUM
-              value: "81"
+              value: "1929"
             - name: CHUNK_SIZE
               value: "3"
             - name: LOCAL_ATTN_SIZE
@@ -362,7 +364,7 @@ spec:
             - name: LINGBOT_VAE_2D
               value: "1"
             - name: LINGBOT_VAE_T
-              value: "1"
+              value: "2"
             - name: LINGBOT_VAE_NORM
               value: "mm"
             - name: LINGBOT_VAE_CC_FLAGS
