@@ -507,6 +507,39 @@ def _up3d_unit(x, cache_t, wt, bt, w2, b2, sel):
     return _up_core(y, w2, b2, sel), xc[:, :, -2:]
 
 
+# LINGBOT_VAE_NKI_UP=2d|all (with LINGBOT_VAE_2D, LINGBOT_VAE_BF16): the spatial upsample (nearest x2 + 3x3 Conv2d) of
+# the upsample2d Resample (2d) or of every Resample (all: + the upsample3d ones' conv after their time conv) as one NKI
+# kernel on the low-resolution haloed tile (kernels/vae_up_conv.py): each output phase is a 3x3 flat-shift conv over
+# the low-res band in SBUF, written to the output with stride 2, so the 4x upsampled input is never built in HBM.
+# Halo: the raw edges of _raw_edges_2d (the same two exchanges as _halo). LINGBOT_VAE_NKI_UP_FOLD=1: the folded
+# 2x2 phase kernels (2.25x fewer matmuls; weights folded in fp32 from the fp32 module weights, rounded once).
+# LINGBOT_VAE_NKI_UP_R: low-res rows per band (default 10).
+_NKI_UP = os.environ.get("LINGBOT_VAE_NKI_UP", "0")
+assert _NKI_UP in ("0", "2d", "all"), _NKI_UP
+_NKI_UP_FOLD = os.environ.get("LINGBOT_VAE_NKI_UP_FOLD", "0") == "1"
+_NKI_UP_R = int(os.environ.get("LINGBOT_VAE_NKI_UP_R", "10"))
+if _NKI_UP != "0":
+    from kernels.vae_up_conv import up_conv as _nki_up_conv, up_conv_weights as _nki_up_w
+
+
+def _up_core_nki(x, wk, b2, sel):
+    """_up_core (LINGBOT_VAE_2D) via kernels/vae_up_conv.py; wk = up_conv_weights(w2[, fold])."""
+    xb = x.to(torch.bfloat16)
+    l, r, u, d = _raw_edges_2d(xb, sel)
+    y = _nki_up_conv(xb[0], l[0], r[0], u[0], d[0], wk, b2.float().reshape(-1, 1), rows=_NKI_UP_R,
+                     fold=_NKI_UP_FOLD)
+    return y.unsqueeze(0)
+
+
+def _up3d_unit_nki(x, cache_t, wt, bt, wk, b2, sel):
+    """_up3d_unit with the spatial part as _up_core_nki."""
+    b, c, t, h, w = x.shape
+    xc = torch.cat([cache_t, x.to(wt.dtype)], 2)
+    y = F.conv3d(xc, wt, bt).reshape(b, 2, c, t, h, w)
+    y = torch.stack((y[:, 0], y[:, 1]), 3).reshape(b, c, t * 2, h, w)
+    return _up_core_nki(y, wk, b2, sel), xc[:, :, -2:]
+
+
 def _head_unit(x, cache, g, s, w, b, sel):
     if _use_nh(x, w):
         return _nh_conv(x, cache, g, s, w, b, sel, nki_conv=_NKI_HEAD and b is not None and w.shape[0] <= 128,
@@ -521,6 +554,7 @@ def _compile(fn):
 _CONV, _RES, _ATTN = _compile(_conv_unit), _compile(_res_unit), _compile(_attn_unit)
 _UP3D, _UP2D, _HEAD = _compile(_up3d_unit), _compile(_up_core), _compile(_head_unit)
 _UP2D_SP = _compile(_up_core_sp)
+_UP2D_N, _UP3D_N = _compile(_up_core_nki), _compile(_up3d_unit_nki)
 
 
 class FusedWidthDecoder:
@@ -573,6 +607,21 @@ class FusedWidthDecoder:
         if k not in self._wcache:
             self._wcache[k] = (subpix_weights(w), b)
         return self._wcache[k]
+    def _wb_upn(self, m):
+        """LINGBOT_VAE_NKI_UP: the upsample conv's (kernels/vae_up_conv.py weight, bias); the fold from the fp32 module
+        weight (on the host, once)."""
+        k = (id(m), "nkiup", _NKI_UP_FOLD)
+        if k not in self._wcache:
+            w, b = self._wb(m)
+            src = m.weight.detach() if _NKI_UP_FOLD else w
+            wk = _nki_up_w(src.cpu(), fold=_NKI_UP_FOLD).to(torch.bfloat16).to(w.device)
+            self._wcache[k] = (wk, b)
+        return self._wcache[k]
+
+    def _nki_up(self, kind):
+        return _TWO_D and not _SWAP and self.dt == torch.bfloat16 and \
+            (_NKI_UP == "all" or (_NKI_UP == "2d" and kind == "up2d"))
+
     def _zeros(self, x, c, halo=True, fp32=False):
         shape = [x.shape[0], c, 2, x.shape[3], x.shape[4]]
         if halo:
@@ -616,7 +665,12 @@ class FusedWidthDecoder:
                 ct = cache(x.shape[1], halo=False)
                 conv2d = m.resample[1]
                 _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
-                if first:
+                if self._nki_up(kind):
+                    if first:
+                        x = _UP2D_N(x, *self._wb_upn(conv2d), sel)
+                    else:
+                        x, ct = _UP3D_N(x, ct, *self._wb(m.time_conv), *self._wb_upn(conv2d), sel)
+                elif first:
                     # 'Rep': no time conv on the first frame; the second frame's time conv then
                     # zero-pads, which is what the all-zero cache does.
                     x = _up2(x, *self._wb_up(conv2d), sel)
@@ -626,7 +680,10 @@ class FusedWidthDecoder:
             elif kind == "up2d":
                 conv2d = m.resample[1]
                 _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
-                x = _up2(x, *self._wb_up(conv2d), sel)
+                if self._nki_up(kind):
+                    x = _UP2D_N(x, *self._wb_upn(conv2d), sel)
+                else:
+                    x = _up2(x, *self._wb_up(conv2d), sel)
             else:  # head
                 norm, conv = m[0], m[2]
                 # fp32 output conv (96 -> 3, cheap) keeps the pixel values at full precision.
