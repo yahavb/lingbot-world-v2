@@ -4,7 +4,8 @@
 # accuracy gate PASS (measured 2026-11-18). The inline VAE tiles 2 x 4 (LINGBOT_VAE_PER_DEVICE=2): the
 # default 4 x 2 tiling at 8 LNC2 ranks decodes black frames. Branch serve-2chip = main + that branch.
 # Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: tools/neuron-top (installed at start).
-# Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint, neuron-compile-cache, neff_cache, hlo_cache.
+# Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint, and cache/v<CACHE_VERSION>/{neuron-compile-cache,
+# neff_cache, hlo_cache}. Bump CACHE_VERSION when pulling new code; old versions can be deleted from the node.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,14 +44,17 @@ spec:
                 && echo "neuron-top: enhanced" || echo "neuron-top: stock"
               NODE=/node-cache; mkdir -p "$NODE"
               CKPT=$NODE/lingbot-world-v2-14b-causal-fast
-              export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
+              # CACHE_VERSION namespaces every compile cache on the node: bump it (env below) when pulling new
+              # model/kernel code, so no pod picks up graphs compiled from the previous version
+              C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}
+              export NEURON_COMPILE_CACHE_URL=$C/neuron-compile-cache
               # compiled graphs persist on the node: the first pod on a node fills these, every later pod
               # (restart, rollout, a second replica) reuses whatever is already there
-              export TORCH_NEURONX_NEFF_CACHE_DIR=$NODE/neff_cache
+              export TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
               export NKI_ENABLE_TRACE_CACHE="${NKI_ENABLE_TRACE_CACHE:-1}"
-              export TORCH_NEURONX_HLO_CACHE_DIR=$NODE/hlo_cache
+              export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache
               mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR"
-              echo "neff cache on node: $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
+              echo "neff cache on node (v$CACHE_VERSION): $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
               export HF_HOME=/tmp/hf-cache
 
               pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
@@ -173,6 +177,9 @@ spec:
             - name: LINGBOT_VAE_LOW_T
               value: "20"
             - name: LINGBOT_COMMIT_KV_ONLY
+              value: "1"
+            - name: CACHE_VERSION
+              # bump on every pull of new model/kernel code (cache dir /opt/lingbot-world-v2/cache/v<N>)
               value: "1"
             - name: BRANCH
               value: "serve-2chip"
