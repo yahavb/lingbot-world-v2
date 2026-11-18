@@ -337,6 +337,12 @@ _NKI_CONV_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_CMAX", "128"))
 # (perf/vae_head_bench.py VARIANT=rbres), stage-3 ResidualBlock -27..-34 us; decode neutral (587-589 vs 587 ms with
 # NKI_CONV=all SQ=bf16 LA=1, 52.87 dB), so not in the best flag set.
 _NKI_CONV_RES = os.environ.get("LINGBOT_VAE_NKI_CONV_RES", "0") == "1"
+# LINGBOT_VAE_NKI_CONV_TMAX=n (with =all): at most n frames per call of the fused kernel; a unit with more (LINGBOT_VAE_T
+# > 1 puts 4 x LINGBOT_VAE_T frames on stages 2 / 3) calls it on consecutive pieces chained through the cache.
+# Measured (perf/vae_repeat_check.sh, 12 decodes each): with LA=1 the kernel at 8 frames per call corrupts bursts of
+# frames in about half the decodes (always from frame 5 of an 8-frame step); with LA=0 8 and 12 frames are clean but
+# 16 frames (LINGBOT_VAE_T=4) corrupt 3 of 12. The production 4 frames per call (LINGBOT_VAE_T=1) was clean in every run.
+_NKI_CONV_TMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_TMAX", "0") or 0)
 if _NKI_CONV != "0":
     from kernels.vae_norm_halo_conv import norm_halo_conv as _nki_norm_halo_conv
     from kernels.vae_head_conv import head_conv_weights as _nki_conv_w
@@ -380,6 +386,21 @@ def _nh_conv(x, cache, gamma, scale, w, b, sel, nki_conv=False, head=False, res=
     l, r, u, d = _raw_edges_2d(xb, sel)
     c = x.shape[1]
     if _nh_fused(x, w, b, head):
+        T = int(xb.shape[2])
+        if _NKI_CONV_TMAX and T > _NKI_CONV_TMAX:
+            # LINGBOT_VAE_NKI_CONV_TMAX: the frames in kernel calls of at most TMAX, chained through the cache
+            # (two calls of T / 2 == one call bit for bit, perf/vae_conv_t_check.py); the halo exchange stays one.
+            g_, w_, b_ = gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1)
+            nc = cache[0].to(torch.bfloat16)
+            ys = []
+            for t0 in range(0, T, _NKI_CONV_TMAX):
+                t1 = min(T, t0 + _NKI_CONV_TMAX)
+                y_, nc = _nki_norm_halo_conv(
+                    xb[0, :, t0:t1].contiguous(), l[0, :, t0:t1].contiguous(), r[0, :, t0:t1].contiguous(),
+                    u[0, :, t0:t1].contiguous(), d[0, :, t0:t1].contiguous(), nc, g_, w_, b_,
+                    None if res is None else res[0, :, t0:t1].contiguous())
+                ys.append(y_)
+            return torch.cat(ys, 1).unsqueeze(0), nc.unsqueeze(0)
         y, nc = _nki_norm_halo_conv(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
                                     gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1),
                                     None if res is None else res[0])
