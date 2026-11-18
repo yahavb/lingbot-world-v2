@@ -528,6 +528,14 @@ _LOW_T = int(os.environ.get("LINGBOT_VAE_LOW_T", "0") or 0)
 # stage 0's upsample and stage 1). Measured: a LOW_T smaller than the latent's frame count (several low steps) lowered
 # vs_R (52.13 dB at LOW_T=5): use LOW_T >= frames - 1.
 _LOW_UPS = int(os.environ.get("LINGBOT_VAE_LOW_UPS", "1") or 1)
+# Intermittent decode error with more than one latent frame per step (LINGBOT_VAE_T=2, LOW_T=5): bursts of 7-11
+# frames at 28-46 dB vs R in a run-dependent place, more often under host load; the fused conv kernel alone is exact
+# at 8 frames (perf/vae_conv_t_check.py). Diagnostics:
+# LINGBOT_VAE_STEP_SYNC=1: torch.neuron.synchronize() after every decode step (bounds the work in flight).
+# LINGBOT_VAE_HOLD=1: keep every step's unit outputs and its input caches referenced until decode() returns (no
+# device buffer of the decode is freed, and so reused, while queued work may still read it).
+_STEP_SYNC = os.environ.get("LINGBOT_VAE_STEP_SYNC", "0") == "1"
+_HOLD = os.environ.get("LINGBOT_VAE_HOLD", "0") == "1"
 if _NKI_UP != "0":
     from kernels.vae_up_conv import up_conv as _nki_up_conv, up_conv_weights as _nki_up_w
 
@@ -658,6 +666,14 @@ class FusedWidthDecoder:
         return len(self.units)
 
     def _step(self, x, caches, first, u0=0, u1=None):
+        out = self._step_body(x, caches, first, u0, u1)
+        if _HOLD:
+            self.__dict__.setdefault("_held", []).append((x, caches, out))
+        if _STEP_SYNC:
+            torch.neuron.synchronize()
+        return out
+
+    def _step_body(self, x, caches, first, u0=0, u1=None):
         new, i = [], 0
 
         def cache(c, halo=True, fp32=False):
@@ -721,6 +737,8 @@ class FusedWidthDecoder:
                 s = self._ut.setdefault(_key, [0, 0.0])
                 s[0] += 1
                 s[1] += time.perf_counter() - _t0
+            if _HOLD:
+                self.__dict__.setdefault("_held", []).append(x)
         return x, new
 
     def unit_timing_report(self):
@@ -744,6 +762,7 @@ class FusedWidthDecoder:
         one frame; k only changes how many graph launches and halo exchanges the decode takes."""
         if self.sel is None:
             self.sel = _selectors(z.device)
+        self._held = []           # LINGBOT_VAE_HOLD: the previous decode's references (it has completed by now)
         zd = self.model.z_dim
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, zd, 1, 1, 1) + scale[0].view(1, zd, 1, 1, 1)
