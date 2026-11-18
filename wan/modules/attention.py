@@ -652,7 +652,7 @@ _CTE_PRIOR_FULL = os.environ.get("LINGBOT_CTE_PRIOR_FULL", "0") == "1"
 
 
 def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, normalize=False,
-             v_token_major=False, h_cnt=0, q_dmajor=False, one_core=False):
+             v_token_major=False, h_cnt=0, q_dmajor=False, one_core=False, rowmax_vec=False):
     """One self-attention attention_cte call of the vendored kernel (LINGBOT_CTE_CHAIN), output in the
     tp_out layout [n, d, Lq_p]. normalize=False: (out, neg_max, sum) -- unnormalized output and the
     kernel's own [n, 128, groups] statistics -- for the next call's chain=. chain=(out, neg_max, sum)
@@ -663,7 +663,7 @@ def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, no
     LINGBOT_HOT_NOCOPY: q_dmajor -- q_c is d-major [n, d, Lq_p] (the constant-offset kernels' q_t; the kernel's
     tp_q=False load, no transpose); h_cnt = N > 0 -- only heads 0 .. N - 1 of q_c / kc / vc / the priors
     (full tensors, no head-sliced copies), the output and statistics [N, ...]. one_core (LINGBOT_HOT_ONECORE): every
-    head on the logical core's program 0."""
+    head on the logical core's program 0. rowmax_vec (LINGBOT_HOT_ROWMAX_VEC): row-max evicts on Vector."""
     d = int(q_c.shape[1] if q_dmajor else q_c.shape[-1])
     tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
     tpq = not q_dmajor
@@ -672,6 +672,8 @@ def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, no
         kw["h_cnt"] = int(h_cnt)
     if one_core:
         kw["one_core"] = True
+    if rowmax_vec:
+        kw["rowmax_vec"] = True
     if k_blocks > 1:
         kw["k_blocks"] = int(k_blocks)
     if k_prior is not None:

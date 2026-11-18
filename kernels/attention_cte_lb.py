@@ -304,8 +304,11 @@ def attention_cte(
     prior_full: bool = False,
     h_cnt: int = 0,
     one_core: bool = False,
+    rowmax_vec: bool = False,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
+    lingbot: rowmax_vec = True (LINGBOT_HOT_ROWMAX_VEC): this call's MM1 row-max evicts on the Vector engine even
+    under LINGBOT_CTE_SCALAR_ROWMAX=1 (the Scalar engine left to the constant-offset kernel beside it). Same values.
     lingbot: one_core = True (LINGBOT_HOT_ONECORE): under an LNC2 grid, program 0 attends every head and
     program 1 none (instead of half the heads each); the caller gives program 1 other work.
     lingbot: h_cnt = N > 0 (LINGBOT_HOT_NOCOPY): only the first N heads (batch entries) of q, k, v, k_prior and
@@ -560,6 +563,7 @@ def attention_cte(
         prior_full=prior_full,
         h_cnt=h_cnt,
         one_core=one_core,
+        rowmax_vec=rowmax_vec,
     )
 
 
@@ -622,6 +626,7 @@ def _attention_cte(
     prior_full: bool = False,
     h_cnt: int = 0,
     one_core: bool = False,
+    rowmax_vec: bool = False,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -1030,6 +1035,7 @@ def _attention_cte(
         chained=chain_o is not None,
         v_token_major=v_token_major,
         prior_full=prior_full,
+        rowmax_vec=bool(rowmax_vec),
         seqlen_q=seqlen_q,
         seqlen_k_active=seqlen_k_active,
         seqlen_k_prior=seqlen_k_prior,
@@ -1310,6 +1316,7 @@ class AttnConfig(nl.NKIObject):
     chained: bool = False  # lingbot: continue an earlier call's softmax (chain_o / _neg_max / _sum)
     v_token_major: bool = False  # lingbot: V memory is [seqlen, bs_kv, d], see attention_cte
     prior_full: bool = False  # lingbot: the whole prior is used on every call, see attention_cte
+    rowmax_vec: bool = False  # lingbot: row-max evicts on Vector even under LINGBOT_CTE_SCALAR_ROWMAX
 
 
 def _attention_cte_impl(
@@ -4463,7 +4470,7 @@ def _qk_and_max_large_tile_impl(
     # element than nisa.tensor_scalar_reduce for a PSUM read + scale + fused max, so moving the evict
     # to Scalar is slower even where Scalar is otherwise free. The placement logic is retained in
     # _row_max_on_scalar and the chaining below is engine-independent; only the engine choice is off.
-    use_scalar_row_max = _SCALAR_ROWMAX  # lingbot: was False
+    use_scalar_row_max = _SCALAR_ROWMAX and not ac.rowmax_vec  # lingbot: was False
     row_max_chains = _row_max_chain_endpoints(k_tile_selections, ac, atp, qkmax_grp, use_scalar_row_max)
     for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
         tile, should_process = k_tile_selections[k_tile_idx]
