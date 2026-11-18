@@ -1903,14 +1903,6 @@ requestAnimationFrame(tick);
   </div>
 </section>
 <div class="nt"><p class="meta">Section 7 · about 1 minute</p><p><b>These numbers, and what they replaced:</b> 76.6 / 36.8 / 16.1 / 10.8 / 8.7 s (Wan2.2) → 21.6 / 8.09 / 4.48 / 4.07 s (LingBot); A100 16.92 s removed: no A100 number for LingBot.</p></div></div>
-<!-- ═══════════════════════════ S9c · LingBot-World v2: 19.9 fps on 8 trn3 chips ═══════════════════════════ -->
-<div class="cell" data-ref="S9c"><section class="slide">
-  <h1>LingBot-World v2: 19.9 fps on 8 trn3 chips</h1>
-  <div class="body">
-  <svg viewBox="0 0 1152 360" width="1152" height="360" role="img" aria-label="Eager 21.6 s; + compiled blocks 8.09 s; + q20 flags (main) 4.48 s; today&#x27;s main flags 4.68 s; + 8dev flags, no chained calls 4.07 s"><text class="lbl" x="0" y="12">8 TRN3 CHIPS (32 RANKS)</text><text class="lbl" x="440" y="12">GEN + VAE PER VIDEO</text><text class="lbl" x="1080" y="12">FPS</text><line class="ax" x1="0" y1="22" x2="1152" y2="22"/><g><text class="tk" x="0" y="61.0">Eager</text><rect class="bar-m" x="440" y="38.0" width="560.0" height="32" rx="4"/><text class="t-v" x="1010.0" y="59.0">21.6 s</text><text class="t-v" x="1080" y="59.0">3.75</text></g><g><text class="tk" x="0" y="127.0">+ compiled blocks</text><rect class="bar" x="440" y="104.0" width="209.5" height="32" rx="4"/><text class="t-v" x="659.5" y="125.0">8.09 s</text><text class="t-v" x="1080" y="125.0">10.0</text></g><g><text class="tk" x="0" y="193.0">+ q20 flags (main)</text><rect class="bar" x="440" y="170.0" width="116.0" height="32" rx="4"/><text class="t-v" x="566.0" y="191.0">4.48 s</text><text class="t-v" x="1080" y="191.0">18.1</text></g><g><text class="tk" x="0" y="259.0">today's main flags</text><rect class="bar" x="440" y="236.0" width="121.2" height="32" rx="4"/><text class="t-v" x="571.2" y="257.0">4.68 s</text><text class="t-v" x="1080" y="257.0">17.3</text></g><g><text class="tk" x="0" y="325.0">+ 8dev flags, no chained calls</text><rect class="bar-g" x="440" y="302.0" width="105.4" height="32" rx="4"/><text class="t-g" x="555.4" y="323.0">4.07 s</text><text class="t-g" x="1080" y="323.0">19.9</text></g></svg>
-  </div>
-</section>
-<div class="nt"><p class="meta">Section 7 · about 1 minute</p><p><b>These numbers, and what they replaced:</b> 16 trn2 devices table (11.90 → 3.24 s, 25.02 fps) → 8 trn3 chips: 21.6 → 4.07 s, 19.9 fps; 8 trn2 devices with the check 4.40 s / 18.40 fps → not measurable on trn3 (the check needs chained calls).</p></div></div>
 <!-- ═══════════════════════════ S9d · LingBot-World v2: a live stream ═══════════════════════════ -->
 <div class="cell" data-ref="S9d"><section class="slide">
   <h1>LingBot-World v2: a live stream</h1>
@@ -1949,7 +1941,7 @@ requestAnimationFrame(tick);
 <p class="meta">Section 8 · ~7 minutes · only if the talk is running early</p>
 <p><b>This is the one section to drop.</b> It is not one of the playbook’s four steps — nothing in it makes the model faster on the device — and the talk is complete without it. Keep it for a room that asks “fine, but how do you actually run this?”, or for time left over.</p>
 <p>Four slides: the animation outwards to the cluster (S11a — the uncut version, which starts inside the chip, is B11e), the server itself (S11b), why warm-up is part of deployment (S11c), and closing the host gaps before deploying like any pod (S11d).</p>
-<p class="chk">CHECK: this was idea 6, “keep the device fed”, when the talk had six ideas. It is a section rather than one of the playbook’s steps now, which is the honest framing — it is deployment work, not a device optimization. The journey charts on S9b and S9c still point here for their host-side rows.</p>
+<p class="chk">CHECK: this was idea 6, “keep the device fed”, when the talk had six ideas. It is a section rather than one of the playbook’s steps now, which is the honest framing — it is deployment work, not a device optimization. The journey chart on S9b still points here for its host-side rows.</p>
 </div></div>
 
 <!-- ═══════════════════════════ S11a · animation: engines to the cluster ═══════════════════════════ -->
@@ -2290,7 +2282,7 @@ requestAnimationFrame(tick);
 &lt;/head&gt;
 &lt;body&gt;
 &lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 900&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
-     aria-label=&quot;Amazon EKS. A key press in the browser goes to the lbw-web pod on an m5 node, then as POST /control to the lbw-v2 pod on a trn3 node, where it becomes a camera pose for the next chunk. The lbw-v2 pod holds T5, the DiT and the KV cache on 8 Neuron devices from its resource claim. Each finished latent chunk goes through a Kubernetes Service to the lbw-v2-vae pod, which has its own claim of 4 Neuron devices. The VAE decodes in steps and sends the frames of each step as soon as they exist, back through lbw-web to the browser. Meanwhile the DiT already makes the next chunk: the timeline at the bottom shows the two pods working at the same time.&quot;&gt;
+     aria-label=&quot;Amazon EKS. The first call, POST /session with the prompt, goes from the browser through the lbw-web pod to T5 in the lbw-v2 pod, which encodes it once. From then on, a key press in the browser goes to the lbw-web pod on an m5 node, then as POST /control to the lbw-v2 pod on a trn3 node, where it becomes a camera pose for the next chunk. The lbw-v2 pod holds T5, the DiT and the KV cache on 8 Neuron devices from its resource claim. Each finished latent chunk goes through a Kubernetes Service to the lbw-v2-vae pod, which has its own claim of 4 Neuron devices. The VAE decodes in steps and sends the frames of each step as soon as they exist, back through lbw-web to the browser. Meanwhile the DiT already makes the next chunk: the timeline at the bottom shows the two pods working at the same time.&quot;&gt;
   &lt;defs&gt;
     &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
       &lt;feGaussianBlur stdDeviation=&quot;8&quot; result=&quot;b&quot;/&gt;
@@ -2369,6 +2361,8 @@ requestAnimationFrame(tick);
   var P_SVC = [[1130,430],[1285,430]];                                   // DiT -&gt; Service -&gt; VAE
   var P_BACK= [[1405,490],[1405,670],[445,670],[445,490]];               // VAE -&gt; web
   var P_WEB = [[345,450],[280,450]];                                     // web -&gt; browser
+  var P_SES = [[545,320],[590,320],[590,240],[1017,240],[1017,250]];     // web -&gt; T5 (POST /session, the prompt)
+  var PROMPT = &#x27;#ffcc33&#x27;, tSes = 0.3;                                    // the first call: the prompt
 
   // ---- static ----
   var st = &#x27;&#x27;;
@@ -2391,12 +2385,12 @@ requestAnimationFrame(tick);
   // paths
   st += L(P_KEY,GRAY,8) + head(345,330,&#x27;r&#x27;,GRAY);
   st += L(P_CTL,GRAY,8) + head(660,295,&#x27;r&#x27;,GRAY) + T(WEB.x+WEB.w/2,WEB.y-12,19,&#x27;POST /control →&#x27;,DIM);
+  st += L(P_SES,hexA(PROMPT,.55),6) + head(1017,250,&#x27;d&#x27;,hexA(PROMPT,.8)) + T(445,186,20,&#x27;first call: POST /session (prompt)&#x27;,PROMPT);
   st += L(P_SVC,GRAY,8) + head(1285,430,&#x27;r&#x27;,GRAY);
   st += R(1150,395,110,30,15,&#x27;#0b0d12&#x27;,EKS,3) + T(1205,417,19,&#x27;Service&#x27;,EKS);
   st += T(1207,465,19,&#x27;latents&#x27;,DIM);
   st += L(P_BACK,GRAY,8) + head(445,490,&#x27;u&#x27;,GRAY) + T(925,660,21,&#x27;frames, as soon as each decode step finishes&#x27;,GOOD);
   st += L(P_WEB,GRAY,8) + head(280,450,&#x27;l&#x27;,GRAY);
-  st += R(T5B.x,T5B.y,T5B.w,T5B.h,16,&#x27;#151a25&#x27;,&#x27;#2fd3c9&#x27;,5) + T(T5B.x+T5B.w/2,T5B.y+58,40,&#x27;T5&#x27;);
   st += L([[T5B.x+T5B.w/2,T5B.y+T5B.h],[T5B.x+T5B.w/2,DT.y]],GRAY,8) + head(T5B.x+T5B.w/2,DT.y,&#x27;d&#x27;,GRAY);
   st += L([[CAM.x+CAM.w/2,CAM.y+CAM.h],[CAM.x+CAM.w/2,DT.y]],GRAY,8) + head(CAM.x+CAM.w/2,DT.y,&#x27;d&#x27;,GRAY);
   st += T(KV.x+24,KV.y+43,26,&#x27;KV cache&#x27;,DIM,&#x27;start&#x27;);
@@ -2422,15 +2416,24 @@ requestAnimationFrame(tick);
     s += T(VP.x+VP.w/2,VP.y+108,20,&#x27;claim: 4 Neuron devices&#x27;,NEU) + devs(VP.x+72,VP.y+124,4,4,vc&gt;=0,vc&gt;=0?C[vc]:NEU);
 
     // keys + key press travelling to the DiT pod
-    var on=-1; for (c=0;c&lt;N;c++) if (t&gt;=kT(c)-0.2 &amp;&amp; t&lt;kT(c)+0.6) on=c;
+    var on=-1; for (c=1;c&lt;N;c++) if (t&gt;=kT(c)-0.2 &amp;&amp; t&lt;kT(c)+0.6) on=c;
     KEYS.forEach(function(k,i){ var lit = on&gt;=0 &amp;&amp; ACT[on]===k, kx=KP.x+i*52;
       s += R(kx,KP.y,44,54,9, lit?ACOL[k]:&#x27;#151a25&#x27;, lit?&#x27;#fff&#x27;:&#x27;#8fa3c7&#x27;, lit?5:3, lit?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;) +
            T(kx+22,KP.y+38,30,k,lit?&#x27;#141416&#x27;:null); });
-    for (c=0;c&lt;N;c++){
+    // first call: the prompt goes browser -&gt; web -&gt; T5 -&gt; DiT, before chunk 0
+    var s1=prog(t,tSes,0.35); if (s1&gt;0&amp;&amp;s1&lt;1){ var qs=along(P_KEY,ease(s1)); s+=dot(qs[0],qs[1],13,PROMPT); }
+    var s2=prog(t,tSes+0.4,0.7); if (s2&gt;0&amp;&amp;s2&lt;1){ var qs2=along(P_SES,ease(s2)); s+=dot(qs2[0],qs2[1],13,PROMPT); }
+    var t5on = t&gt;=tSes+1.05 &amp;&amp; t&lt;S0-0.05;
+    s += R(T5B.x,T5B.y,T5B.w,T5B.h,16, t5on?hexA(&#x27;#2fd3c9&#x27;,.3):&#x27;#151a25&#x27;,&#x27;#2fd3c9&#x27;, t5on?8:5, t5on?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;) +
+         T(T5B.x+T5B.w/2,T5B.y+58,40,&#x27;T5&#x27;);
+    var s3=prog(t,S0-0.45,0.4); if (s3&gt;0&amp;&amp;s3&lt;1) s+=dot(T5B.x+T5B.w/2, lerp(T5B.y+T5B.h,DT.y,ease(s3)),13,PROMPT);
+    if (t&lt;S0+0.4) s += R(BR.x+40,BR.y+90,BR.w-80,16,8,hexA(PROMPT,.7)) + R(BR.x+40,BR.y+120,BR.w-120,16,8,hexA(PROMPT,.7)) +
+                      T(BR.x+BR.w/2,BR.y+190,22,&#x27;prompt&#x27;,PROMPT);
+    for (c=1;c&lt;N;c++){
       var p1=prog(t,kT(c),0.35); if (p1&gt;0&amp;&amp;p1&lt;1){ var q=along(P_KEY,ease(p1)); s+=dot(q[0],q[1],13,C[c]); }
       var p2=prog(t,kT(c)+0.4,0.55); if (p2&gt;0&amp;&amp;p2&lt;1){ var q2=along(P_CTL,ease(p2)); s+=dot(q2[0],q2[1],13,C[c]); }
     }
-    var camOn=-1; for (c=0;c&lt;N;c++) if (t&gt;=kT(c)+0.9 &amp;&amp; t&lt;sC(c)+0.3) camOn=c;
+    var camOn=-1; for (c=1;c&lt;N;c++) if (t&gt;=kT(c)+0.9 &amp;&amp; t&lt;sC(c)+0.3) camOn=c;
     s += R(CAM.x,CAM.y,CAM.w,CAM.h,16, camOn&gt;=0?hexA(C[camOn],.3):&#x27;#151a25&#x27;, camOn&gt;=0?C[camOn]:&#x27;#8fa3c7&#x27;, camOn&gt;=0?7:5,
            camOn&gt;=0?&#x27; filter=&quot;url(#glow)&quot;&#x27;:&#x27;&#x27;) + T(CAM.x+CAM.w/2,CAM.y+44,34,&#x27;camera&#x27;) + T(CAM.x+CAM.w/2,CAM.y+74,19,&#x27;pose per frame&#x27;,&#x27;#c3c9d6&#x27;);
 
@@ -2463,7 +2466,7 @@ requestAnimationFrame(tick);
       if (t&gt;=t1+BACK+0.3){ shown=c; shownCol=C[c]; nframes++; }
     }
     if (shown&gt;=0) s += mini(BR.x+20,BR.y+50,BR.w-40,BR.h-70,shownCol,1);
-    else s += T(BR.x+BR.w/2,BR.y+150,22,&#x27;waiting&#x27;,GRAY);
+
 
     // timeline: both pods busy at the same time
     for (c=0;c&lt;N;c++){
@@ -2494,7 +2497,7 @@ requestAnimationFrame(tick);
   </div>
   <p class="takeaway"><span class="k">Takeaway</span><span>Two pods, two claims, one Service: the DiT never waits for the VAE.</span></p>
 </section>
-<div class="nt"><p class="meta">Section 8 · about 1 minute · the animation plays when the slide opens (click restarts it)</p><p>This is S1c on Kubernetes. A key press goes from the browser to the lbw-web pod on an m5 node, then as POST /control to the lbw-v2 pod on the trn3 node, where it becomes the camera pose of the next chunk. Keys never go through T5.</p><p>The lbw-v2 pod (DiT + T5 + KV cache) has its own resource claim of Neuron devices; the lbw-v2-vae pod has another. Each finished latent chunk goes through the lbw-v2-vae Service (serve.py RemoteDecoder, POST /decode?stream=1, from a sender thread), so the DiT starts the next chunk at once. The VAE sends the frames of each decode step as soon as they exist, back through lbw-web to the browser.</p><p>Measured with this split: DiT + T5 on 8 trn3 devices (xl-lnc2), VAE on 4 (l-lnc1): 17.3 fps and about 1.1 s from a key press to its frames at the browser (lbw-deploy.yaml header, lbw-v2-vae-deploy.yaml). The pod running today (lbw-v2) keeps the VAE inline on 4 devices: 15.2 fps.</p></div></div>
+<div class="nt"><p class="meta">Section 8 · about 1 minute · the animation plays when the slide opens (click restarts it)</p><p>This is S1c on Kubernetes. The first call (POST /session) carries the prompt: lbw-web passes it to the lbw-v2 pod, where T5 encodes it once. From then on, a key press goes from the browser to the lbw-web pod on an m5 node, then as POST /control to the lbw-v2 pod on the trn3 node, where it becomes the camera pose of the next chunk. Keys never go through T5.</p><p>The lbw-v2 pod (DiT + T5 + KV cache) has its own resource claim of Neuron devices; the lbw-v2-vae pod has another. Each finished latent chunk goes through the lbw-v2-vae Service (serve.py RemoteDecoder, POST /decode?stream=1, from a sender thread), so the DiT starts the next chunk at once. The VAE sends the frames of each decode step as soon as they exist, back through lbw-web to the browser.</p><p>Measured with this split: DiT + T5 on 8 trn3 devices (xl-lnc2), VAE on 4 (l-lnc1): 17.3 fps and about 1.1 s from a key press to its frames at the browser (lbw-deploy.yaml header, lbw-v2-vae-deploy.yaml). The pod running today (lbw-v2) keeps the VAE inline on 4 devices: 15.2 fps.</p></div></div>
 <!-- ═══════════════════════════ S11d · stream every chunk, then deploy like any pod ═══════════════════════════ -->
 <div class="cell" data-ref="S11d"><section class="slide">
   <p class="kicker">Cloud deployment · on Amazon EKS</p>
