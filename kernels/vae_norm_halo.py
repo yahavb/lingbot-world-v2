@@ -69,7 +69,8 @@ def _norm_halo(x, left, right, up, down, cache, g):
     nct = (C + _P - 1) // _P
     cs = [min(_P, C - k * _P) for k in range(nct)]
     F = _F0 // nct
-    assert T * Wp <= F, (T, Wp, F)
+    assert Wp <= F, (Wp, F)
+    TG = min(T, F // Wp)                                                   # frames per edge-row tile
     R = max(r for r in range(1, H + 1) if H % r == 0 and r * Wp <= F)      # interior rows per tile
     out = nl.ndarray((C, T + 2, Hp, Wp), dtype=x.dtype, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=out[0:C, 0:2, 0:Hp, 0:Wp], src=cache[0:C, 0:2, 0:Hp, 0:Wp])
@@ -80,19 +81,22 @@ def _norm_halo(x, left, right, up, down, cache, g):
         gt = nl.ndarray((_P, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=gt[0:cs[k], 0:1], src=g[k * _P:k * _P + cs[k], 0:1])
         gts.append(gt)
-    # padded rows 0 and H + 1 of every frame: the up / down rows
+    # padded rows 0 and H + 1 of every frame: the up / down rows, TG frames per tile
     for src, r in ((up, 0), (down, Hp - 1)):
-        ets, eys = [], []
-        for k in range(nct):
-            et = nl.ndarray((_P, F), dtype=x.dtype, buffer=nl.sbuf)
-            for t in range(T):
-                nisa.dma_copy(dst=et[0:cs[k], t * Wp:(t + 1) * Wp], src=src[k * _P:k * _P + cs[k], t, 0, 0:Wp])
-            ets.append(et)
-            eys.append(nl.ndarray((_P, F), dtype=x.dtype, buffer=nl.sbuf))
-        _norm(ets, eys, T * Wp, cs, ones, gts, F)
-        for k in range(nct):
-            for t in range(T):
-                nisa.dma_copy(dst=out[k * _P:k * _P + cs[k], 2 + t, r, 0:Wp], src=eys[k][0:cs[k], t * Wp:(t + 1) * Wp])
+        for f0 in range(0, T, TG):
+            tg = min(TG, T - f0)
+            ets, eys = [], []
+            for k in range(nct):
+                et = nl.ndarray((_P, F), dtype=x.dtype, buffer=nl.sbuf)
+                for t in range(tg):
+                    nisa.dma_copy(dst=et[0:cs[k], t * Wp:(t + 1) * Wp], src=src[k * _P:k * _P + cs[k], f0 + t, 0, 0:Wp])
+                ets.append(et)
+                eys.append(nl.ndarray((_P, F), dtype=x.dtype, buffer=nl.sbuf))
+            _norm(ets, eys, tg * Wp, cs, ones, gts, F)
+            for k in range(nct):
+                for t in range(tg):
+                    nisa.dma_copy(dst=out[k * _P:k * _P + cs[k], 2 + f0 + t, r, 0:Wp],
+                                  src=eys[k][0:cs[k], t * Wp:(t + 1) * Wp])
     # interior rows 1..H in tiles of R rows (with their left / right halo columns)
     for t in nl.affine_range(T):
         for j in nl.affine_range(H // R):
