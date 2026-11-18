@@ -41,7 +41,7 @@ Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). Thi
 
 # 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks), work in progress toward 16 fps
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
-Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t14 set).
+Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t17 set).
 | Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
 |---|---|---|---|---|---|
 | s0_base | `flags_2chip.txt` | 6976.3 | 889 | 10.30 | FAIL (G1 19.99) |
@@ -61,7 +61,8 @@ Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t14 set
 | t5 | + `MX_TUNED_M544=1` (tuned tiles for the full-weight cross q / o at M=544) | 4561.0 | 715 (-O1) | 15.35 | PASS (G1 20.65) |
 | t8 | + `C3_DEPTH=3`, `VAE_NKI_HALO=1` (decode: norm + SiLU + halo + cache of every C <= 128 conv input as one NKI kernel) | 4555.1 | 646 | 15.57 | PASS (G1 20.65, G2 16.81) |
 | t11 | + `VAE_NKI_CONV=all VAE_NKI_CONV_SQ=bf16 VAE_NKI_CONV_LA=1 VAE_NKI_CONV_CMAX=192` (decode: norm + halo + cache + causal 3x3x3 conv as one NKI kernel, C <= 192) | 4558.4 | 582 | 15.76 | PASS (G1 20.65, G2 16.81) |
-| **t14** | **+ `RESIDUAL_BF16=1` (bf16 residual stream between the block's steps)** | **4521.6** | **587** | **15.86** | **PASS** (G1 20.33, G2 15.41, c0s0 0.0396) |
+| t14 | + `RESIDUAL_BF16=1` (bf16 residual stream between the block's steps) | 4521.6 | 587 | 15.86 | PASS (G1 20.33, G2 15.41, c0s0 0.0396) |
+| **t17** | **+ `VAE_NKI_UP=2d VAE_NKI_UP_FOLD=1` (decode: nearest x2 upsample + 3x3 conv as one NKI kernel on the low-res tile)** | **4511.8** | **573** | **15.93** | **PASS** (G1 20.33, G2 15.41, c0s0 0.0396) |
 Refuted on the way (ledger): DVE exp offload (any share), paired exps, GpSimd adds, fused QKV (accuracy), TSPLIT,
 token-major attention output, glue kernels, bf16 residual (accuracy), FiLM bf16 all-reduce (accuracy), collective
 algorithm / DMA knobs, DMA priority for the attention loads, TP-free FFN (M=544 matmuls slower than the collectives
