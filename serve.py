@@ -62,6 +62,7 @@ VAE_URL = os.environ.get("VAE_URL")
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
+SERVE_STATS = os.environ.get("LINGBOT_SERVE_STATS", "0") == "1"
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
 BACKLOG = int(os.environ.get("LIVE_BACKLOG_FRAMES", "480"))  # unread frames that end a live session
@@ -538,6 +539,15 @@ def main():
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
             x0 = x0.cpu() if rank == 0 else x0
+            if rank == 0 and SERVE_STATS:
+                # LINGBOT_SERVE_STATS=1: per-chunk latent statistics, to find where a long
+                # live session starts to drift (perf/drift_probe.py reads these lines).
+                xf = x0.float()
+                xf = xf[0] if xf.dim() == 5 else xf
+                logging.info(f"[STATS] chunk={chunk_id} action={action} mean={xf.mean().item():.4f} "
+                             f"std={xf.std().item():.4f} absmax={xf.abs().max().item():.3f} "
+                             f"nan={int(torch.isnan(xf).sum())} "
+                             f"ch_std={','.join(f'{v:.3f}' for v in xf.reshape(xf.shape[0], -1).std(1).tolist())}")
             times = {"ctl": ctl_times.pop(chunk_id, None), "start": starts.pop(chunk_id, None),
                      "x0": time.time()}
 
