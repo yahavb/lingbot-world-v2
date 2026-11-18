@@ -68,6 +68,7 @@ def main():
     acts = a.actions.split(",")
 
     rows, cur, frames, first = [], None, [], None
+    tim = {}
     sent = {"chunk": -1}
 
     def steer(chunk):
@@ -87,6 +88,11 @@ def main():
             first = np.asarray(mid.convert("RGB"), dtype=np.float32) / 255.0
         ms = [metrics(f, first) for f in fr]
         row = {"chunk": chunk, "frames": len(fr), "t": round(time.time() - t0, 2)}
+        e = tim.get(chunk, {})
+        if e.get("start") and e.get("x0"):
+            row["dit_ms"] = round(1000 * (e["x0"] - e["start"]), 1)
+        if e.get("x0") and e.get("dec"):
+            row["vae_ms"] = round(1000 * (e["dec"] - e["x0"]), 1)
         for k in ms[0]:
             row[k] = round(float(np.mean([m[k] for m in ms])), 5)
         rows.append(row)
@@ -111,6 +117,10 @@ def main():
                 break
             continue
         c = item.get("chunk")
+        t_ = item.get("t") or {}
+        if c is not None and t_:
+            e = tim.setdefault(c, {"start": t_.get("start"), "x0": t_.get("x0")})
+            e["dec"] = t_.get("dec")
         if c != cur:
             flush(cur, frames)
             frames, cur = [], c
