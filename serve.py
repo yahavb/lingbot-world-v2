@@ -62,6 +62,7 @@ VAE_URL = os.environ.get("VAE_URL")
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
+SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
 BACKLOG = int(os.environ.get("LIVE_BACKLOG_FRAMES", "480"))  # unread frames that end a live session
@@ -538,6 +539,11 @@ def main():
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
             x0 = x0.cpu() if rank == 0 else x0
+            if rank == 0 and SAVE_LATENTS:
+                # LINGBOT_SERVE_SAVE_LATENTS=<dir>: every chunk's latents, to decode a live session
+                # offline (decode_latents_width_sharded.py) and compare with the inline VAE's frames
+                os.makedirs(SAVE_LATENTS, exist_ok=True)
+                torch.save(x0.clone(), f"{SAVE_LATENTS}/c{chunk_id:04d}.pt")
             times = {"ctl": ctl_times.pop(chunk_id, None), "start": starts.pop(chunk_id, None),
                      "x0": time.time()}
 
