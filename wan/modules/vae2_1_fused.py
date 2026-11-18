@@ -337,6 +337,12 @@ _NKI_CONV_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_CMAX", "128"))
 # (perf/vae_head_bench.py VARIANT=rbres), stage-3 ResidualBlock -27..-34 us; decode neutral (587-589 vs 587 ms with
 # NKI_CONV=all SQ=bf16 LA=1, 52.87 dB), so not in the best flag set.
 _NKI_CONV_RES = os.environ.get("LINGBOT_VAE_NKI_CONV_RES", "0") == "1"
+# LINGBOT_VAE_NKI_CONV_TMAX=n (with =all): at most n frames per call of the fused kernel; a unit with more (LINGBOT_VAE_T
+# > 1 puts 4 x LINGBOT_VAE_T frames on stages 2 / 3) calls it on consecutive pieces chained through the cache.
+# Measured (perf/vae_repeat_check.sh, 12 decodes each): with LA=1 the kernel at 8 frames per call corrupts bursts of
+# frames in about half the decodes (always from frame 5 of an 8-frame step); with LA=0 8 and 12 frames are clean but
+# 16 frames (LINGBOT_VAE_T=4) corrupt 3 of 12. The production 4 frames per call (LINGBOT_VAE_T=1) was clean in every run.
+_NKI_CONV_TMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_TMAX", "0") or 0)
 if _NKI_CONV != "0":
     from kernels.vae_norm_halo_conv import norm_halo_conv as _nki_norm_halo_conv
     from kernels.vae_head_conv import head_conv_weights as _nki_conv_w
@@ -380,6 +386,21 @@ def _nh_conv(x, cache, gamma, scale, w, b, sel, nki_conv=False, head=False, res=
     l, r, u, d = _raw_edges_2d(xb, sel)
     c = x.shape[1]
     if _nh_fused(x, w, b, head):
+        T = int(xb.shape[2])
+        if _NKI_CONV_TMAX and T > _NKI_CONV_TMAX:
+            # LINGBOT_VAE_NKI_CONV_TMAX: the frames in kernel calls of at most TMAX, chained through the cache
+            # (two calls of T / 2 == one call bit for bit, perf/vae_conv_t_check.py); the halo exchange stays one.
+            g_, w_, b_ = gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1)
+            nc = cache[0].to(torch.bfloat16)
+            ys = []
+            for t0 in range(0, T, _NKI_CONV_TMAX):
+                t1 = min(T, t0 + _NKI_CONV_TMAX)
+                y_, nc = _nki_norm_halo_conv(
+                    xb[0, :, t0:t1].contiguous(), l[0, :, t0:t1].contiguous(), r[0, :, t0:t1].contiguous(),
+                    u[0, :, t0:t1].contiguous(), d[0, :, t0:t1].contiguous(), nc, g_, w_, b_,
+                    None if res is None else res[0, :, t0:t1].contiguous())
+                ys.append(y_)
+            return torch.cat(ys, 1).unsqueeze(0), nc.unsqueeze(0)
         y, nc = _nki_norm_halo_conv(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
                                     gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1),
                                     None if res is None else res[0])
@@ -528,6 +549,14 @@ _LOW_T = int(os.environ.get("LINGBOT_VAE_LOW_T", "0") or 0)
 # stage 0's upsample and stage 1). Measured: a LOW_T smaller than the latent's frame count (several low steps) lowered
 # vs_R (52.13 dB at LOW_T=5): use LOW_T >= frames - 1.
 _LOW_UPS = int(os.environ.get("LINGBOT_VAE_LOW_UPS", "1") or 1)
+# Intermittent decode error with more than one latent frame per step (LINGBOT_VAE_T=2, LOW_T=5): bursts of 7-11
+# frames at 28-46 dB vs R in a run-dependent place, more often under host load; the fused conv kernel alone is exact
+# at 8 frames (perf/vae_conv_t_check.py). Diagnostics:
+# LINGBOT_VAE_STEP_SYNC=1: torch.neuron.synchronize() after every decode step (bounds the work in flight).
+# LINGBOT_VAE_HOLD=1: keep every step's unit outputs and its input caches referenced until decode() returns (no
+# device buffer of the decode is freed, and so reused, while queued work may still read it).
+_STEP_SYNC = os.environ.get("LINGBOT_VAE_STEP_SYNC", "0") == "1"
+_HOLD = os.environ.get("LINGBOT_VAE_HOLD", "0") == "1"
 if _NKI_UP != "0":
     from kernels.vae_up_conv import up_conv as _nki_up_conv, up_conv_weights as _nki_up_w
 
@@ -658,6 +687,14 @@ class FusedWidthDecoder:
         return len(self.units)
 
     def _step(self, x, caches, first, u0=0, u1=None):
+        out = self._step_body(x, caches, first, u0, u1)
+        if _HOLD:
+            self.__dict__.setdefault("_held", []).append((x, caches, out))
+        if _STEP_SYNC:
+            torch.neuron.synchronize()
+        return out
+
+    def _step_body(self, x, caches, first, u0=0, u1=None):
         new, i = [], 0
 
         def cache(c, halo=True, fp32=False):
@@ -721,6 +758,8 @@ class FusedWidthDecoder:
                 s = self._ut.setdefault(_key, [0, 0.0])
                 s[0] += 1
                 s[1] += time.perf_counter() - _t0
+            if _HOLD:
+                self.__dict__.setdefault("_held", []).append(x)
         return x, new
 
     def unit_timing_report(self):
@@ -744,6 +783,7 @@ class FusedWidthDecoder:
         one frame; k only changes how many graph launches and halo exchanges the decode takes."""
         if self.sel is None:
             self.sel = _selectors(z.device)
+        self._held = []           # LINGBOT_VAE_HOLD: the previous decode's references (it has completed by now)
         zd = self.model.z_dim
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, zd, 1, 1, 1) + scale[0].view(1, zd, 1, 1, 1)

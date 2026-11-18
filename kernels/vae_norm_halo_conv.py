@@ -18,7 +18,11 @@ arithmetic as kernels/vae_norm_halo.py (fp32 squares and ones-matmul by default)
 LINGBOT_VAE_NKI_CONV_R: output rows per band (default 12, the largest divisor of H not above it; 20 and 24 were no
 better: 1678 / 1735 vs 1692-1705 us for the 96 -> 96 conv unit, perf/vae_head_bench.py VARIANT=fused).
 LINGBOT_VAE_NKI_CONV_LA=n: issue each output frame's matmuls after n more frames' norms (default 0: in order; 1 and 2
-measured the same as 0 within 15 us).
+measured the same as 0 within 15 us). DO NOT use n >= 1 above 4 frames per call: in the 16-rank decode with 8 frames
+per call (LINGBOT_VAE_T=2) LA=1 corrupted a burst of frames (from output frame 5 on) in about half the decodes,
+run-dependent and more often under host load, while this kernel alone on one core was exact (perf/vae_conv_t_check.py,
+perf/vae_repeat_check.sh). With LA=0, 8 and 12 frames per call were clean; 16 frames corrupted 3 of 12 decodes (from
+output frame 2), so the race is not only the look-ahead; keep the calls at <= 12 frames.
 LINGBOT_VAE_NKI_CONV_EDGE=copy: load the left / right halo columns contiguously and place them with a GpSimd copy
 (kernels/vae_norm_halo.py's LINGBOT_VAE_NKI_HALO_EDGE=copy) instead of one 2-byte DMA element per row. REFUTED
 (accuracy): bit-identical in the one-core benches (96 -> 96 conv unit 1580 -> 1530 us, head 1614 -> 1514 us with
