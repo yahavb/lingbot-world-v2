@@ -652,17 +652,26 @@ _CTE_PRIOR_FULL = os.environ.get("LINGBOT_CTE_PRIOR_FULL", "0") == "1"
 
 
 def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, normalize=False,
-             v_token_major=False):
+             v_token_major=False, h_cnt=0, q_dmajor=False, one_core=False):
     """One self-attention attention_cte call of the vendored kernel (LINGBOT_CTE_CHAIN), output in the
     tp_out layout [n, d, Lq_p]. normalize=False: (out, neg_max, sum) -- unnormalized output and the
     kernel's own [n, 128, groups] statistics -- for the next call's chain=. chain=(out, neg_max, sum)
     of an earlier call over other keys with the same q_c: this call continues that call's online
     softmax, so the last call of a chain returns the attention over the union of all the calls' keys.
     normalize=True: the normalized output only. k_prior / v_prior and k_blocks as in cte_partial.
-    v_token_major (LINGBOT_V_TOKEN_MAJOR): V and the V prior hold [L, n, d] memory under the [n, L, d] shape."""
-    d = int(q_c.shape[-1])
+    v_token_major (LINGBOT_V_TOKEN_MAJOR): V and the V prior hold [L, n, d] memory under the [n, L, d] shape.
+    LINGBOT_HOT_NOCOPY: q_dmajor -- q_c is d-major [n, d, Lq_p] (the constant-offset kernels' q_t; the kernel's
+    tp_q=False load, no transpose); h_cnt = N > 0 -- only heads 0 .. N - 1 of q_c / kc / vc / the priors
+    (full tensors, no head-sliced copies), the output and statistics [N, ...]. one_core (LINGBOT_HOT_ONECORE): every
+    head on the logical core's program 0."""
+    d = int(q_c.shape[1] if q_dmajor else q_c.shape[-1])
     tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
+    tpq = not q_dmajor
     kw = {}
+    if h_cnt:
+        kw["h_cnt"] = int(h_cnt)
+    if one_core:
+        kw["one_core"] = True
     if k_blocks > 1:
         kw["k_blocks"] = int(k_blocks)
     if k_prior is not None:
@@ -676,10 +685,10 @@ def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, no
     if v_token_major:
         kw["v_token_major"] = True
     if normalize:
-        out = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+        out = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=tpq, tp_k=tp_k,
                              tp_out=True, **kw)
         return out[0] if isinstance(out, tuple) else out
-    return tuple(_attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+    return tuple(_attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=tpq, tp_k=tp_k,
                                 tp_out=True, cache_softmax=True, skip_output_normalization=True, **kw))
 
 
@@ -715,6 +724,12 @@ def _cmax_kernels():
                 "part2h": wrap_nki(cm3.cmax3_part_2h),
                 "part3h": wrap_nki(cm3.cmax3_part_3h),
                 "final1h": wrap_nki(cm3.cmax3_final_1h),
+                # LINGBOT_HOT_ONECORE: the same with an uneven LNC2 head split (h_split heads on program 0)
+                "full1hs": wrap_nki(cm3.cmax3_full_1hs),
+                "part1hs": wrap_nki(cm3.cmax3_part_1hs),
+                "part2hs": wrap_nki(cm3.cmax3_part_2hs),
+                "part3hs": wrap_nki(cm3.cmax3_part_3hs),
+                "final1hs": wrap_nki(cm3.cmax3_final_1hs),
             }
         elif _CMAX_MODE == 2:
             from kernels import attention_cmax2_lb as cm
@@ -767,10 +782,15 @@ def _cmax_arg(offset):
     return offset if torch.is_tensor(offset) else float(offset)
 
 
-def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False, h_lo=0):
+def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False, h_lo=0, h_split=0):
     """fp32 accumulator [n, Lq_p, d + 1] (unnormalized output and row sums) over up to 3 chunks (K [n, d, L],
     V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say). h_lo (LINGBOT_CMAX=3,
-    LINGBOT_HOT_HEADS): heads h_lo .. n - 1 only."""
+    LINGBOT_HOT_HEADS): heads h_lo .. n - 1 only; h_split (LINGBOT_HOT_ONECORE): h_split of them on program 0."""
+    if h_lo and h_split:
+        assert _CMAX_MODE == 3, "h_split: LINGBOT_CMAX=3 only"
+        return _cmax_kernels()[f"part{len(k_chunks)}hs"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
+                                                         *_cmax_layout(k_blocks, v_token_major), int(h_lo),
+                                                         int(h_split))
     if h_lo:
         assert _CMAX_MODE == 3, "h_lo: LINGBOT_CMAX=3 only"
         return _cmax_kernels()[f"part{len(k_chunks)}h"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
@@ -779,12 +799,18 @@ def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=Fals
                                                    *_cmax_layout(k_blocks, v_token_major))
 
 
-def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0, h_lo=0):
+def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0, h_lo=0, h_split=0):
     """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only).
     LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair; with tok_cols (LINGBOT_C3_TOKOUT)
     token-major [Lq_p, tok_cols] instead, the heads' n x d columns then zeros."""
     k = _cmax_kernels()
     lay = _cmax_layout(k_blocks, v_token_major)
+    if h_lo and h_split:
+        # LINGBOT_HOT_ONECORE: as below, h_split of the heads on program 0
+        assert _CMAX_MODE == 3 and not tok_cols, "h_split: LINGBOT_CMAX=3, no tok_cols"
+        if acc is None:
+            return k["full1hs"](q_t, kc, vc, _cmax_arg(offset), *lay, int(h_lo), int(h_split))
+        return k["final1hs"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(h_lo), int(h_split))
     if h_lo:
         # LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only -> [n - h_lo, d, Lq_p]
         assert _CMAX_MODE == 3 and not tok_cols, "h_lo: LINGBOT_CMAX=3, no tok_cols"

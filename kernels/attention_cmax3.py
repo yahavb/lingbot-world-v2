@@ -134,19 +134,26 @@ def _load_v(v_sb, v, head, n_heads, d, seq_k, n_tiles, token_major):
 
 
 def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None, s_in=None, normalize=True,
-           tok_cols=0, h_lo=0):
+           tok_cols=0, h_lo=0, h_split=0):
     # h_lo (LINGBOT_HOT_HEADS): only heads h_lo .. n_heads - 1 of q / K / V (all heads' layouts and strides), the
     # outputs and accumulators holding those n_heads - h_lo heads
+    # h_split = m > 0 (LINGBOT_HOT_ONECORE, LNC2): program 0 takes heads h_lo .. h_lo + m - 1, program 1 the rest
     n_heads, d, seq_q = q_hbm.shape
     kernel_assert(d == _P, f"d must be {_P}, got {d}")
     kernel_assert(seq_q % _P == 0, f"seq_q={seq_q} must be a multiple of {_P}")
     _, n_prgs, prg_id = get_verified_program_sharding_info("attention_cmax3", max_sharding=2)
     h_lo = int(h_lo or 0)
     h_cnt = n_heads - h_lo
-    kernel_assert(0 <= h_lo < n_heads and h_cnt % n_prgs == 0, f"{n_heads=} {h_lo=} vs {n_prgs=}")
+    h_split = int(h_split or 0)
     kernel_assert(not (h_lo and tok_cols), "h_lo: no tok_cols")
-    per = h_cnt // n_prgs
-    h0 = h_lo + prg_id * per
+    if h_split and n_prgs == 2:
+        kernel_assert(0 < h_split < h_cnt, f"{h_split=} vs {h_cnt=}")
+        per = h_split if prg_id == 0 else h_cnt - h_split
+        h0 = h_lo if prg_id == 0 else h_lo + h_split
+    else:
+        kernel_assert(0 <= h_lo < n_heads and h_cnt % n_prgs == 0, f"{n_heads=} {h_lo=} vs {n_prgs=}")
+        per = h_cnt // n_prgs
+        h0 = h_lo + prg_id * per
     c = float(offset)
     tok = int(tok_cols or 0)
     kernel_assert(not tok or normalize, "tok_cols: normalized calls only")
@@ -898,3 +905,33 @@ def cmax3_part_3h(q, k0, k1, k2, v0, v1, v2, softmax_max, k_blocks, v_token_majo
 def cmax3_final_1h(q, k0, v0, o_acc, s_acc, softmax_max, k_blocks, v_token_major, h_lo):
     return _IMPLH(q, [k0], [v0], softmax_max, k_blocks, v_token_major, o_in=o_acc, s_in=s_acc, normalize=True,
                   h_lo=h_lo)
+
+
+# LINGBOT_HOT_ONECORE: the h_lo kernels with an uneven LNC2 split -- program 0 takes heads h_lo .. h_lo + h_split - 1,
+# program 1 the rest (program 0 also runs every exact head, attention_cte_lb one_core)
+@nki.jit
+def cmax3_full_1hs(q, k0, v0, softmax_max, k_blocks, v_token_major, h_lo, h_split):
+    return _cmax3(q, [k0], [v0], softmax_max, k_blocks, v_token_major, normalize=True, h_lo=h_lo, h_split=h_split)
+
+
+@nki.jit
+def cmax3_part_1hs(q, k0, v0, softmax_max, k_blocks, v_token_major, h_lo, h_split):
+    return _cmax3(q, [k0], [v0], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo, h_split=h_split)
+
+
+@nki.jit
+def cmax3_part_2hs(q, k0, k1, v0, v1, softmax_max, k_blocks, v_token_major, h_lo, h_split):
+    return _cmax3(q, [k0, k1], [v0, v1], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo,
+                  h_split=h_split)
+
+
+@nki.jit
+def cmax3_part_3hs(q, k0, k1, k2, v0, v1, v2, softmax_max, k_blocks, v_token_major, h_lo, h_split):
+    return _cmax3(q, [k0, k1, k2], [v0, v1, v2], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo,
+                  h_split=h_split)
+
+
+@nki.jit
+def cmax3_final_1hs(q, k0, v0, o_acc, s_acc, softmax_max, k_blocks, v_token_major, h_lo, h_split):
+    return _cmax3(q, [k0], [v0], softmax_max, k_blocks, v_token_major, o_in=o_acc, s_in=s_acc, normalize=True,
+                  h_lo=h_lo, h_split=h_split)

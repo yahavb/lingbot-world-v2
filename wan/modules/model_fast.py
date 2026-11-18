@@ -316,6 +316,19 @@ for _it in (t_ for t_ in _HOT_SPEC.replace(" ", "").split(";") if t_):
     _l, _t, _hs = _it.split(":")
     _HOT.setdefault(int(_l), {})[int(_t)] = [int(h_) for h_ in _hs.split(",") if h_]
 _HOT_NE = {L_: 2 * (-(-max(len(v_) for v_ in d_.values()) // 2)) for L_, d_ in _HOT.items()}
+# LINGBOT_HOT_NOCOPY=1 (LINGBOT_HOT_HEADS): the exact kernels read heads 0 .. N_e - 1 of the constant-offset path's
+# d-major q_t and of the full cached / gathered K and V chunks (attention_cte_lb h_cnt, tp_q=False) instead of a
+# transposed copy of Q and head-sliced copies of every K / V chunk. Same values.
+_HOT_NOCOPY = os.environ.get("LINGBOT_HOT_NOCOPY", "0") == "1"
+# LINGBOT_HOT_ORDER=k (LINGBOT_HOT_HEADS): program order of the hybrid's four attention calls. 0: cmax lead, exact
+# lead, cmax final, exact final (default); 1: exact lead first; 2: exact final before cmax final; 3: both.
+_HOT_ORDER = int(os.environ.get("LINGBOT_HOT_ORDER", "0") or 0)
+# LINGBOT_HOT_ONECORE=1 (LINGBOT_HOT_NOCOPY, LNC2): every exact head on the logical core's program 0 (attention_cte_lb
+# one_core) and the constant-offset heads split unevenly to match (program 0: n / 2 - N_e of them, program 1: n / 2),
+# instead of half of each kind per physical core. An exact head costs about one constant-offset head of engine time.
+_HOT_ONECORE = os.environ.get("LINGBOT_HOT_ONECORE", "0") == "1"
+assert not _HOT_ONECORE or _HOT_NOCOPY, "LINGBOT_HOT_ONECORE needs LINGBOT_HOT_NOCOPY"
+
 # LINGBOT_V_GATHER_FIRST=1: in the step forward, the new chunk's V CP all-gather issued before its K gather.
 _V_GATHER_FIRST = os.environ.get("LINGBOT_V_GATHER_FIRST", "0") == "1"
 # LINGBOT_DIAG_NOGATHER=1 (diagnostic, wrong output): the step forward attends the new chunk's cache slot instead of
@@ -2174,9 +2187,11 @@ class CausalWanSelfAttention(nn.Module):
                     q_t, lq = _qt_pre, int(_qt_pre.shape[2])
                     nh = int(q_t.shape[0])
                     lead_k, lead_v = list(k_chunks[:-1]), list(v_chunks[:-1])
-                    acc = (cmax_partial(q_t, lead_k, lead_v, _CMAX_OFFSET, _kb, True, h_lo=ne)
-                           if lead_k else None)
-                    q_ce = q_t[:ne].transpose(1, 2).contiguous()          # [N_e, Lq_p, d], already scaled
+                    # LINGBOT_HOT_ONECORE: program 0 holds the N_e exact heads, so n / 2 - N_e constant-offset ones
+                    _hs = (nh // 2 - ne) if (_HOT_ONECORE and nh // 2 > ne) else 0
+                    if _HOT_ORDER in (0, 2, 4):
+                        acc = (cmax_partial(q_t, lead_k, lead_v, _CMAX_OFFSET, _kb, True, h_lo=ne, h_split=_hs)
+                               if lead_k else None)
 
                     def _k_hot(kc_):
                         lk = int(kc_.shape[2])                            # [n, d, L] shape; memory [kb, n, d, L/kb]
@@ -2186,14 +2201,27 @@ class CausalWanSelfAttention(nn.Module):
                         lv = int(vc_.shape[1])                            # [n, L, d] shape, [L, n, d] memory
                         return vc_.view(lv, nh, _d)[:, :ne].contiguous().view(ne, lv, _d)
 
+                    if _HOT_NOCOPY:
+                        # LINGBOT_HOT_NOCOPY: the exact calls read heads 0 .. N_e - 1 of q_t (d-major) and of the
+                        # full K / V chunks themselves (the kernel's h_cnt), no transposed Q, no head copies
+                        q_ce, _ckw = q_t, dict(h_cnt=ne, q_dmajor=True, one_core=bool(_hs))
+                        _k_hot = _v_hot = (lambda t_: t_)
+                    else:
+                        q_ce, _ckw = q_t[:ne].transpose(1, 2).contiguous(), {}   # [N_e, Lq_p, d], already scaled
+
                     lead = [(_k_hot(kc_), _v_hot(vc_)) for kc_, vc_ in zip(lead_k, lead_v)]
                     last = lead.pop() if (_ATTN_PAIR and lead) else None
                     state = None
                     while _ATTN_PAIR and len(lead) >= 2:
                         (ka, va), (kb2, vb2) = lead.pop(0), lead.pop(0)
-                        state = cte_call(q_ce, kb2, vb2, ka, va, k_blocks=_kb, chain=state, v_token_major=True)
+                        state = cte_call(q_ce, kb2, vb2, ka, va, k_blocks=_kb, chain=state, v_token_major=True,
+                                         **_ckw)
                     for kc_, vc_ in lead:
-                        state = cte_call(q_ce, kc_, vc_, k_blocks=_kb, chain=state, v_token_major=True)
+                        state = cte_call(q_ce, kc_, vc_, k_blocks=_kb, chain=state, v_token_major=True, **_ckw)
+                    if _HOT_ORDER in (1, 3, 5):
+                        # LINGBOT_HOT_ORDER: the exact lead calls first in program order
+                        acc = (cmax_partial(q_t, lead_k, lead_v, _CMAX_OFFSET, _kb, True, h_lo=ne, h_split=_hs)
+                               if lead_k else None)
                     if _ATTN_EARLY != 2:
                         kg, vg = _gather_new()
                     if kv_write:
@@ -2203,9 +2231,20 @@ class CausalWanSelfAttention(nn.Module):
                             kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
                     elif not _DIAG_NOGATHER:
                         kd, vd = kg.reshape(kd.shape), vg.reshape(vd.shape)
-                    o_c = cmax_final(q_t, kd, vd, acc, _CMAX_OFFSET, _kb, True, h_lo=ne)   # [n - N_e, d, Lq_p]
-                    o_e = cte_call(q_ce, _k_hot(kd), _v_hot(vd), *(last if last is not None else ()), k_blocks=_kb,
-                                   chain=state, normalize=True, v_token_major=True)        # [N_e, d, Lq_p]
+
+                    def _last_e():
+                        return cte_call(q_ce, _k_hot(kd), _v_hot(vd), *(last if last is not None else ()),
+                                        k_blocks=_kb, chain=state, normalize=True, v_token_major=True,
+                                        **_ckw)                                     # [N_e, d, Lq_p]
+
+                    if _HOT_ORDER in (2, 3):
+                        # LINGBOT_HOT_ORDER: the exact final call before the constant-offset one
+                        o_e = _last_e()
+                        o_c = cmax_final(q_t, kd, vd, acc, _CMAX_OFFSET, _kb, True, h_lo=ne, h_split=_hs)
+                    else:
+                        o_c = cmax_final(q_t, kd, vd, acc, _CMAX_OFFSET, _kb, True, h_lo=ne,
+                                         h_split=_hs)                               # [n - N_e, d, Lq_p]
+                        o_e = _last_e()
                     o_n = torch.cat([o_e.to(o_c.dtype), o_c], dim=0)
                     x = o_n[:, :, :lq].permute(2, 0, 1).unsqueeze(0)       # [n, d, Lq_p] -> [1, Lq, n, d]
                     out = self._out_proj(x, _async_out, scatter=_sp_scatter)
