@@ -1,0 +1,42 @@
+# ALB Ingress for KEEP-trn3-dev1 (us-east-2).
+#
+#   /lbw/  -> lbw-web:7860  (web_app.py serves under /lbw itself: URL_PREFIX=/lbw)
+#
+# The ALB cannot rewrite paths, so each app must serve under its own prefix.
+# To add an app: give it a prefix, add a path below pointing at its Service.
+#
+# SECURITY: lbw-web has no login. Inbound is limited at the ALB security group to the
+# keep-trn3-dev1-corp prefix list (Amazon CORP ranges) plus yahavb's home IP. Do NOT open
+# it to 0.0.0.0/0 -- that publishes an unauthenticated app that drives Trainium.
+#
+# HTTP only: no ACM certificate in us-east-2 yet.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dev1
+  namespace: default
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    # Union of this account's two Amazon CORP lists; VPN egress rotates across them.
+    alb.ingress.kubernetes.io/security-group-prefix-lists: pl-025f2c1c85ff40379
+    # User-requested 2026-11-15: yahavb's home IP (off VPN). Update if it changes.
+    alb.ingress.kubernetes.io/inbound-cidrs: 50.46.241.164/32,15.248.7.0/24
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/load-balancer-name: keep-trn3-dev1
+    alb.ingress.kubernetes.io/healthcheck-path: /lbw/
+    # lbw streams a session for minutes; raise the 60s default idle timeout.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=900
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /lbw
+            pathType: Prefix
+            backend:
+              service:
+                name: lbw-web
+                port:
+                  number: 7860

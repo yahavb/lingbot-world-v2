@@ -1,18 +1,6 @@
-# 4-device demo front end for lbw-deploy.yaml; Service ClusterIP only.
-# Live, steerable front end (web_app.py + web/index.html) for lbw-v2. ClusterIP only:
-#   kubectl port-forward svc/lbw-web 7860:7860   then open http://localhost:7860
-apiVersion: v1
-kind: Service
-metadata:
-  name: lbw-web
-spec:
-  type: ClusterIP
-  selector:
-    app: lbw-web
-  ports:
-    - port: 7860
-      targetPort: 7860
----
+# Front end for lbw-deploy.yaml (Service in lbw-svc.yaml, ALB path in lbw-ing.yaml).
+# Live, steerable front end (web_app.py + web/index.html) for lbw-v2. served at /lbw through the ALB (lbw-ing.yaml);
+#   fallback: kubectl port-forward svc/lbw-web 7860:7860, then http://localhost:7860/lbw/
 apiVersion: apps/v1
 kind: Deployment
 metadata:

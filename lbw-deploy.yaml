@@ -1,27 +1,8 @@
-# lbw-v2 on 4 trn3 devices at LNC2 (l-lnc2, 16 ranks, TP4 x CP4, 480x768), DiT + T5 + VAE in
-# one pod (no VAE_URL). DiT block Linears in MXFP8 (K=1280 ones bf16), K/V tile DMA descriptors on the
-# Sync engine (LINGBOT_CTE_KV_DGE=hwdge_sync), plus the kiro_mx4 16 fps flags (kiro_mx4/RESULTS.md: MX_FAST_DMA,
-# all 12 Linears MX, CTE_CHAIN, V_TOKEN_MAJOR, CTE_QPAD=32, CROSS_DEDUP=128, POST_LEAN KV_REUSE START_OVERLAP=4
-# FILM_SHARD SCHED_FUSE GC_OFF); the rest = the ledger flags of the 4-device 13.5 fps run.
-# Deployment + Service lbw-v2 (lbw-web LBW_URL points here). Serves at
-# 12.9 fps steady through the service (measured 2026-11-17, perf: docs/perf/MXFP8_LNC1.md).
-# DiT + T5 streaming server (serve.py) on HALF a trn3 node (xl-lnc2: 8 devices, 32 ranks), TP4 x CP8
-# with the q20_kbnw flags -- the half-instance row of kiro/LOOP_ENGINEERING.md (17.88 fps with an
-# inline VAE); streaming with lbw-v2-vae it measured 17.3 fps and ~1.1 s from a control press to
-# its frames at the browser. Latent chunks go to
-# lbw-v2-vae (VAE_URL). The converted checkpoint and compiled NEFFs live on the node
-# (hostPath /opt/lingbot-world-v2).
-apiVersion: v1
-kind: Service
-metadata:
-  name: lbw-v2
-spec:
-  selector:
-    app: lbw-v2
-  ports:
-    - port: 8000
-      targetPort: 8000
----
+# lbw-v2: the LingBot-World v2 streaming server (serve.py) on 4 trn3 devices at LNC2 (claim l-lnc2,
+# 16 ranks, TP4 x CP4), 480x768, DiT + T5 + VAE in one pod. DiT Linears in MXFP8 plus the kiro_mx4
+# 16 fps flags (kiro_mx4/RESULTS.md). Measured 15.2 fps streaming, warm, through the service (2026-11-17).
+# Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml.
+# The converted checkpoint and compiled NEFFs live on the node (hostPath /opt/lingbot-world-v2).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
