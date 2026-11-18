@@ -1,5 +1,5 @@
-# lbw-dbg: a copy of lbw-v2 (same flags, 4 trn3 devices LNC2, TP4 x CP4, VAE inline) on the other
-# trn3 node, with LINGBOT_SERVE_STATS=1, for the long-session drift probe (perf/drift_probe.py).
+# lbw-dbg: a copy of lbw-v2 (same flags, 4 trn3 devices LNC2, TP4 x CP4, VAE inline) on a free
+# trn3 device group (node 137, devices 12-15), with LINGBOT_SERVE_STATS=1, for the long-session drift probe (perf/drift_probe.py).
 # No Service: drive it with kubectl exec. Delete when done.
 apiVersion: apps/v1
 kind: Deployment
@@ -19,7 +19,7 @@ spec:
     spec:
       nodeSelector:
         node-type: trn3-dev1
-        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
+        kubernetes.io/hostname: ip-192-168-192-137.us-east-2.compute.internal
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: l-lnc2
@@ -90,9 +90,10 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "90"
-              memory: 900Gi
-              ephemeral-storage: 600Gi
+              # node 137 is fully requested on paper (real use ~19%); lbw-v2 uses ~312 GiB
+              cpu: "8"
+              memory: 50Gi
+              ephemeral-storage: 200Gi
             limits:
               cpu: "95"
               memory: 950Gi
