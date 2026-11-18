@@ -50,8 +50,17 @@ mm = wrap_nki(_mm_pq)        # the same, traceable inside a fullgraph torch.comp
 # (every core then quantizes half the rows but loads all of the weight), ahead of any tuned table.
 # perf/mx_shard_bench.py with the NKI trace cache off, M=2176, (5120, 1280) q / k / v: default N-split 121.3 us,
 # default M-split 143.1, the M2176 table's tiles (M split, what LINGBOT_MX_TUNED_M2176 ran) 277.9.
-_NSHARD = tuple(tuple(int(v) for v in k.split("x"))
-                for k in os.environ.get("LINGBOT_MX_NSHARD", "").replace(":", ",").split(",") if k)
+# An entry "KxN@M" applies only to calls with M rows (e.g. 5120x5120@544: the full-weight cross q / o, not the FiLM).
+_NSHARD, _NSHARD_M = (), ()
+for _k in os.environ.get("LINGBOT_MX_NSHARD", "").replace(":", ",").split(","):
+    if not _k:
+        continue
+    _kn, _, _m = _k.partition("@")
+    _key = tuple(int(v) for v in _kn.split("x"))
+    if _m:
+        _NSHARD_M += (_key + (int(_m),),)
+    else:
+        _NSHARD += (_key,)
 @nki.jit
 def _mm_pq_n(lhs, w_data, w_scales):
     return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
@@ -142,8 +151,10 @@ _M2176_DEFAULT = tuple(tuple(int(v) for v in k.split("x"))
 
 
 def mm(x, w_data, w_scales):  # noqa: F811 -- tuned dispatch over the default kernel
-    if _NSHARD and LNC == 2 and (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4) in _NSHARD:
-        return _mm_nshard(x, w_data, w_scales)      # LINGBOT_MX_NSHARD
+    if (_NSHARD or _NSHARD_M) and LNC == 2:
+        _kk = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
+        if _kk in _NSHARD or _kk + (int(x.shape[0]),) in _NSHARD_M:
+            return _mm_nshard(x, w_data, w_scales)      # LINGBOT_MX_NSHARD
     if _TUNED_ON and int(x.shape[0]) in _TUNED_BY_M:
         tbl = _TUNED_BY_M[int(x.shape[0])]
         key = (int(w_data.shape[0]) * 4, int(w_data.shape[1]) // 4)
