@@ -126,7 +126,7 @@ function timing(f, shownAt) {
 }
 
 // the serving setup, last line of the video HUD
-const SETUP = "4x trn3-dev1   MXFP8   LNC2   480\u00d7768";
+const SETUP = "2x trn3-dev1   MXFP8   LNC2   480\u00d7768";
 function fpsText() {
   const g = rate(arrivals, 6000), v = rate(shown, 3000);
   return g > 0 || v > 0 ? `fps: generated ${g.toFixed(1)}, shown ${v.toFixed(1)}, chunk ${lastChunk}`
