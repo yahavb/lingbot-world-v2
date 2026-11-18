@@ -694,6 +694,12 @@ def _cmax_kernels():
                 # LINGBOT_C3_TOKOUT: token-major [Sq, tok_cols] output, zero columns up to the o-projection's K
                 "full1t": wrap_nki(cm3.cmax3_full_tok_1),
                 "final1t": wrap_nki(cm3.cmax3_final_tok_1),
+                # LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only
+                "full1h": wrap_nki(cm3.cmax3_full_1h),
+                "part1h": wrap_nki(cm3.cmax3_part_1h),
+                "part2h": wrap_nki(cm3.cmax3_part_2h),
+                "part3h": wrap_nki(cm3.cmax3_part_3h),
+                "final1h": wrap_nki(cm3.cmax3_final_1h),
             }
         elif _CMAX_MODE == 2:
             from kernels import attention_cmax2_lb as cm
@@ -746,19 +752,30 @@ def _cmax_arg(offset):
     return offset if torch.is_tensor(offset) else float(offset)
 
 
-def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False):
+def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False, h_lo=0):
     """fp32 accumulator [n, Lq_p, d + 1] (unnormalized output and row sums) over up to 3 chunks (K [n, d, L],
-    V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say)."""
+    V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say). h_lo (LINGBOT_CMAX=3,
+    LINGBOT_HOT_HEADS): heads h_lo .. n - 1 only."""
+    if h_lo:
+        assert _CMAX_MODE == 3, "h_lo: LINGBOT_CMAX=3 only"
+        return _cmax_kernels()[f"part{len(k_chunks)}h"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
+                                                        *_cmax_layout(k_blocks, v_token_major), int(h_lo))
     return _cmax_kernels()[f"part{len(k_chunks)}"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
                                                    *_cmax_layout(k_blocks, v_token_major))
 
 
-def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0):
+def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0, h_lo=0):
     """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only).
     LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair; with tok_cols (LINGBOT_C3_TOKOUT)
     token-major [Lq_p, tok_cols] instead, the heads' n x d columns then zeros."""
     k = _cmax_kernels()
     lay = _cmax_layout(k_blocks, v_token_major)
+    if h_lo:
+        # LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only -> [n - h_lo, d, Lq_p]
+        assert _CMAX_MODE == 3 and not tok_cols, "h_lo: LINGBOT_CMAX=3, no tok_cols"
+        if acc is None:
+            return k["full1h"](q_t, kc, vc, _cmax_arg(offset), *lay, int(h_lo))
+        return k["final1h"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(h_lo))
     if tok_cols:
         assert _CMAX_MODE == 3, "tok_cols: LINGBOT_CMAX=3 only"
         if acc is None:

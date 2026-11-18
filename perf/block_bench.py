@@ -168,7 +168,8 @@ def main():
         ks = [torch.cat(ks[:-1], dim=-1).contiguous(), ks[-1]]
         vs = [torch.cat(vs[:-1], dim=1).contiguous(), vs[-1]]
     from wan.modules.attention import cross_cache_shapes
-    _cks, _cvs = cross_cache_shapes(1, 512, heads, d)
+    # LINGBOT_CROSS_TPFREE: the full cross-attention holds all heads
+    _cks, _cvs = cross_cache_shapes(1, 512, heads * tpd if mf._CROSS_TPFREE else heads, d)
     cross = {"k": torch.zeros(_cks, dtype=torch.bfloat16, device=dev),
              "v": torch.zeros(_cvs, dtype=torch.bfloat16, device=dev),
              "is_init": torch.tensor(0, dtype=torch.int32, device=dev)}
@@ -188,6 +189,10 @@ def main():
     # then the MXFP8 FFN / every Linear when those flags are on.
     if mf._WT_PRE:
         mf._pretranspose_weights([blk])
+    if mf._HOT:
+        mf._permute_hot_heads([blk], layer0=K)     # LINGBOT_HOT_HEADS
+    if mf._CROSS_TPFREE:
+        mf._cross_full_modules([blk])
     if mf._FFN_MX:
         mf._prequantize_ffn_mx([blk])
     if mf._LIN_MX:

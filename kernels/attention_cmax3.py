@@ -134,14 +134,19 @@ def _load_v(v_sb, v, head, n_heads, d, seq_k, n_tiles, token_major):
 
 
 def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None, s_in=None, normalize=True,
-           tok_cols=0):
+           tok_cols=0, h_lo=0):
+    # h_lo (LINGBOT_HOT_HEADS): only heads h_lo .. n_heads - 1 of q / K / V (all heads' layouts and strides), the
+    # outputs and accumulators holding those n_heads - h_lo heads
     n_heads, d, seq_q = q_hbm.shape
     kernel_assert(d == _P, f"d must be {_P}, got {d}")
     kernel_assert(seq_q % _P == 0, f"seq_q={seq_q} must be a multiple of {_P}")
     _, n_prgs, prg_id = get_verified_program_sharding_info("attention_cmax3", max_sharding=2)
-    kernel_assert(n_heads % n_prgs == 0, f"{n_heads=} must be divisible by {n_prgs=}")
-    per = n_heads // n_prgs
-    h0 = prg_id * per
+    h_lo = int(h_lo or 0)
+    h_cnt = n_heads - h_lo
+    kernel_assert(0 <= h_lo < n_heads and h_cnt % n_prgs == 0, f"{n_heads=} {h_lo=} vs {n_prgs=}")
+    kernel_assert(not (h_lo and tok_cols), "h_lo: no tok_cols")
+    per = h_cnt // n_prgs
+    h0 = h_lo + prg_id * per
     c = float(offset)
     tok = int(tok_cols or 0)
     kernel_assert(not tok or normalize, "tok_cols: normalized calls only")
@@ -160,11 +165,11 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
             nisa.dma_copy(dst=o_out.ap(pattern=[[tok, _P], [_P * tok, n_qt], [1, pw]], offset=n_heads * d + prg_id * pw),
                           src=zb[:, 0:n_qt, 0:pw])
     elif normalize:
-        o_out = nl.ndarray(shape=(n_heads, d, seq_q), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
+        o_out = nl.ndarray(shape=(h_cnt, d, seq_q), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
         s_out = None
     else:
-        o_out = nl.ndarray(shape=(n_heads, d, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
-        s_out = nl.ndarray(shape=(n_heads, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
+        o_out = nl.ndarray(shape=(h_cnt, d, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
+        s_out = nl.ndarray(shape=(h_cnt, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
     n_ch = len(k_chunks)
     seq_ks = [int(k.shape[2]) for k in k_chunks]
     n_vts = [div_ceil(sk, _P) for sk in seq_ks]
@@ -400,19 +405,20 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
             nisa.nc_matmul(b_ps[:, 0:nq], stationary=ones, moving=sp[:, 0:nq])
         o_sb = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
         s_bc = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+        ho = head - h_lo        # this head's index in the outputs / accumulators
         if o_in is not None:
             o_prev = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=o_prev[:, 0:nq], src=o_in[head, :, nl.ds(q0, nq)])
+            nisa.dma_copy(dst=o_prev[:, 0:nq], src=o_in[ho, :, nl.ds(q0, nq)])
             nisa.tensor_tensor(dst=o_sb[:, 0:nq], data1=o_ps[:, 0:nq], data2=o_prev[:, 0:nq], op=nl.add)
             s_prev = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=s_prev[:, 0:nq], src=s_in.ap(pattern=[[0, d], [1, nq]], offset=head * seq_q + q0))
+            nisa.dma_copy(dst=s_prev[:, 0:nq], src=s_in.ap(pattern=[[0, d], [1, nq]], offset=ho * seq_q + q0))
             nisa.tensor_tensor(dst=s_bc[:, 0:nq], data1=b_ps[:, 0:nq], data2=s_prev[:, 0:nq], op=nl.add)
         else:
             nisa.tensor_copy(dst=o_sb[:, 0:nq], src=o_ps[:, 0:nq])
             nisa.tensor_copy(dst=s_bc[:, 0:nq], src=b_ps[:, 0:nq])
         if not normalize:
-            nisa.dma_copy(dst=o_out[head, :, nl.ds(q0, nq)], src=o_sb[:, 0:nq])
-            nisa.dma_copy(dst=s_out.ap(pattern=[[seq_q, 1], [1, nq]], offset=head * seq_q + q0), src=s_bc[0:1, 0:nq])
+            nisa.dma_copy(dst=o_out[ho, :, nl.ds(q0, nq)], src=o_sb[:, 0:nq])
+            nisa.dma_copy(dst=s_out.ap(pattern=[[seq_q, 1], [1, nq]], offset=ho * seq_q + q0), src=s_bc[0:1, 0:nq])
             return
         rcp = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
         nisa.reciprocal(dst=rcp[:, 0:nq], data=s_bc[:, 0:nq])
@@ -431,7 +437,7 @@ def _cmax3(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None
             nisa.tensor_copy(dst=obuf[:, qt0:qt0 + nqt, hl * d:(hl + 1) * d],
                              src=tp_ps[:, 0:nqt * _P].reshape((_P, nqt, _P)), engine=nisa.engine.vector)
             return
-        nisa.dma_copy(dst=o_out[head, :, nl.ds(q0, nq)], src=o_bf[:, 0:nq])
+        nisa.dma_copy(dst=o_out[ho, :, nl.ds(q0, nq)], src=o_bf[:, 0:nq])
 
     load_head(0)
     depth = _DEPTH      # MM1 + exp run this many key tiles ahead of P@V
@@ -644,7 +650,189 @@ def _cmax3u(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=Non
     return o_out, s_out
 
 
-_IMPL = _cmax3u if _PAIR else _cmax3
+# LINGBOT_C3_PAIR=2: _cmax3u's two key tiles per exp and per bf16 add (Scalar busy 1262 -> 1107 us in the cached-chunk
+# call, bb_pf), without its PSUM squeeze: the row sums leave PSUM -- each bf16 add chain is folded on the Vector engine
+# into an fp32 SBUF accumulator, and one ones-matmul per super-group in its epilogue (into its own O^T bank, after O^T
+# is read) broadcasts them -- so PSUM holds the O^T accumulators ping-ponged over banks 0-1 and three 2-bank S^T slots
+# (2-3, 4-5, 6-7). LINGBOT_C3_PDEPTH: units (pairs) of MM1 + exp lead over P@V (default LINGBOT_C3_DEPTH).
+_PAIR2 = os.environ.get("LINGBOT_C3_PAIR", "0") == "2"
+_PDEPTH = int(os.environ.get("LINGBOT_C3_PDEPTH", "0") or 0)
+
+
+def _cmax3pv(q_hbm, k_chunks, v_chunks, offset, k_blocks, v_token_major, o_in=None, s_in=None, normalize=True,
+             h_lo=0):
+    n_heads, d, seq_q = q_hbm.shape
+    kernel_assert(d == _P, f"d must be {_P}, got {d}")
+    kernel_assert(seq_q % _P == 0, f"seq_q={seq_q} must be a multiple of {_P}")
+    _, n_prgs, prg_id = get_verified_program_sharding_info("attention_cmax3", max_sharding=2)
+    h_lo = int(h_lo or 0)
+    h_cnt = n_heads - h_lo
+    kernel_assert(0 <= h_lo < n_heads and h_cnt % n_prgs == 0, f"{n_heads=} {h_lo=} vs {n_prgs=}")
+    per = h_cnt // n_prgs
+    h0 = h_lo + prg_id * per
+    c = float(offset)
+    if normalize:
+        o_out = nl.ndarray(shape=(h_cnt, d, seq_q), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
+        s_out = None
+    else:
+        o_out = nl.ndarray(shape=(h_cnt, d, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
+        s_out = nl.ndarray(shape=(h_cnt, seq_q), dtype=nl.float32, buffer=nl.shared_hbm)
+    n_ch = len(k_chunks)
+    seq_ks = [int(k.shape[2]) for k in k_chunks]
+    n_vts = [div_ceil(sk, _P) for sk in seq_ks]
+    tiles = [(ci, t) for ci in range(n_ch) for t in range(n_vts[ci])]
+    widths = [min(_P, seq_ks[ci] - t * _P) for ci, t in tiles]
+    units, held = [], None
+    for ti, w in enumerate(widths):
+        if w < _P:
+            units.append((ti,))
+        elif held is None:
+            held = ti
+        else:
+            units.append((held, ti))
+            held = None
+    if held is not None:
+        units.append((held,))
+    n_u = len(units)
+    pair_us = [u for u in range(n_u) if len(units[u]) == 2]
+    pair_pos = {u: (i_, len(pair_us)) for i_, u in enumerate(pair_us)}
+    o_banks, slots = (0, 1), (2, 4, 6)
+    n_sg = div_ceil(seq_q, _SG * _P)
+    ones = nl.ndarray(shape=(_P, _P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones, value=1.0)
+
+    q_bufs = [nl.ndarray(shape=(d, seq_q), dtype=nl.bfloat16, buffer=nl.sbuf) for _ in range(2)]
+    k_bufs = [[nl.ndarray(shape=(d, seq_ks[ci]), dtype=nl.bfloat16, buffer=nl.sbuf) for ci in range(n_ch)]
+              for _ in range(2)]
+    v_bufs = [[nl.ndarray(shape=(_P, n_vts[ci], d), dtype=nl.bfloat16, buffer=nl.sbuf) for ci in range(n_ch)]
+              for _ in range(2)]
+
+    def load_head(hl):
+        st, head = hl % 2, h0 + hl
+        nisa.dma_copy(dst=q_bufs[st], src=q_hbm[head, :, :], **_load_kw())
+        for ci in range(n_ch):
+            _load_k(k_bufs[st][ci], k_chunks[ci], head, n_heads, d, seq_ks[ci], k_blocks)
+            _load_v(v_bufs[st][ci], v_chunks[ci], head, n_heads, d, seq_ks[ci], n_vts[ci], v_token_major)
+
+    items = [(hl, sg, u) for hl in range(per) for sg in range(n_sg) for u in range(n_u)]
+    cnt = {"s": 0}
+    sg_state = {}
+
+    def stage1(item):
+        hl, sg, u = item
+        st = hl % 2
+        q0 = sg * _SG * _P
+        nq = min(_SG * _P, seq_q - q0)
+        if u == 0:
+            acc = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=acc[:, 0:2, 0:nq], value=0.0, engine=nisa.engine.gpsimd)
+            sg_state[(hl, sg)] = {"o": _psum((d, _SG * _P), o_banks[(hl * n_sg + sg) % 2]), "acc": acc,
+                                  "n": 0, "prev": None, "spb": None}
+        S = sg_state[(hl, sg)]
+        unit = units[u]
+        slot = slots[cnt["s"] % len(slots)]
+        cnt["s"] += 1
+        s_ps = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.float32, buffer=nl.psum,
+                          address=(0, slot * PSUM_BANK_SIZE))
+        for j, ti in enumerate(unit):
+            ci, t = tiles[ti]
+            w = widths[ti]
+            nisa.nc_matmul(s_ps[0:w, j, 0:nq], stationary=k_bufs[st][ci][:, nl.ds(t * _P, w)],
+                           moving=q_bufs[st][:, nl.ds(q0, nq)])
+        pt = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+        w0 = widths[unit[0]]
+        if len(unit) == 2:
+            nisa.activation(dst=pt[:, 0:2, 0:nq], op=nl.exp, data=s_ps[:, 0:2, 0:nq], bias=-c, scale=1.0)
+        else:
+            nisa.activation(dst=pt[0:w0, 0, 0:nq], op=nl.exp, data=s_ps[0:w0, 0, 0:nq], bias=-c, scale=1.0)
+        acc = S["acc"]
+        if len(unit) == 1:
+            # a chunk's partial last tile (or an unpaired one): straight into the fp32 accumulator
+            nisa.tensor_tensor(dst=acc[0:w0, 0, 0:nq], data1=acc[0:w0, 0, 0:nq], data2=pt[0:w0, 0, 0:nq],
+                               op=nl.add, engine=nisa.engine.vector)
+            return pt
+        if S["n"] == 0:
+            S["prev"], S["n"] = pt, 1
+        elif S["n"] == 1:
+            spb = nl.ndarray(shape=(_P, 2, _SG * _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=spb[:, 0:2, 0:nq], data1=S["prev"][:, 0:2, 0:nq], data2=pt[:, 0:2, 0:nq],
+                               op=nl.add, engine=nisa.engine.vector)
+            S["spb"], S["n"] = spb, 2
+        else:
+            nisa.tensor_tensor(dst=S["spb"][:, 0:2, 0:nq], data1=S["spb"][:, 0:2, 0:nq], data2=pt[:, 0:2, 0:nq],
+                               op=nl.add, engine=nisa.engine.vector)
+            S["n"] += 1
+        j_, n_j = pair_pos[u]
+        if S["n"] == _SUM_GROUP or j_ == n_j - 1:
+            src = S["prev"] if S["n"] == 1 else S["spb"]
+            nisa.tensor_tensor(dst=acc[:, 0:2, 0:nq], data1=acc[:, 0:2, 0:nq], data2=src[:, 0:2, 0:nq],
+                               op=nl.add, engine=nisa.engine.vector)
+            S["n"] = 0
+        return pt
+
+    def stage2(item, pt):
+        hl, sg, u = item
+        st, head = hl % 2, h0 + hl
+        q0 = sg * _SG * _P
+        nq = min(_SG * _P, seq_q - q0)
+        S = sg_state[(hl, sg)]
+        o_ps = S["o"]
+        for j, ti in enumerate(units[u]):
+            ci, t = tiles[ti]
+            w = widths[ti]
+            nisa.nc_matmul(o_ps[:, 0:nq], stationary=v_bufs[st][ci][0:w, t, :], moving=pt[0:w, j, 0:nq],
+                           accumulate=not (u == 0 and j == 0))
+        if u != n_u - 1:
+            return
+        ho = head - h_lo
+        bank = o_banks[(hl * n_sg + sg) % 2]
+        o_sb = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+        if o_in is not None:
+            o_prev = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=o_prev[:, 0:nq], src=o_in[ho, :, nl.ds(q0, nq)])
+            nisa.tensor_tensor(dst=o_sb[:, 0:nq], data1=o_ps[:, 0:nq], data2=o_prev[:, 0:nq], op=nl.add)
+        else:
+            nisa.tensor_copy(dst=o_sb[:, 0:nq], src=o_ps[:, 0:nq])
+        # the row sums over keys (partitions) on every partition, into this super-group's O^T bank (read above)
+        b_ps = _psum((d, _SG * _P), bank)
+        nisa.nc_matmul(b_ps[:, 0:nq], stationary=ones, moving=S["acc"][:, 0, 0:nq], accumulate=False)
+        nisa.nc_matmul(b_ps[:, 0:nq], stationary=ones, moving=S["acc"][:, 1, 0:nq], accumulate=True)
+        s_bc = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+        if s_in is not None:
+            s_prev = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=s_prev[:, 0:nq], src=s_in.ap(pattern=[[0, d], [1, nq]], offset=ho * seq_q + q0))
+            nisa.tensor_tensor(dst=s_bc[:, 0:nq], data1=b_ps[:, 0:nq], data2=s_prev[:, 0:nq], op=nl.add)
+        else:
+            nisa.tensor_copy(dst=s_bc[:, 0:nq], src=b_ps[:, 0:nq])
+        if not normalize:
+            nisa.dma_copy(dst=o_out[ho, :, nl.ds(q0, nq)], src=o_sb[:, 0:nq])
+            nisa.dma_copy(dst=s_out.ap(pattern=[[seq_q, 1], [1, nq]], offset=ho * seq_q + q0), src=s_bc[0:1, 0:nq])
+            return
+        rcp = nl.ndarray(shape=(d, _SG * _P), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=rcp[:, 0:nq], data=s_bc[:, 0:nq])
+        o_bf = nl.ndarray(shape=(d, _SG * _P), dtype=q_hbm.dtype, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=o_bf[:, 0:nq], data1=o_sb[:, 0:nq], data2=rcp[:, 0:nq], op=nl.multiply)
+        nisa.dma_copy(dst=o_out[ho, :, nl.ds(q0, nq)], src=o_bf[:, 0:nq])
+
+    load_head(0)
+    depth = _PDEPTH or _DEPTH
+    pend = []
+    for item in items:
+        hl, sg, u = item
+        pend.append((item, stage1(item)))
+        if len(pend) > depth:
+            stage2(*pend.pop(0))
+        if sg == 0 and u == depth and hl + 1 < per:
+            load_head(hl + 1)
+    while pend:
+        stage2(*pend.pop(0))
+    if normalize:
+        return o_out
+    return o_out, s_out
+
+
+_IMPL = _cmax3pv if _PAIR2 else (_cmax3u if _PAIR else _cmax3)
+_IMPLH = _cmax3pv if _PAIR2 else _cmax3
 
 
 @nki.jit
@@ -683,3 +871,30 @@ def cmax3_final_tok_1(q, k0, v0, o_acc, s_acc, softmax_max, k_blocks, v_token_ma
     """LINGBOT_C3_TOKOUT: cmax3_final_1 with the token-major [Sq, tok_cols] output (zero columns past n x d)."""
     return _cmax3(q, [k0], [v0], softmax_max, k_blocks, v_token_major, o_in=o_acc, s_in=s_acc, normalize=True,
                   tok_cols=tok_cols)
+
+
+# LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only (the hot heads 0 .. h_lo - 1 go to the exact kernel)
+@nki.jit
+def cmax3_full_1h(q, k0, v0, softmax_max, k_blocks, v_token_major, h_lo):
+    return _IMPLH(q, [k0], [v0], softmax_max, k_blocks, v_token_major, normalize=True, h_lo=h_lo)
+
+
+@nki.jit
+def cmax3_part_1h(q, k0, v0, softmax_max, k_blocks, v_token_major, h_lo):
+    return _IMPLH(q, [k0], [v0], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo)
+
+
+@nki.jit
+def cmax3_part_2h(q, k0, k1, v0, v1, softmax_max, k_blocks, v_token_major, h_lo):
+    return _IMPLH(q, [k0, k1], [v0, v1], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo)
+
+
+@nki.jit
+def cmax3_part_3h(q, k0, k1, k2, v0, v1, v2, softmax_max, k_blocks, v_token_major, h_lo):
+    return _IMPLH(q, [k0, k1, k2], [v0, v1, v2], softmax_max, k_blocks, v_token_major, normalize=False, h_lo=h_lo)
+
+
+@nki.jit
+def cmax3_final_1h(q, k0, v0, o_acc, s_acc, softmax_max, k_blocks, v_token_major, h_lo):
+    return _IMPLH(q, [k0], [v0], softmax_max, k_blocks, v_token_major, o_in=o_acc, s_in=s_acc, normalize=True,
+                  h_lo=h_lo)

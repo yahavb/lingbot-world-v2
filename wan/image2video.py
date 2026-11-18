@@ -690,7 +690,9 @@ class WanI2VCausal:
             chunk_size, frame_seqlen, transformer_dtype, self.device)
         warmup_cross_kv = self._initialize_crossattn_cache(
             num_layers=cfg.num_layers,
-            shape=[1, text_seq_len, local_num_heads, head_dim],
+            # LINGBOT_CROSS_TPFREE=1: every rank's cross-attention holds all heads
+            shape=[1, text_seq_len, cfg.num_heads if os.environ.get("LINGBOT_CROSS_TPFREE", "0") == "1"
+                   else local_num_heads, head_dim],
             dtype=transformer_dtype,
             device=self.device)
 
@@ -1409,6 +1411,8 @@ class WanI2VCausal:
         # Cross-attention is TP-only (context, no Ulysses all_to_all), so its
         # cache holds num_heads/tp heads, NOT divided by sp_size.
         cross_num_heads = model_args.num_heads // self.tp_degree
+        if os.environ.get("LINGBOT_CROSS_TPFREE", "0") == "1":
+            cross_num_heads = model_args.num_heads      # LINGBOT_CROSS_TPFREE: full cross-attention on every rank
         cross_kv_shape = [batch_size, max_sequence_length, cross_num_heads, head_dim]
         cross_kv_cache = self._initialize_crossattn_cache(num_layers=model_args.num_layers,
                                                           shape=cross_kv_shape,
