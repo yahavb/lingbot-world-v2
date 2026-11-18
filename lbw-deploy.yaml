@@ -1,7 +1,9 @@
-# lbw-v2: the LingBot-World v2 streaming server (serve.py) on 4 trn3 devices at LNC2 (claim l-lnc2,
-# 16 ranks, TP4 x CP4), 480x768, DiT + T5 + VAE in one pod. DiT Linears in MXFP8 plus the kiro_mx4
-# 16 fps flags (kiro_mx4/RESULTS.md). Measured 15.2 fps streaming, warm, through the service (2026-11-17).
-# Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml.
+# lbw-v2: the LingBot-World v2 streaming server (serve.py) on 2 trn3 devices at LNC2 (claim m-lnc2,
+# 8 ranks, TP4 x CP2), 480x768, DiT + T5 + VAE in one pod. Flags = the 2-chip t19 set of
+# loop_engineering_16_fps_minimal_setup (kiro_mx4/flags_2chip.txt + flags_2chip_best.txt): batch 15.95 fps,
+# accuracy gate PASS (measured 2026-11-18). The inline VAE tiles 2 x 4 (LINGBOT_VAE_PER_DEVICE=2): the
+# default 4 x 2 tiling at 8 LNC2 ranks decodes black frames. Branch serve-2chip = main + that branch.
+# Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: ConfigMap neuron-top-patch.
 # The converted checkpoint and compiled NEFFs live on the node (hostPath /opt/lingbot-world-v2).
 apiVersion: apps/v1
 kind: Deployment
@@ -21,9 +23,10 @@ spec:
     spec:
       nodeSelector:
         node-type: trn3-dev1
+        kubernetes.io/hostname: ip-192-168-192-137.us-east-2.compute.internal
       resourceClaims:
         - name: neuroncores
-          resourceClaimTemplateName: l-lnc2
+          resourceClaimTemplateName: m-lnc2
       containers:
         - name: inference
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
@@ -91,9 +94,9 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "90"
-              memory: 900Gi
-              ephemeral-storage: 600Gi
+              cpu: "40"
+              memory: 300Gi
+              ephemeral-storage: 300Gi
             limits:
               cpu: "95"
               memory: 950Gi
@@ -107,18 +110,78 @@ spec:
             - name: logs
               mountPath: /logs
           env:
+            - name: LINGBOT_VAE_PER_DEVICE
+              value: "2"
+            - name: LINGBOT_MX_TUNED_M2176
+              value: "1"
+            - name: LINGBOT_MX_RP_POST
+              value: "1"
+            - name: LINGBOT_FFN_EPI
+              value: "1"
+            - name: LINGBOT_FFN_UP_PAD
+              value: "1"
+            - name: LINGBOT_MX_M2176_DEFAULT
+              value: "3584x5120"
+            - name: LINGBOT_QK_POST
+              value: "1"
+            - name: LINGBOT_CMAX
+              value: "3"
+            - name: LINGBOT_C3_SUMMODE
+              value: "pef"
+            - name: LINGBOT_C3_SUMGROUP
+              value: "16"
+            - name: LINGBOT_C3_DEPTH
+              value: "3"
+            - name: LINGBOT_VBIAS_FOLD
+              value: "1"
+            - name: LINGBOT_QK_POST_T
+              value: "1"
+            - name: LINGBOT_VAE_HEAD_BF16
+              value: "1"
+            - name: LINGBOT_FILM_TPFREE
+              value: "1"
+            - name: LINGBOT_CROSS_TPFREE
+              value: "1"
+            - name: LINGBOT_HOT_HEADS
+              value: "default"
+            - name: LINGBOT_MX_QKV_FUSED
+              value: "1"
+            - name: LINGBOT_MX_NSHARD
+              value: "5120x3840"
+            - name: LINGBOT_MX_TUNED_M544
+              value: "1"
+            - name: LINGBOT_VAE_NKI_HALO
+              value: "1"
+            - name: LINGBOT_VAE_NKI_CONV
+              value: "all"
+            - name: LINGBOT_VAE_NKI_CONV_SQ
+              value: "bf16"
+            - name: LINGBOT_VAE_NKI_CONV_LA
+              value: "1"
+            - name: LINGBOT_VAE_NKI_CONV_CMAX
+              value: "192"
+            - name: LINGBOT_RESIDUAL_BF16
+              value: "1"
+            - name: LINGBOT_VAE_NKI_UP
+              value: "all"
+            - name: LINGBOT_VAE_NKI_UP_FOLD
+              value: "1"
+            - name: LINGBOT_VAE_LOW_T
+              value: "20"
+            - name: LINGBOT_COMMIT_KV_ONLY
+              value: "1"
             - name: BRANCH
-              value: "main"
+              value: "serve-2chip"
             - name: SEG_CHUNKS
               value: "14"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
-              value: "16"
+              value: "8"
             - name: LNC
               value: "2"
             - name: CP
-              value: "4"
+              value: "2"
             - name: TP
               value: "4"
             - name: SIZE
@@ -184,7 +247,7 @@ spec:
             - name: LINGBOT_COMMIT_NOHEAD
               value: "1"
             - name: LINGBOT_FILM_ALL
-              value: "0"
+              value: "1"
             - name: LINGBOT_KEY_THREADS
               value: "4"
             - name: LINGBOT_IMG_BLOCK
@@ -272,17 +335,17 @@ spec:
             - name: LINGBOT_VAE_GATHER1
               value: "1"
             - name: LINGBOT_FILM_ALL_CHUNKS
-              value: "3"
+              value: "7"
             - name: LINGBOT_FILM_ALL_BLOCKS
               value: "10"
             - name: LINGBOT_BLOCK_GROUP
-              value: "2"
+              value: "8"
             - name: LINGBOT_CTE_SCALAR_ROWMAX
               value: "1"
             - name: LINGBOT_CTE_PRIOR_FULL
               value: "1"
             - name: LINGBOT_CTE_EXP_SPLIT
-              value: "2"
+              value: "1"
             - name: LINGBOT_T5_FP32
               value: "1"
             - name: LINGBOT_VAE_2D
@@ -292,7 +355,7 @@ spec:
             - name: LINGBOT_VAE_NORM
               value: "mm"
             - name: LINGBOT_VAE_CC_FLAGS
-              value: "-O1"
+              value: "-O1+--model-type=unet-inference"
             - name: LINGBOT_VAE_BF16
               value: "1"
             - name: LINGBOT_VAE_FUSED
