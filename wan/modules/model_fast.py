@@ -318,19 +318,26 @@ for _it in (t_ for t_ in _HOT_SPEC.replace(" ", "").split(";") if t_):
 _HOT_NE = {L_: 2 * (-(-max(len(v_) for v_ in d_.values()) // 2)) for L_, d_ in _HOT.items()}
 # LINGBOT_HOT_NOCOPY=1 (LINGBOT_HOT_HEADS): the exact kernels read heads 0 .. N_e - 1 of the constant-offset path's
 # d-major q_t and of the full cached / gathered K and V chunks (attention_cte_lb h_cnt, tp_q=False) instead of a
-# transposed copy of Q and head-sliced copies of every K / V chunk. Same values.
+# transposed copy of Q and head-sliced copies of every K / V chunk. Same values (bit-identical block output). Block
+# bench (TP4 x CP2 LNC2, C_best5): L38 4.09 / 4.14 -> 3.95 / 3.94 ms, L33 4.33 / 4.34 -> 4.05 / 4.09 ms.
 _HOT_NOCOPY = os.environ.get("LINGBOT_HOT_NOCOPY", "0") == "1"
 # LINGBOT_HOT_ORDER=k (LINGBOT_HOT_HEADS): program order of the hybrid's four attention calls. 0: cmax lead, exact
 # lead, cmax final, exact final (default); 1: exact lead first; 2: exact final before cmax final; 3: both;
 # 4: every exact call data-dependent on the cmax lead call (Q + 0 x one of its row sums); 5: only the exact final.
+# Profile of NOCOPY (L38, core 0): the scheduler put both exact calls' Scalar work (row-max evicts, ~55% busy, latency
+# bound) at 0.63-1.35 ms and every cmax exp after it (1.35-2.22), so the Scalar engine idled ~0.35 ms; 4 / 5 let the
+# cmax lead run first. With NOCOPY, bit-identical: L38 3.94 -> 3.76 (4) / 3.75 (5) ms, L33 4.05 -> 3.83 / 3.83 ms
+# (default hybrid 4.10 / 4.33); orders 1-3 no change (3.93-3.94 / 4.05-4.06).
 _HOT_ORDER = int(os.environ.get("LINGBOT_HOT_ORDER", "0") or 0)
 # LINGBOT_HOT_ONECORE=1 (LINGBOT_HOT_NOCOPY, LNC2): every exact head on the logical core's program 0 (attention_cte_lb
 # one_core) and the constant-offset heads split unevenly to match (program 0: n / 2 - N_e of them, program 1: n / 2),
 # instead of half of each kind per physical core. An exact head costs about one constant-offset head of engine time.
+# Measured slower: L38 3.94 -> 4.20 ms (the exact kernel is latency-bound; two heads on one core serialize it).
 _HOT_ONECORE = os.environ.get("LINGBOT_HOT_ONECORE", "0") == "1"
 assert not _HOT_ONECORE or _HOT_NOCOPY, "LINGBOT_HOT_ONECORE needs LINGBOT_HOT_NOCOPY"
 # LINGBOT_HOT_ROWMAX_VEC=1 (LINGBOT_HOT_NOCOPY): the hybrid's exact calls evict their scores with the row max on the
-# Vector engine (attention_cte_lb rowmax_vec) even under LINGBOT_CTE_SCALAR_ROWMAX=1. Same values.
+# Vector engine (attention_cte_lb rowmax_vec) even under LINGBOT_CTE_SCALAR_ROWMAX=1. Same function (Vector vs Scalar
+# max, rel 0.00000 but not bit-equal). Untested as a flag; LINGBOT_CTE_SCALAR_ROWMAX=0 (same effect) L38 3.94 -> 3.99.
 _HOT_ROWMAX_VEC = os.environ.get("LINGBOT_HOT_ROWMAX_VEC", "0") == "1"
 
 # LINGBOT_V_GATHER_FIRST=1: in the step forward, the new chunk's V CP all-gather issued before its K gather.
