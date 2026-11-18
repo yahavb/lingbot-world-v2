@@ -158,6 +158,11 @@ def _parse_args():
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
+        "--max_chunks", type=int, default=None,
+        help="causal_fast: run this many chunks with --frame_num's shapes and graphs (chunks past the "
+             "camera path reuse its last chunk's camera, as a live session does): a long video without "
+             "compiling every chunk position or holding every chunk's camera on the device.")
+    parser.add_argument(
         "--frame_num",
         type=int,
         default=None,
@@ -605,7 +610,8 @@ def run_causal(args, cfg, img, device, rank, mode="causal_fast",
             save_latents_path=args.save_latents_path,
             prompt_embeds_path=args.prompt_embeds_path,
             prompt_embeds=prompt_embeds,
-            return_latents=return_latents)
+            return_latents=return_latents,
+            **({"max_chunks": args.max_chunks} if args.max_chunks else {}))
         if dist.is_initialized():
             torch.neuron.synchronize()
             dist.barrier()

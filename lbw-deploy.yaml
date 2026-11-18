@@ -4,8 +4,6 @@
 # accuracy gate PASS (measured 2026-11-18). The inline VAE tiles 2 x 4 (LINGBOT_VAE_PER_DEVICE=2): the
 # default 4 x 2 tiling at 8 LNC2 ranks decodes black frames. Branch serve-2chip = main + that branch.
 # Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: tools/neuron-top (installed at start).
-# TEST (2026-11-18): FRAME_NUM=1929 + scene 06 (2-minute push-in) to compare a 2-minute online video with
-# the offline Job lbw-bench-2chip-long. Set FRAME_NUM back to 81 for the demo.
 # Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint, and cache/v<CACHE_VERSION>/{neuron-compile-cache,
 # neff_cache, hlo_cache}. Bump CACHE_VERSION when pulling new code; old versions can be deleted from the node.
 apiVersion: apps/v1
@@ -200,7 +198,7 @@ spec:
             - name: SIZE
               value: "480*768"
             - name: FRAME_NUM
-              value: "1929"
+              value: "81"
             - name: CHUNK_SIZE
               value: "3"
             - name: LOCAL_ATTN_SIZE
