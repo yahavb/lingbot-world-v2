@@ -326,8 +326,9 @@ if _NKI_HEAD:
 # vs_R stays 52.87 dB. Decode (2-chip LNC1 16 ranks, T=1, HEAD_BF16, -O1 unet-inference, NKI_HALO): 647 / 645 ms
 # (start / end) -> NKI_HEAD=1 624, NKI_CONV=head 616, =all 602-607, =all + SQ=bf16 + LA=1 587 (52.87 dB).
 # LINGBOT_VAE_NKI_CONV_CMAX=c (with =all): also the ResidualBlock convs of up to c in / out channels (default 128;
-# 192 adds the stage-2 ResidualBlocks, whose norm is otherwise the compiled torch form). Not useful: stage-2
-# ResidualBlock 2845 (torch path) -> 2879 us; the fused conv unit there is 1470 vs 1532 for halo kernel + conv.
+# 192 adds the stage-2 ResidualBlocks, whose norm is otherwise the compiled torch form). Stage-2 ResidualBlock
+# (perf/vae_rb_bench.py): torch path 2823-2845 us, fused 2879 (fp32 squares), 2658 with SQ=bf16. Decode with
+# =all SQ=bf16 LA=1: 587-588 -> 582-583 ms, vs_R 52.8743 -> 52.8755 dB (best flag set).
 _NKI_CONV = os.environ.get("LINGBOT_VAE_NKI_CONV", "0")
 assert _NKI_CONV in ("0", "head", "all"), _NKI_CONV
 _NKI_CONV_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_CMAX", "128"))
