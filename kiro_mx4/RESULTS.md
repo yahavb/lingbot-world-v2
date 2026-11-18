@@ -41,7 +41,7 @@ Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). Thi
 
 # 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks), work in progress toward 16 fps
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
-Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the r5 set).
+Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t3 set).
 | Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
 |---|---|---|---|---|---|
 | s0_base | `flags_2chip.txt` | 6976.3 | 889 | 10.30 | FAIL (G1 19.99) |
@@ -52,9 +52,16 @@ Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the r5 set)
 | **r1** | **+ `VBIAS_FOLD QK_POST_T`** | **4937.2** | 890 | **13.90** | **PASS** (G1 20.14) |
 | r1 + `VAE_T=1` | decode 813 ms (same frames, 52.76 dB vs R either way) | 4937.2 | 813 | 14.09 | (decode-only change) |
 | **r5** | **+ `VAE_T=1 FILM_ALL=1` (all chunks' camera FiLM before the loop: 222 ms vs 278)** | **4906.0** | 811 | **14.17** | **PASS** (G1 20.62) |
+| r7 / r7b | r5 set + `BLOCK_GROUP=4` (not kept) | 4866.6 / 4865.6 | 816 / 812 | 14.25 / 14.27 | FAIL (G2 14.18, deterministic) |
+| r8 | r5 set + `VAE_HEAD_BF16=1`, VAE `-O1 --model-type=unet-inference` (decode 715 ms) | 4898.2 | 715 | 14.43 | PASS (G1 20.62) |
+| r9 | + `BLOCK_GROUP=8` | 4885.5 | 715 | 14.46 | PASS (G1 20.94, G2 15.72) |
+| t1 | + `FILM_TPFREE=1` (camera FiLM MLP with full weights on the TP token shard: no all-reduce / all-to-alls) | 4766.2 | 715 | 14.78 | PASS (G1 21.02) |
+| t2 | + `CROSS_TPFREE=1` (cross-attention with full weights on the token shard: no AG / q-norm AR / RS) | 4721.4 | 716 | 14.90 | PASS (G1 20.97, c0s0 0.0439) |
+| **t3** | **+ `HOT_HEADS=default` (exact layers: hot heads exact, the rest constant-offset), `MX_QKV_FUSED=1 MX_NSHARD=5120x3840` (fused q/k/v, default tiles, N split: bit-identical), `FILM_ALL_CHUNKS=7`** | **4594.0** | 715 | **15.26** | **PASS** (G1 20.22, G2 15.41, c0s0 0.0412) |
 Refuted on the way (ledger): DVE exp offload (any share), paired exps, GpSimd adds, fused QKV (accuracy), TSPLIT,
 token-major attention output, glue kernels, bf16 residual (accuracy), FiLM bf16 all-reduce (accuracy), collective
 algorithm / DMA knobs, DMA priority for the attention loads, TP-free FFN (M=544 matmuls slower than the collectives
 they save). Where the 2-chip block (3.57 ms in the pipeline, 3 cached chunks) goes: attention ~1.5 ms (exp-bound on
 the Scalar engine at ~0.5 us per [128, 512] tile), MX matmuls ~1.07 ms (42-61% of MX peak), ~0.35 ms fully idle at
-the TP collectives, the rest elementwise glue; the camera FiLM graphs are 222 ms of each 4.9 s generation. 16 fps needs GEN <= ~4.25 s (-0.66 s).
+the TP collectives, the rest elementwise glue; the camera FiLM graphs are 222 ms of each 4.9 s generation. 
+At t3, 16 fps needs GEN + VAE <= 5062 ms, i.e. GEN <= ~4347 ms at a 715 ms decode (-247 ms). The block (bench, 3 cached chunks) is 3.63 ms: pre-attention 0.63 (fused QKV 338 us, qk_post ~190 us on the critical path), attention ~1.53 (Scalar ~100% busy after a ~90 us start), cross 0.56, FFN 0.6. Also refuted since r5: N split for the separate q/k/v (DMA-bound in-graph), PAIR=2 key-tile pairs (Tensor saturates), bf16 cross dedup, ATTN_EARLY=1; the M2176 tuned-tile table predates the NKI trace-cache fix (every candidate after the first re-timed one kernel), re-swept with the cache off: only q/k/v (now fused, default tiles) and the M=544 cross matmuls changed.

@@ -92,11 +92,19 @@ _TUNED_LNC2_M2176 = {
     (3584, 5120): dict(tn=512, bm=8, bn=5, bk=7, lm=4, ln=5, sr=True, extra={}),
     (1536, 5120): dict(tn=512, bm=16, bn=4, bk=3, lm=4, ln=4, sr=True, extra={"load_with_PE_swizzle": True}),
 }
+# LNC2 at M=544 rows (one TP rank's token shard at TP4 x CP2: LINGBOT_CROSS_TPFREE's full-weight cross q / o),
+# perf/mx_tile_sweep.py SHAPE=sq_full M=544 FAST=1 with the NKI trace cache off: tn512 B4/4/10 L4/4 (all of K in one
+# block, like the default) 144.7 us, B4/4/5 134.8 (K in two blocks), default ~160. LINGBOT_MX_TUNED_M544=1.
+_TUNED_LNC2_M544 = {
+    (5120, 5120): dict(tn=512, bm=4, bn=4, bk=10, lm=4, ln=4, sr=False, extra={}),
+}
 _TUNED_BY_M = {}
 if LNC == 2:
     _TUNED = _TUNED_LNC2
     if os.environ.get("LINGBOT_MX_TUNED_M2176", "0") == "1":
         _TUNED_BY_M[2176] = _TUNED_LNC2_M2176
+    if os.environ.get("LINGBOT_MX_TUNED_M544", "0") == "1":
+        _TUNED_BY_M[544] = _TUNED_LNC2_M544
 _TUNED_ON = os.environ.get("LINGBOT_MX_TUNED", "0") == "1"
 # LINGBOT_MX_TUNED_KEYS="5120x1280,1536x5120": tune only these (K, N) (bisecting in-graph failures)
 _TUNED_KEYS = os.environ.get("LINGBOT_MX_TUNED_KEYS", "")
