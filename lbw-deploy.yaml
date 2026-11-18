@@ -3,8 +3,8 @@
 # loop_engineering_16_fps_minimal_setup (kiro_mx4/flags_2chip.txt + flags_2chip_best.txt): batch 15.95 fps,
 # accuracy gate PASS (measured 2026-11-18). The inline VAE tiles 2 x 4 (LINGBOT_VAE_PER_DEVICE=2): the
 # default 4 x 2 tiling at 8 LNC2 ranks decodes black frames. Branch serve-2chip = main + that branch.
-# Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: ConfigMap neuron-top-patch.
-# The converted checkpoint and compiled NEFFs live on the node (hostPath /opt/lingbot-world-v2).
+# Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml. neuron-top: tools/neuron-top (installed at start).
+# Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint, neuron-compile-cache, neff_cache, hlo_cache.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,18 +34,23 @@ spec:
             - /bin/bash
             - "-c"
             - |
-              # neuron-top with op names in the memory layout and EFA traffic (ConfigMap neuron-top-patch)
-              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched" || true
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
               echo "commit: $(git log --oneline -1)"
+              # enhanced neuron-top (op names in the memory layout, EFA traffic), from the repo
+              install -m 755 tools/neuron-top/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" \
+                && echo "neuron-top: enhanced" || echo "neuron-top: stock"
               NODE=/node-cache; mkdir -p "$NODE"
               CKPT=$NODE/lingbot-world-v2-14b-causal-fast
               export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
-              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              # compiled graphs persist on the node: the first pod on a node fills these, every later pod
+              # (restart, rollout, a second replica) reuses whatever is already there
+              export TORCH_NEURONX_NEFF_CACHE_DIR=$NODE/neff_cache
               export NKI_ENABLE_TRACE_CACHE="${NKI_ENABLE_TRACE_CACHE:-1}"
-              export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
+              export TORCH_NEURONX_HLO_CACHE_DIR=$NODE/hlo_cache
+              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR"
+              echo "neff cache on node: $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
               export HF_HOME=/tmp/hf-cache
 
               pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
@@ -102,7 +107,6 @@ spec:
               memory: 950Gi
               ephemeral-storage: 600Gi
           volumeMounts:
-            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}
             - name: node-cache
               mountPath: /node-cache
             - name: dshm
@@ -361,8 +365,6 @@ spec:
             - name: LINGBOT_VAE_FUSED
               value: "1"
       volumes:
-        - name: neuron-top-patch
-          configMap: {name: neuron-top-patch, optional: true}
         - name: node-cache
           hostPath:
             path: /opt/lingbot-world-v2
