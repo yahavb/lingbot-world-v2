@@ -39,6 +39,17 @@ LNC2-tuned MX tiles (0), `NEURON_RT_IO_RING_CACHE_SIZE=1024` (0), `LINGBOT_CROSS
 Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). This is the MX gate (floor 20 dB); the bf16
 4-device approved base scored 39.4 dB on the first 9 frames.
 
+# 4 chips with the 2-chip work (TP4 x CP4, LNC2, decode at LNC1 on 32 ranks)
+Same video, fps definition and gate; 4-device pod kiro-ishaybee-dev (node .137), GEN = pass 3 of 3, VAE = faster of 2
+decodes. Flags: `kiro_mx4/flags_2chip.txt` (= the 16.89 fps 4-chip set) + the step's additions; every row decodes with the
+final VAE flags (t28: `VAE_T=3`, the NKI decode kernels, `LOW_T=20`). `LINGBOT_CMAX=3` needs whole 128-row query tiles,
+so from that step on the 1080 tokens per CP rank pad to 1152 (`LINGBOT_TOKEN_PAD=128 LINGBOT_CTE_QPAD=128`) instead of 1088.
+| Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
+|---|---|---|---|---|---|
+| u0 | `flags_2chip.txt` (the 16.89 fps GEN flags), today's decode | 4134.1 | 353 | 18.05 | PASS (G1 21.03, G2 15.76) |
+| **u_full2** | **+ every 2-chip GEN flag (`flags_2chip_best.txt`, t28 set) + `TOKEN_PAD=128 CTE_QPAD=128`** | **2947.6** | **342** | **24.62** | **PASS** (G1 21.01, G2 16.32, c0s0 0.0408) |
+Cumulative steps (u1 .. u8) are being measured.
+
 # 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks): 16.16 fps, gate PASS (t28)
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
 All rows from t5 on ran on the same 2-device pod (kiro-ishaybee-dev2); the other two 2-device pods on the node measure the same GEN flags ~25 ms and ~90 ms slower.
