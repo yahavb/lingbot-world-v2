@@ -518,6 +518,16 @@ _NKI_UP = os.environ.get("LINGBOT_VAE_NKI_UP", "0")
 assert _NKI_UP in ("0", "2d", "all"), _NKI_UP
 _NKI_UP_FOLD = os.environ.get("LINGBOT_VAE_NKI_UP_FOLD", "0") == "1"
 _NKI_UP_R = int(os.environ.get("LINGBOT_VAE_NKI_UP_R", "10"))
+# LINGBOT_VAE_LOW_T=k (decode): after frame 0, the units before the first temporal upsample (conv_in, the mid block
+# and stage 0: C=384 at the latent's 15 x 24 tile) run on k latent frames per step, then the rest frame by frame
+# (LINGBOT_VAE_T). Every temporal op is a causal conv over [2-frame cache, new frames] or per frame, so the layer-wise
+# order computes the same values; it only cuts the low-resolution units' launches and halo exchanges (105 + 21 + 21
+# + 21 tiny calls per decode at k = 1).
+_LOW_T = int(os.environ.get("LINGBOT_VAE_LOW_T", "0") or 0)
+# LINGBOT_VAE_LOW_UPS=u (with LOW_T): the batched phase ends before the u-th temporal upsample (1: stage 0 only; 2: also
+# stage 0's upsample and stage 1). Measured: a LOW_T smaller than the latent's frame count (several low steps) lowered
+# vs_R (52.13 dB at LOW_T=5): use LOW_T >= frames - 1.
+_LOW_UPS = int(os.environ.get("LINGBOT_VAE_LOW_UPS", "1") or 1)
 if _NKI_UP != "0":
     from kernels.vae_up_conv import up_conv as _nki_up_conv, up_conv_weights as _nki_up_w
 
@@ -631,7 +641,23 @@ class FusedWidthDecoder:
         dt = x.dtype if self.dt is None else (torch.float32 if fp32 else self.dt)
         return torch.zeros(shape, dtype=dt, device=x.device)
 
-    def _step(self, x, caches, first):
+    def _n_caches(self, u0, u1):
+        """Cache tensors the units [u0, u1) read and return, in _step's order."""
+        per = {"conv": 1, "res": 2, "attn": 0, "up3d": 1, "up2d": 0}
+        return sum(per.get(kind, 1) for kind, _ in self.units[u0:u1])
+
+    def _low_split(self):
+        """Index of the decoder's first temporal upsample unit: the units before it (conv_in, the mid block, stage 0)
+        work at the latent's resolution and frame rate (LINGBOT_VAE_LOW_T)."""
+        seen = 0
+        for u, (kind, _) in enumerate(self.units):
+            if kind == "up3d":
+                seen += 1
+                if seen == _LOW_UPS:
+                    return u
+        return len(self.units)
+
+    def _step(self, x, caches, first, u0=0, u1=None):
         new, i = [], 0
 
         def cache(c, halo=True, fp32=False):
@@ -642,7 +668,7 @@ class FusedWidthDecoder:
             return caches[i - 1]
 
         sel = self.sel
-        for kind, m in self.units:
+        for kind, m in self.units[u0:u1]:
             if _UNIT_TIMING:
                 torch.neuron.synchronize()
                 _t0 = time.perf_counter()
@@ -729,6 +755,28 @@ class FusedWidthDecoder:
         k = max(1, int(os.environ.get("LINGBOT_VAE_T", "1")))
         out, caches = self._step(x[:, :, :1], None, first=True)
         outs, i, n = [out], 1, x.shape[2]
+        if _LOW_T and n > 1:
+            # LINGBOT_VAE_LOW_T: the low-resolution units on _LOW_T latent frames per step, then the rest on
+            # LINGBOT_VAE_T frames per step (layer-wise instead of frame-wise: the same causal computation)
+            s_ = self._low_split()
+            nl_ = self._n_caches(0, s_)
+            c_lo, c_hi = caches[:nl_], caches[nl_:]
+            lows = []
+            while i < n:
+                j = min(n, i + _LOW_T)
+                y, c_lo = self._step(x[:, :, i:j], c_lo, first=False, u0=0, u1=s_)
+                lows.append(y)
+                i = j
+            y = lows[0] if len(lows) == 1 else torch.cat(lows, 2)
+            i, m_ = 0, y.shape[2]
+            while i < m_:
+                j = min(m_, i + k)
+                out, c_hi = self._step(y[:, :, i:j], c_hi, first=False, u0=s_)
+                outs.append(out)
+                i = j
+            self.unit_timing_report()
+            out = torch.cat(outs, 2)
+            return out.transpose(-1, -2).contiguous() if _SWAP else out
         while i < n:
             j = min(n, i + k)
             out, caches = self._step(x[:, :, i:j], caches, first=False)
