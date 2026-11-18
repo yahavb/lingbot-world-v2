@@ -39,10 +39,10 @@ LNC2-tuned MX tiles (0), `NEURON_RT_IO_RING_CACHE_SIZE=1024` (0), `LINGBOT_CROSS
 Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). This is the MX gate (floor 20 dB); the bf16
 4-device approved base scored 39.4 dB on the first 9 frames.
 
-# 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks): 16.11 fps, gate PASS (t27)
+# 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks): 16.16 fps, gate PASS (t28)
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
 All rows from t5 on ran on the same 2-device pod (kiro-ishaybee-dev2); the other two 2-device pods on the node measure the same GEN flags ~25 ms and ~90 ms slower.
-Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t27 set).
+Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t28 set).
 | Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
 |---|---|---|---|---|---|
 | s0_base | `flags_2chip.txt` | 6976.3 | 889 | 10.30 | FAIL (G1 19.99) |
@@ -66,8 +66,10 @@ Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t27 set
 | t17 | + `VAE_NKI_UP=2d VAE_NKI_UP_FOLD=1` (decode: nearest x2 upsample + 3x3 conv as one NKI kernel on the low-res tile) | 4511.8 | 573 | 15.93 | PASS (G1 20.33, G2 15.41, c0s0 0.0396) |
 | t19 | + `VAE_LOW_T=20` (decode: conv_in, mid block and stage 0 on all 20 latent frames in one step, the rest frame by frame) | 4516.2 | 552 | 15.98 | PASS (G1 20.33, G2 15.41, c0s0 0.0396) |
 | t22 | + `VAE_NKI_UP=all` (the temporal upsamples too), `COMMIT_KV_ONLY=1` (the commit forward's last block stops after its K / V; GEN-neutral) | 4517.3 | 548 | 15.99 | PASS (G1 20.48, G2 16.10, c0s0 0.0396) |
-| **t27** | **+ `VAE_T=2` (decode 2 latent frames per step), `VAE_NKI_CONV_LA=0` (the fused conv kernel's look-ahead off: at 8 frames per call it corrupted bursts of frames in about half the decodes)** | **4519.4** | **508** | **16.11** | **PASS** (G1 20.48, G2 16.10, c0s0 0.0396) |
+| t27 | + `VAE_T=2` (decode 2 latent frames per step), `VAE_NKI_CONV_LA=0` (the fused conv kernel's look-ahead off: at 8 frames per call it corrupted bursts of frames in about half the decodes) | 4519.4 | 508 | 16.11 | PASS (G1 20.48, G2 16.10, c0s0 0.0396) |
 | t27b | t27 on the second 2-device pod (GEN ~25 ms slower there) | 4552.8 | 508 | 16.01 | PASS (same frames) |
+| **t28** | **`VAE_T=3` (3 latent frames per decode step; 0 of 48 repeat decodes with any frame below 50 dB)** | **4515.8** | **496** | **16.16** | **PASS** (G1 20.48, G2 16.10, c0s0 0.0396) |
+| t28b | t28 on the second 2-device pod | 4558.5 | 495 | 16.03 | PASS |
 Refuted on the way (ledger): DVE exp offload (any share), paired exps, GpSimd adds, fused QKV (accuracy), TSPLIT,
 token-major attention output, glue kernels, bf16 residual (accuracy), FiLM bf16 all-reduce (accuracy), collective
 algorithm / DMA knobs, DMA priority for the attention loads, TP-free FFN (M=544 matmuls slower than the collectives
