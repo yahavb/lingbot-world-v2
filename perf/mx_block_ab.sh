@@ -16,7 +16,7 @@ for v in $VARIANTS; do
     IFS=',' read -r -a a <<< "$kvs"; for kv in "${a[@]}"; do export "$kv"; done
     if [ -z "$first" ]; then export SAVE_REF="$OUT/ref.pt"; else export REF="$OUT/ref.pt"; fi
     for i in 1 2; do
-      torchrun --nproc_per_node="$NPROC" --master_port=29733 perf/block_bench.py 2>&1 \
+      torchrun --nproc_per_node="$NPROC" --master_port="${PORT:-29733}" perf/block_bench.py 2>&1 \
         | grep -avE "AliasingInfo|Mutated inputs|Detected collective" > "$OUT/bb_${name}_$i.log"
       echo "[ab] $name run$i: $(grep -a '^\[block_bench\] tp=' "$OUT/bb_${name}_$i.log" | head -1 | grep -oE '[0-9.]+ ms/block|rel_rms_vs_ref=[0-9.e-]+')"
       grep -m3 -aE "Traceback|Error|failed" "$OUT/bb_${name}_$i.log" | cut -c1-200
@@ -24,7 +24,7 @@ for v in $VARIANTS; do
     done
     if [ "${PROF_VARIANT:-}" = "$name" ]; then
       export PROF_DIR="$OUT/prof_$name"; rm -rf "$PROF_DIR"; mkdir -p "$PROF_DIR"
-      REPS=5 torchrun --nproc_per_node="$NPROC" --master_port=29734 --no-python \
+      REPS=5 torchrun --nproc_per_node="$NPROC" --master_port="$(( ${PORT:-29733} + 1 ))" --no-python \
         bash perf/prof_rank0.sh python3 perf/block_bench.py > "$OUT/bbprof_$name.log" 2>&1
       d=$(ls -d "$PROF_DIR"/* | head -1); P="$OUT/pq_$name"; rm -rf "$P"; mkdir -p "$P"
       "$PROF" view -d "$d" --output-format parquet --output-file "$P" > "$P.log" 2>&1 &

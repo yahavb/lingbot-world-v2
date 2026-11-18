@@ -510,6 +510,9 @@ _CROSS_TPOUT = os.environ.get("LINGBOT_CROSS_TPOUT", "0") == "1"
 _CROSS_QPAD = int(os.environ.get("LINGBOT_CROSS_QPAD", "128"))
 
 
+_CROSS_DEDUP_BF16 = os.environ.get("LINGBOT_CROSS_DEDUP_BF16", "0") == "1"
+
+
 def cross_dedup_bias(k, v, kc):
     """LINGBOT_CROSS_DEDUP: for the first kc rows of the cross-attention K / V ([L, n, d] each), log(m / r) on the r
     rows inside the slice that equal the last row in both K and V (the context's zero padding, m such rows in all), 0
@@ -520,10 +523,32 @@ def cross_dedup_bias(k, v, kc):
     return torch.where(s, torch.log(m / r), torch.zeros((), dtype=torch.float32, device=k.device))
 
 
+# LINGBOT_CROSS_KERNEL=1: the deduplicated cross-attention as kernels/cross_dedup.py (four heads per instruction group,
+# exact softmax, bf16 probabilities) instead of the graph's fp32 matmuls + softmax.
+_CROSS_KERNEL = os.environ.get("LINGBOT_CROSS_KERNEL", "0") == "1"
+_CROSS_K = []
+
+
 def cross_attention_dedup(q, k_ndl, v_nld, bias, kc, dtype=torch.bfloat16):
     """LINGBOT_CROSS_DEDUP: [1, Lq, n, d] queries against the first kc keys of the N-major cross cache with the
     per-key log-multiplicity bias (cross_dedup_bias), as fp32 matmuls and softmax in the block graph -> [1, Lq, n, d]."""
     d = int(q.shape[-1])
+    if _CROSS_KERNEL and int(kc) == 128 and d == 128 and int(q.shape[2]) % 8 == 0:
+        if not _CROSS_K:
+            from torch_neuronx.nki_hop import wrap_nki
+            from kernels.cross_dedup import cross_dedup_kernel
+            _CROSS_K.append(wrap_nki(cross_dedup_kernel))
+        _, lq, n, _ = q.shape
+        o = _CROSS_K[0](q[0].reshape(lq, n * d).to(torch.bfloat16).contiguous(), k_ndl.to(torch.bfloat16),
+                        v_nld.to(torch.bfloat16), bias.float().contiguous(), int(n))
+        return o.view(1, lq, n, d).to(dtype)
+    if _CROSS_DEDUP_BF16:
+        # LINGBOT_CROSS_DEDUP_BF16=1 (kiro_mx4): the two matmuls on bf16 operands (the PE's bf16 rate, 4x fp32),
+        # softmax and bias in fp32 on the bf16-rounded logits
+        qh = (q[0] * (1.0 / math.sqrt(d))).to(torch.bfloat16).permute(1, 0, 2)          # [n, Lq, d]
+        lg = torch.matmul(qh, k_ndl[:, :, :kc].to(torch.bfloat16)).float() + bias        # [n, Lq, kc]
+        p_ = torch.softmax(lg, dim=-1).to(torch.bfloat16)
+        return torch.matmul(p_, v_nld[:, :kc].to(torch.bfloat16)).permute(1, 0, 2).unsqueeze(0).to(dtype)
     qh = (q[0].float() * (1.0 / math.sqrt(d))).permute(1, 0, 2)                         # [n, Lq, d]
     p_ = torch.softmax(torch.matmul(qh, k_ndl[:, :, :kc].float()) + bias, dim=-1)       # [n, Lq, kc]
     return torch.matmul(p_, v_nld[:, :kc].float()).permute(1, 0, 2).unsqueeze(0).to(dtype)
@@ -627,17 +652,28 @@ _CTE_PRIOR_FULL = os.environ.get("LINGBOT_CTE_PRIOR_FULL", "0") == "1"
 
 
 def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, normalize=False,
-             v_token_major=False):
+             v_token_major=False, h_cnt=0, q_dmajor=False, one_core=False, rowmax_vec=False):
     """One self-attention attention_cte call of the vendored kernel (LINGBOT_CTE_CHAIN), output in the
     tp_out layout [n, d, Lq_p]. normalize=False: (out, neg_max, sum) -- unnormalized output and the
     kernel's own [n, 128, groups] statistics -- for the next call's chain=. chain=(out, neg_max, sum)
     of an earlier call over other keys with the same q_c: this call continues that call's online
     softmax, so the last call of a chain returns the attention over the union of all the calls' keys.
     normalize=True: the normalized output only. k_prior / v_prior and k_blocks as in cte_partial.
-    v_token_major (LINGBOT_V_TOKEN_MAJOR): V and the V prior hold [L, n, d] memory under the [n, L, d] shape."""
-    d = int(q_c.shape[-1])
+    v_token_major (LINGBOT_V_TOKEN_MAJOR): V and the V prior hold [L, n, d] memory under the [n, L, d] shape.
+    LINGBOT_HOT_NOCOPY: q_dmajor -- q_c is d-major [n, d, Lq_p] (the constant-offset kernels' q_t; the kernel's
+    tp_q=False load, no transpose); h_cnt = N > 0 -- only heads 0 .. N - 1 of q_c / kc / vc / the priors
+    (full tensors, no head-sliced copies), the output and statistics [N, ...]. one_core (LINGBOT_HOT_ONECORE): every
+    head on the logical core's program 0. rowmax_vec (LINGBOT_HOT_ROWMAX_VEC): row-max evicts on Vector."""
+    d = int(q_c.shape[1] if q_dmajor else q_c.shape[-1])
     tp_k = int(kc.shape[-1]) == d and int(kc.shape[1]) != d
+    tpq = not q_dmajor
     kw = {}
+    if h_cnt:
+        kw["h_cnt"] = int(h_cnt)
+    if one_core:
+        kw["one_core"] = True
+    if rowmax_vec:
+        kw["rowmax_vec"] = True
     if k_blocks > 1:
         kw["k_blocks"] = int(k_blocks)
     if k_prior is not None:
@@ -651,10 +687,10 @@ def cte_call(q_c, kc, vc, k_prior=None, v_prior=None, k_blocks=1, chain=None, no
     if v_token_major:
         kw["v_token_major"] = True
     if normalize:
-        out = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+        out = _attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=tpq, tp_k=tp_k,
                              tp_out=True, **kw)
         return out[0] if isinstance(out, tuple) else out
-    return tuple(_attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=True, tp_k=tp_k,
+    return tuple(_attention_cte(q_c, kc, vc, scale=1.0, causal_mask=False, tp_q=tpq, tp_k=tp_k,
                                 tp_out=True, cache_softmax=True, skip_output_normalization=True, **kw))
 
 
@@ -672,7 +708,32 @@ def _cmax_kernels():
     global _CMAX_KERNELS
     if _CMAX_KERNELS is None:
         from torch_neuronx.nki_hop import wrap_nki
-        if _CMAX_MODE == 2:
+        if _CMAX_MODE == 3:
+            # LINGBOT_CMAX=3: kernels/attention_cmax3.py (512-query P@V, d-major output, (o, s) accumulators)
+            from kernels import attention_cmax3 as cm3
+            _CMAX_KERNELS = {
+                "full1": wrap_nki(cm3.cmax3_full_1),
+                "part1": wrap_nki(cm3.cmax3_part_1),
+                "part2": wrap_nki(cm3.cmax3_part_2),
+                "part3": wrap_nki(cm3.cmax3_part_3),
+                "final1": wrap_nki(cm3.cmax3_final_1),
+                # LINGBOT_C3_TOKOUT: token-major [Sq, tok_cols] output, zero columns up to the o-projection's K
+                "full1t": wrap_nki(cm3.cmax3_full_tok_1),
+                "final1t": wrap_nki(cm3.cmax3_final_tok_1),
+                # LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only
+                "full1h": wrap_nki(cm3.cmax3_full_1h),
+                "part1h": wrap_nki(cm3.cmax3_part_1h),
+                "part2h": wrap_nki(cm3.cmax3_part_2h),
+                "part3h": wrap_nki(cm3.cmax3_part_3h),
+                "final1h": wrap_nki(cm3.cmax3_final_1h),
+                # LINGBOT_HOT_ONECORE: the same with an uneven LNC2 head split (h_split heads on program 0)
+                "full1hs": wrap_nki(cm3.cmax3_full_1hs),
+                "part1hs": wrap_nki(cm3.cmax3_part_1hs),
+                "part2hs": wrap_nki(cm3.cmax3_part_2hs),
+                "part3hs": wrap_nki(cm3.cmax3_part_3hs),
+                "final1hs": wrap_nki(cm3.cmax3_final_1hs),
+            }
+        elif _CMAX_MODE == 2:
             from kernels import attention_cmax2_lb as cm
             _CMAX_KERNELS = {
                 "full1": wrap_nki(cm.cmax2_full_1),
@@ -700,7 +761,7 @@ def _cmax_kernels():
 
 def _cmax_layout(k_blocks, v_token_major):
     """The extra compile-time arguments of the LINGBOT_CMAX=2 kernels (the =1 kernels take plain layouts only)."""
-    if _CMAX_MODE == 2:
+    if _CMAX_MODE in (2, 3):
         return (int(k_blocks), bool(v_token_major))
     assert k_blocks == 1 and not v_token_major, "LINGBOT_CMAX=1 reads plain K / V layouts; use LINGBOT_CMAX=2"
     return ()
@@ -723,19 +784,50 @@ def _cmax_arg(offset):
     return offset if torch.is_tensor(offset) else float(offset)
 
 
-def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False):
+def cmax_partial(q_t, k_chunks, v_chunks, offset, k_blocks=1, v_token_major=False, h_lo=0, h_split=0):
     """fp32 accumulator [n, Lq_p, d + 1] (unnormalized output and row sums) over up to 3 chunks (K [n, d, L],
-    V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say)."""
+    V [n, L, d] logical shapes; their memory as k_blocks / v_token_major say). h_lo (LINGBOT_CMAX=3,
+    LINGBOT_HOT_HEADS): heads h_lo .. n - 1 only; h_split (LINGBOT_HOT_ONECORE): h_split of them on program 0."""
+    if h_lo and h_split:
+        assert _CMAX_MODE == 3, "h_split: LINGBOT_CMAX=3 only"
+        return _cmax_kernels()[f"part{len(k_chunks)}hs"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
+                                                         *_cmax_layout(k_blocks, v_token_major), int(h_lo),
+                                                         int(h_split))
+    if h_lo:
+        assert _CMAX_MODE == 3, "h_lo: LINGBOT_CMAX=3 only"
+        return _cmax_kernels()[f"part{len(k_chunks)}h"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
+                                                        *_cmax_layout(k_blocks, v_token_major), int(h_lo))
     return _cmax_kernels()[f"part{len(k_chunks)}"](q_t, *k_chunks, *v_chunks, _cmax_arg(offset),
                                                    *_cmax_layout(k_blocks, v_token_major))
 
 
-def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False):
-    """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only)."""
+def cmax_final(q_t, kc, vc, acc, offset, k_blocks=1, v_token_major=False, tok_cols=0, h_lo=0, h_split=0):
+    """Normalized [n, Lq_p, d] attention over one more chunk, continuing acc (None: this chunk only).
+    LINGBOT_CMAX=3: d-major [n, d, Lq_p], acc the partial call's (o, s) pair; with tok_cols (LINGBOT_C3_TOKOUT)
+    token-major [Lq_p, tok_cols] instead, the heads' n x d columns then zeros."""
     k = _cmax_kernels()
     lay = _cmax_layout(k_blocks, v_token_major)
+    if h_lo and h_split:
+        # LINGBOT_HOT_ONECORE: as below, h_split of the heads on program 0
+        assert _CMAX_MODE == 3 and not tok_cols, "h_split: LINGBOT_CMAX=3, no tok_cols"
+        if acc is None:
+            return k["full1hs"](q_t, kc, vc, _cmax_arg(offset), *lay, int(h_lo), int(h_split))
+        return k["final1hs"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(h_lo), int(h_split))
+    if h_lo:
+        # LINGBOT_HOT_HEADS: heads h_lo .. n - 1 only -> [n - h_lo, d, Lq_p]
+        assert _CMAX_MODE == 3 and not tok_cols, "h_lo: LINGBOT_CMAX=3, no tok_cols"
+        if acc is None:
+            return k["full1h"](q_t, kc, vc, _cmax_arg(offset), *lay, int(h_lo))
+        return k["final1h"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(h_lo))
+    if tok_cols:
+        assert _CMAX_MODE == 3, "tok_cols: LINGBOT_CMAX=3 only"
+        if acc is None:
+            return k["full1t"](q_t, kc, vc, _cmax_arg(offset), *lay, int(tok_cols))
+        return k["final1t"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay, int(tok_cols))
     if acc is None:
         return k["full1"](q_t, kc, vc, _cmax_arg(offset), *lay)
+    if _CMAX_MODE == 3:
+        return k["final1"](q_t, kc, vc, *acc, _cmax_arg(offset), *lay)       # acc = (o [n, d, Sq], s [n, Sq])
     return k["final1"](q_t, kc, vc, acc, _cmax_arg(offset), *lay)
 
 

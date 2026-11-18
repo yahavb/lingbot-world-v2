@@ -13,10 +13,17 @@ ARGS=(--task i2v-A14B --infer_mode causal_fast --ckpt_dir "$CKPT" --size "${SIZE
       --chunk_size 3 --image examples/03/image.jpg --action_path examples/03 --prompt "$PROMPT"
       --tp_degree "$TP" --cp_size "$CP" --denoise_steps "${DENOISE_STEPS:-4}" --local_attn_size 12 --sink_size 1 --base_seed 42)
 t0=$(date +%s)
-torchrun --nproc_per_node="$NPROC" --master_port=29740 generate.py "${ARGS[@]}" \
+# GEN_VIS / VAE_VIS: NEURON_RT_VISIBLE_CORES of the generation / the decodes (two runs side by side on one pod);
+# PORT: torchrun master port (default 29740); SYSPROF_DIR: Neuron runtime system profile of rank 0's generation
+# (perf/sysprof_rank0.sh: one span per NEFF execution, no instruction trace; read with perf/sysprof_gaps.py)
+WRAP=(); [ -n "${SYSPROF_DIR:-}" ] && WRAP=(--no-python bash perf/sysprof_rank0.sh python3)
+env ${GEN_VIS:+NEURON_RT_VISIBLE_CORES=$GEN_VIS} torchrun --nproc_per_node="$NPROC" --master_port="${PORT:-29740}" "${WRAP[@]}" generate.py "${ARGS[@]}" \
   --save_file "$d/out.mp4" --save_latents_path "$d/latents.pt" 2>&1 | grep -avE "AliasingInfo|Mutated inputs|Detected collective" > "$d/gen.log"
+# VAE_LNC=1 VAE_NPROC=16: decode at LNC1 (on 2 devices the LNC2 8-rank 2-D tiling (4 x 2) decodes black frames)
 for i in 1 2; do
-  LINGBOT_SAVE_FRAMES="$d/frames.pt" torchrun --nproc_per_node="${VAE_NPROC:-$NPROC}" --master_port=29740 decode_latents_width_sharded.py \
+  env ${VAE_VIS:+NEURON_RT_VISIBLE_CORES=$VAE_VIS} NEURON_LOGICAL_NC_CONFIG="${VAE_LNC:-$NEURON_LOGICAL_NC_CONFIG}" \
+  LINGBOT_SAVE_FRAMES="$d/frames.pt" \
+  torchrun --nproc_per_node="${VAE_NPROC:-$NPROC}" --master_port="${PORT:-29740}" decode_latents_width_sharded.py \
     --task i2v-A14B --ckpt_dir "$CKPT" --latents_path "$d/latents.pt" --save_file "$d/out.mp4" \
     --timing --warmup 2>&1 | grep -avE "AliasingInfo|Mutated inputs" > "$d/dec$i.log"
 done

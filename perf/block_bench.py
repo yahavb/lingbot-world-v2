@@ -97,7 +97,8 @@ def main():
     Lp = -(-L_loc // pad) * pad if pad else L_loc
     g = torch.Generator().manual_seed(1234 + rank // tpd)  # same x on every TP rank of a CP cell
     x = torch.randn(1, L_loc, config["dim"], generator=g) * 0.5
-    x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev).float()
+    x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev)
+    x = x.to(torch.bfloat16) if mf._RESIDUAL_BF16 else x.float()     # LINGBOT_RESIDUAL_BF16: the stream's dtype
     e0 = (torch.randn(1, 1, 6, config["dim"], generator=g) * 0.1).to(dev).float()
     ctx = torch.randn(1, 512, config["dim"], generator=g) * 0.5
     ctx_real = int(os.environ.get("CTX_REAL", "0") or 0)
@@ -167,7 +168,8 @@ def main():
         ks = [torch.cat(ks[:-1], dim=-1).contiguous(), ks[-1]]
         vs = [torch.cat(vs[:-1], dim=1).contiguous(), vs[-1]]
     from wan.modules.attention import cross_cache_shapes
-    _cks, _cvs = cross_cache_shapes(1, 512, heads, d)
+    # LINGBOT_CROSS_TPFREE: the full cross-attention holds all heads
+    _cks, _cvs = cross_cache_shapes(1, 512, heads * tpd if mf._CROSS_TPFREE else heads, d)
     cross = {"k": torch.zeros(_cks, dtype=torch.bfloat16, device=dev),
              "v": torch.zeros(_cvs, dtype=torch.bfloat16, device=dev),
              "is_init": torch.tensor(0, dtype=torch.int32, device=dev)}
@@ -187,6 +189,12 @@ def main():
     # then the MXFP8 FFN / every Linear when those flags are on.
     if mf._WT_PRE:
         mf._pretranspose_weights([blk])
+    if mf._HOT:
+        mf._permute_hot_heads([blk], layer0=K)     # LINGBOT_HOT_HEADS
+    if mf._FFN_TP2:
+        mf._ffn_tp2_weights([blk])          # LINGBOT_FFN_TP2
+    if mf._CROSS_TPFREE:
+        mf._cross_full_modules([blk])
     if mf._FFN_MX:
         mf._prequantize_ffn_mx([blk])
     if mf._LIN_MX:
