@@ -38,3 +38,23 @@ LNC2-tuned MX tiles (0), `NEURON_RT_IO_RING_CACHE_SIZE=1024` (0), `LINGBOT_CROSS
 | G3 first-chunk x0 rel-RMS vs R | 0.0673 | 0.0555 |
 Not covered: G4 (fp32 CPU decodes), D1 (repeat run), D2 (flags off == main). This is the MX gate (floor 20 dB); the bf16
 4-device approved base scored 39.4 dB on the first 9 frames.
+
+# 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks), work in progress toward 16 fps
+Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
+Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the r5 set).
+| Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
+|---|---|---|---|---|---|
+| s0_base | `flags_2chip.txt` | 6976.3 | 889 | 10.30 | FAIL (G1 19.99) |
+| rp1 | + `MX_RP_POST` | 6314.8 | 889 | 11.24 | PASS |
+| h1 | + `FFN_EPI FFN_UP_PAD M2176_DEFAULT QK_POST` | 5707.2 | 889 | 12.28 | PASS |
+| k1 | + `CMAX=3` (512-query P@V, transposes) | 5625.1 | 890 | 12.43 | PASS |
+| p1 | key-major scores, `C3_SUMMODE=pef SUMGROUP=16 DEPTH=4` | 5035.2 | 889 | 13.67 | FAIL (G1 18.85; G0/G3 at or better than B) |
+| **r1** | **+ `VBIAS_FOLD QK_POST_T`** | **4937.2** | 890 | **13.90** | **PASS** (G1 20.14) |
+| r1 + `VAE_T=1` | decode 813 ms (same frames, 52.76 dB vs R either way) | 4937.2 | 813 | 14.09 | (decode-only change) |
+| **r5** | **+ `VAE_T=1 FILM_ALL=1` (all chunks' camera FiLM before the loop: 222 ms vs 278)** | **4906.0** | 811 | **14.17** | **PASS** (G1 20.62) |
+Refuted on the way (ledger): DVE exp offload (any share), paired exps, GpSimd adds, fused QKV (accuracy), TSPLIT,
+token-major attention output, glue kernels, bf16 residual (accuracy), FiLM bf16 all-reduce (accuracy), collective
+algorithm / DMA knobs, DMA priority for the attention loads, TP-free FFN (M=544 matmuls slower than the collectives
+they save). Where the 2-chip block (3.57 ms in the pipeline, 3 cached chunks) goes: attention ~1.5 ms (exp-bound on
+the Scalar engine at ~0.5 us per [128, 512] tile), MX matmuls ~1.07 ms (42-61% of MX peak), ~0.35 ms fully idle at
+the TP collectives, the rest elementwise glue; the camera FiLM graphs are 222 ms of each 4.9 s generation. 16 fps needs GEN <= ~4.25 s (-0.66 s).

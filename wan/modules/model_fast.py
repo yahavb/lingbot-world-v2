@@ -244,6 +244,8 @@ _ROWMAX_GRAPH = os.environ.get("LINGBOT_ROWMAX_GRAPH", "0") == "1"
 # so the 40 blocks share two compiled graph families (a per-layer value read in the trace made 40).
 _CMAX = int(os.environ.get("LINGBOT_CMAX", "0") or 0) >= 1
 _CMAX_OFFSET = float(os.environ.get("LINGBOT_CMAX_OFFSET", "30"))
+# LINGBOT_CMAX=3: kernels/attention_cmax3.py (512-query P@V, d-major output) instead of attention_cmax2_lb.py
+_CMAX_MODE3 = os.environ.get("LINGBOT_CMAX", "0") == "3"
 # LINGBOT_CMAX_QSPLIT=n (kiro, 4-chip CP4: 1088 queries per rank): the constant-offset calls take at most n query rows
 # each (kernels/attention_cmax2_lb.py runs at most 640, validated at CP8's 544 with pinned PSUM), the query rows split
 # into consecutive pieces that each attend every key: the same softmax per row, more K / V loads.
@@ -988,6 +990,8 @@ def _tp_row_parallel(linear, x, scatter=False, bf16_sum=False):
     # Left as-is only because removing it is a no-op either way. The docstring's claim
     # about "paying fp32 matmul rates on bf16-stored weights" and the per-forward weight
     # upcast does not survive this: there was no upcast.
+    if scatter and getattr(linear, "_bias_full", None) is not None:
+        return _mx_rp_scatter(linear, x).to(orig_dtype)          # LINGBOT_MX_RP_POST
     with torch.amp.autocast('neuron', dtype=torch.float32):
         y = linear(x)
     if scatter:
@@ -1020,6 +1024,31 @@ def _tp_rms_norm(x, weight, eps, full_dim):
 
 
 _QK_AR1 = os.environ.get("LINGBOT_QK_AR1", "0") == "1"
+# LINGBOT_QK_POST=1 (LINGBOT_LIN_MX, flat CP with precomputed RoPE grids): the self-attention Q and K projections
+# without their bias, then kernels/qk_post.py: bias + sum of squares (one kernel), ONE TP all-reduce for both rows'
+# sums, bias + RMSNorm + RoPE (one kernel). Replaces two all-reduces and the compiler's elementwise chain, which the
+# 2-chip block profile showed serialized between the q/k/v kernels (~0.5 ms, no engine above 45% busy).
+_QK_POST = os.environ.get("LINGBOT_QK_POST", "0") in ("1", "2")
+_QK_POST_SPLIT = os.environ.get("LINGBOT_QK_POST", "0") == "2"
+# LINGBOT_QK_POST_T=1 (with LINGBOT_QK_POST=1 and LINGBOT_CMAX=3, constant-offset layers only): the norm + RoPE kernel
+# writes q pre-scaled by 1/sqrt(d) and k as [n, d, L] (kernels/qk_post.py qk_norm_rope_t), the layouts the attention
+# and the K gather read. The pef block profile (bb_pf) had cmax_prep_q's scale + transpose (multiply.14 at 813 us) and
+# the K cache-layout transpose (transpose.146, 110 us of engine time) scheduled late, behind the V projection, so the
+# cached chunks' attention waited ~290 us for its Q.
+_QK_POST_T = os.environ.get("LINGBOT_QK_POST_T", "0") == "1"
+# LINGBOT_QK_POST_TSPLIT=1 (with QK_POST_T and LINGBOT_MX_QKV_FUSED): q's and k's sum / all-reduce / norm + RoPE as
+# separate kernels (kernels/qk_post.py x_ss3 / x_norm_rope_t3), so the cached chunks' attention, which needs only q,
+# can start while k's chain runs (bb_qkv: q_t ready at 643 us, attention at full speed from ~700 us).
+_QK_POST_TSPLIT = os.environ.get("LINGBOT_QK_POST_TSPLIT", "0") == "1"
+# LINGBOT_VBIAS_FOLD=1: the self-attention V bias folded into the o-projection bias at load. Softmax weights sum to 1,
+# so attn(V + 1 b_v^T) W_o^T = attn(V) W_o^T + W_o b_v: V (and the KV cache) is computed without its bias, and every
+# rank adds W_o,r b_v,r to its share of the row-parallel o bias (their sum is all-reduced as before). Drops the
+# [2176, 1280] bias add after the V projection (add.121 in bb_pf, ~90 us of engine time during the attention).
+_VBIAS_FOLD = os.environ.get("LINGBOT_VBIAS_FOLD", "0") == "1"
+# LINGBOT_C3_TOKOUT=1 (LINGBOT_CMAX=3, MX o-projection): the constant-offset final call writes token-major
+# [Lq, K_o] (heads x d, then the zero columns of the o-projection's padded K) instead of [n, d, Lq], so no
+# transpose + pad op runs between the attention and the o-projection (pad.152 in bb_qt3: 110 us, 59 us busy).
+_C3_TOKOUT = os.environ.get("LINGBOT_C3_TOKOUT", "0") == "1"
 # LINGBOT_QKV_FUSED=1: self-attention Q, K, V as ONE matmul on a [Wq; Wk; Wv] buffer (q/k/v
 # weights become views into it, no extra memory). The block profile charged ~0.3 ms of compiler
 # transposes to EACH of the three projections of the same all-gathered input.
@@ -1042,6 +1071,26 @@ _LIN_MX = os.environ.get("LINGBOT_LIN_MX", "0") == "1"
 _FFN_MX = os.environ.get("LINGBOT_FFN_MX", "0") == "1" or _LIN_MX
 # LINGBOT_LIN_MX_SKIP="self_attn.o,cross_attn.o": these Linears stay bf16 under LINGBOT_LIN_MX.
 _MX_QKV_FUSED = os.environ.get("LINGBOT_MX_QKV_FUSED", "0") == "1"
+# LINGBOT_MX_RP_POST=1|fp32: the three sequence-parallel row-parallel MX Linears (self_attn.o, cross_attn.o, ffn.2)
+# leave the bias out of the [n*S, C] partial sums, reduce-scatter the kernel's bf16 output as is (=1) or cast to fp32
+# first (=fp32, the default path's reduction dtype), and add the full bias to this rank's [S, C] shard afterwards.
+# The 2-chip block profile charged each [2176, 5120] bias add + fp32 cast (add.268 / add.466 / add.531) ~45 us of PE
+# transposes and ~70 us of Vector/Scalar, serialized between the kernels. The full bias (rank 0's; the other ranks hold
+# zeros, see shard_row_parallel) is all-reduced once at load into _bias_full.
+_MX_RP_POST = os.environ.get("LINGBOT_MX_RP_POST", "0")
+_MX_RP_NAMES = ("self_attn.o", "cross_attn.o")
+# LINGBOT_FFN_EPI=1: the MX FFN's bias + GELU(tanh) + down-projection K padding as one NKI kernel (kernels/ffn_epi.py)
+# instead of compiler elementwise ops (~200 us with PE transposes between the two matmuls at the 2-chip shape).
+_FFN_EPI = os.environ.get("LINGBOT_FFN_EPI", "0") == "1"
+# LINGBOT_FFN_UP_PAD=1: ffn.0's weight gets zero output rows up to ffn.2's 512-padded K (3456 -> 3584 at TP4), so the
+# up projection writes the padded activation itself. perf/mx_tile_sweep.py FAST=1 M=2176: (5120, 3584) default tiles
+# 208-216 us vs (5120, 3456) tuned 252 us.
+_FFN_UP_PAD = os.environ.get("LINGBOT_FFN_UP_PAD", "0") == "1"
+# LINGBOT_GLUE=1 (LINGBOT_SP, LINGBOT_LIN_MX): the block's residual / gate / camera FiLM / LayerNorm / modulation steps
+# on the token shard as kernels/glue.py NKI kernels; norm3's affine is folded into cross_attn.q's weight and bias
+# (before MX quantization), so the kernel's LayerNorm has none. The 2-chip block profile had these chains at
+# 110-190 us each between the collectives (~0.55 ms per block), latency-bound compiler ops.
+_GLUE = os.environ.get("LINGBOT_GLUE", "0") == "1"
 _MX_LIN_SKIP = tuple(x for x in os.environ.get("LINGBOT_LIN_MX_SKIP", "").replace(":", ",").split(",") if x)
 _MX_LIN_NAMES = ("self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
                  "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
@@ -1158,6 +1207,29 @@ def _mx_linear_forward(self, x):
     return y.view(*shp[:-1], y.shape[-1])
 
 
+def _mx_set_bias_full(lin):
+    """LINGBOT_MX_RP_POST: the full row-parallel bias on every TP rank (eager, once, at load)."""
+    if lin.bias is None or getattr(lin, "_bias_full", None) is not None:
+        return
+    with torch.no_grad():
+        b = tp.all_reduce_fn(lin.bias.detach().float().contiguous(), "tp")
+        lin.register_buffer("_bias_full", (b + 0).to(lin.bias.dtype), persistent=False)
+
+
+def _mx_rp_scatter(lin, x):
+    """LINGBOT_MX_RP_POST: row-parallel MX Linear on x [1, n*S, K], reduce-scatter over the TP group's tokens, then
+    the full bias on this rank's shard -> [1, S, N] fp32."""
+    from kernels import ffn_mx
+    x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+    if lin._mxq_k != x2.shape[-1]:
+        x2 = torch_F.pad(x2, (0, lin._mxq_k - x2.shape[-1]))
+    y = ffn_mx.mm(x2.contiguous(), lin._mxq_data, lin._mxq_scales)      # [n*S, N] bf16, no bias
+    if _MX_RP_POST == "fp32":
+        y = y.float()
+    r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh("tp"))      # [S, N]
+    return (r.float() + lin._bias_full.float()).unsqueeze(0)
+
+
 def _prequantize_linears_mx(blocks):
     """LINGBOT_LIN_MX: every non-FFN block Linear (the FFN is _prequantize_ffn_mx's)."""
     assert not (_QKV_FUSED or _QKV_XT), "LINGBOT_LIN_MX: QKV_FUSED / QKV_XT read q/k/v weights directly"
@@ -1165,6 +1237,14 @@ def _prequantize_linears_mx(blocks):
     for blk in blocks:
         b_ = getattr(blk, "_orig_mod", blk)
         sa = b_.self_attn
+        if _VBIAS_FOLD and not getattr(b_, "_vbias_folded", False) and sa.v.bias is not None \
+                and sa.o.bias is not None and sa.o.weight.numel() > 0 and sa.v.weight.numel() > 0:
+            # LINGBOT_VBIAS_FOLD: o.bias_r += W_o,r b_v,r (this rank's heads), V without bias from here on
+            with torch.no_grad():
+                c = sa.o.weight.float() @ sa.v.bias.float()
+                sa.o.bias.copy_((sa.o.bias.float() + c).to(sa.o.bias.dtype))
+                sa.v.bias = None
+                b_._vbias_folded = True
         if _MX_QKV_FUSED and getattr(sa, "_mxqkv", None) is None:
             with torch.no_grad():
                 h = nn.Module()
@@ -1178,15 +1258,31 @@ def _prequantize_linears_mx(blocks):
                     l_.weight = nn.Parameter(torch.empty(0, dtype=l_.weight.dtype, device=l_.weight.device),
                                              requires_grad=False)
                 n += 3
+        if _GLUE and getattr(b_, "norm3", None) is not None and getattr(b_.norm3, "weight", None) is not None \
+                and not getattr(b_, "_norm3_folded", False):
+            # LINGBOT_GLUE: cross_attn.q(LN(x) * w3 + b3) = LN(x) @ (Wq diag(w3))^T + (bq + Wq b3)
+            with torch.no_grad():
+                cq = b_.cross_attn.q
+                w3 = b_.norm3.weight.float()
+                b3 = b_.norm3.bias.float() if b_.norm3.bias is not None else torch.zeros_like(w3)
+                wq = cq.weight.float()
+                bq = cq.bias.float() if cq.bias is not None else torch.zeros(wq.shape[0], device=wq.device)
+                cq.weight = nn.Parameter((wq * w3[None, :]).to(cq.weight.dtype), requires_grad=False)
+                cq.bias = nn.Parameter((bq + wq @ b3).to(cq.weight.dtype), requires_grad=False)
+                b_._norm3_folded = True
         for name in _MX_LIN_NAMES:
             if name in _MX_LIN_SKIP or (_MX_QKV_FUSED and name in ("self_attn.q", "self_attn.k", "self_attn.v")):
                 continue
             lin = b_.get_submodule(name)
             _mx_quantize_linear(lin)
             lin.forward = types.MethodType(_mx_linear_forward, lin)
+            if _MX_RP_POST in ("1", "fp32") and name in _MX_RP_NAMES and tp.mesh_submesh("tp") is not None:
+                _mx_set_bias_full(lin)
             n += 1
     _q(f"[model_fast] LINGBOT_LIN_MX: {n} Linears in MXFP8 ({len(_MX_LIN_NAMES) - len(_MX_LIN_SKIP)} per "
-       f"block, kept bf16: {list(_MX_LIN_SKIP)}); bf16 copies freed")
+       f"block, kept bf16: {list(_MX_LIN_SKIP)}); bf16 copies freed"
+       + (f"; LINGBOT_MX_RP_POST={_MX_RP_POST}: o-projection biases after the reduce-scatter"
+          if _MX_RP_POST in ("1", "fp32") else ""))
 
 
 def _prequantize_ffn_mx(blocks):
@@ -1201,10 +1297,21 @@ def _prequantize_ffn_mx(blocks):
                 kp = -(-w.shape[1] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
                 if kp != w.shape[1]:
                     w = torch_F.pad(w, (0, kp - w.shape[1]))
+                if lin is ffn[0] and _FFN_UP_PAD:
+                    # LINGBOT_FFN_UP_PAD: zero output rows up to the down projection's padded K, so ffn.0 writes
+                    # [M, 3584] (GELU(0 + 0) = 0 in the pad) and nothing pads between the matmuls
+                    npad = -(-w.shape[0] // ffn_mx.K_ALIGN) * ffn_mx.K_ALIGN
+                    if npad != w.shape[0]:
+                        w = torch_F.pad(w, (0, 0, 0, npad - w.shape[0]))
+                        if lin.bias is not None:
+                            lin.register_buffer("_b_pad", torch_F.pad(lin.bias.detach(), (0, npad - lin.bias.shape[0])),
+                                                persistent=False)
                 d, sc = ffn_mx.prequantize_weight(w.contiguous())
                 lin.register_buffer("_mxq_data", d, persistent=False)
                 lin.register_buffer("_mxq_scales", sc, persistent=False)
                 lin._mxq_k = kp
+        if _MX_RP_POST in ("1", "fp32") and _SP_ON and tp.mesh_submesh("tp") is not None:
+            _mx_set_bias_full(ffn[2])
         if i == 0:
             # The compiled path (wrap_nki) must match the eager LNC launch the bench measured.
             x = torch.randn(256, ffn[0].in_features, device=ffn[0].weight.device).to(torch.bfloat16)
@@ -1214,7 +1321,7 @@ def _prequantize_ffn_mx(blocks):
             dense = x.float() @ ffn[0].weight.float().t()
             torch.neuron.synchronize()
             dd = (got.float() - ref.float()).abs().max().item()
-            rel = ((ref.float() - dense).norm() / dense.norm()).item()
+            rel = ((ref.float()[:, :dense.shape[1]] - dense).norm() / dense.norm()).item()   # (LINGBOT_FFN_UP_PAD)
             _q(f"[model_fast] LINGBOT_FFN_MX: {ffn_mx.FP8}, compiled vs eager max|d| {dd:.3e}, "
                f"eager vs bf16-weight fp32 matmul rel {rel:.3e}")
             # tuned tiles (LINGBOT_MX_TUNED) may sum in another order than the default eager kernel
@@ -1235,13 +1342,26 @@ def _ffn_mx(ffn, hf):
     """SP FFN on MXFP8 matmuls: hf [1, M, C] all-gathered -> [1, M, C] partial sums (+ bias)."""
     from kernels import ffn_mx
     x = hf[0]
-    u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)
-    if ffn[0].bias is not None:
-        u = u + ffn[0].bias
-    u = ffn[1](u)
-    if ffn[2]._mxq_k != u.shape[1]:
-        u = torch_F.pad(u, (0, ffn[2]._mxq_k - u.shape[1]))
+    u = ffn_mx.mm(x, ffn[0]._mxq_data, ffn[0]._mxq_scales)      # [M, N] (N padded under LINGBOT_FFN_UP_PAD)
+    b0 = getattr(ffn[0], "_b_pad", None)
+    b0 = ffn[0].bias if b0 is None else b0
+    if _FFN_EPI and b0 is not None:
+        # LINGBOT_FFN_EPI: bias + GELU(tanh) + the K padding of the down projection in one NKI kernel
+        from kernels import ffn_epi
+        u = ffn_epi.bias_gelu_pad(u, b0.view(1, -1).to(u.dtype).contiguous(), int(ffn[2]._mxq_k))
+    else:
+        if b0 is not None:
+            u = u + b0
+        u = ffn[1](u)
+        if ffn[2]._mxq_k != u.shape[1]:
+            u = torch_F.pad(u, (0, ffn[2]._mxq_k - u.shape[1]))
     y = ffn_mx.mm(u.contiguous(), ffn[2]._mxq_data, ffn[2]._mxq_scales)
+    if getattr(ffn[2], "_bias_full", None) is not None:
+        # LINGBOT_MX_RP_POST: no bias in the partial sums; reduce-scatter here, full bias on this rank's shard
+        if _MX_RP_POST == "fp32":
+            y = y.float()
+        r = fc.reduce_scatter_tensor(y, "sum", 0, tp.mesh_submesh("tp"))
+        return (r.float() + ffn[2]._bias_full.float()).unsqueeze(0)
     if ffn[2].bias is not None:
         y = y + ffn[2].bias
     return y.unsqueeze(0)
@@ -1470,7 +1590,23 @@ class CausalWanSelfAttention(nn.Module):
                     and kv_chunks[0][-1].dim() == 3 and not _KV_GATHER1
                     and not self._const_max_here() and not self._fa2_here())
         _vg_early = [None]
-        q, k, v = qkv_fn(x)
+        # LINGBOT_QK_POST: MX q/k without bias, then bias + TP RMSNorm + RoPE in two NKI kernels (kernels/qk_post.py)
+        _qkp = (_QK_POST and getattr(self, 'tp_enabled', False) and self.qk_norm and sp_enabled
+                and _SEQ_MODE == "cp" and x.shape[0] == 1 and rope_grids is not None and rope_grids[0] is not None
+                and ((getattr(self.q, "_mxq_data", None) is not None and getattr(self.k, "_mxq_data", None) is not None)
+                     or getattr(self, "_mxqkv", None) is not None)
+                and not (_Q_FIRST or _QKV_XT or _KV_FIRST or _QK_AR1 or _v_early)
+                and not (_KV_REAL and _REAL_TOKENS[0] is not None and _REAL_TOKENS[0] < x.shape[1])
+                and not (_COMMIT_Q_FIRST and kv_write and getattr(self, 'use_cmax', False)))
+        # LINGBOT_QK_POST_T: the constant-offset kernel's queries (scaled) and this rank's K, both [n, d, s] already
+        _qt_pre = _kt_pre = None
+        if _qkp:
+            _r = self._qkv_post(x, rope_grids, rope_local_grid if rope_local_grid is not None else grid_sizes)
+            q, k, v = _r[:3]
+            if len(_r) > 3:
+                _qt_pre, _kt_pre = _r[3], _r[4]
+        else:
+            q, k, v = qkv_fn(x)
 
         if frame_seqlen is None:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
@@ -1508,7 +1644,9 @@ class CausalWanSelfAttention(nn.Module):
         else:
             rope_grid = grid_sizes
 
-        if rope_grids is not None and rope_grids[0] is not None:
+        if _qkp:
+            roped_query, roped_key = q, k                   # LINGBOT_QK_POST: rotated in kernels/qk_post.py
+        elif rope_grids is not None and rope_grids[0] is not None:
             # Precomputed by WanModelFast.forward. Pure tensor math from here, so
             # this traces under fullgraph=True; building the grids in-block does
             # not (data-dependent start_frame -> unbacked symint).
@@ -1676,6 +1814,10 @@ class CausalWanSelfAttention(nn.Module):
                     _kin = (roped_key[0].permute(1, 2, 0) if _k_ndl
                             else roped_key[0].permute(1, 0, 2)).contiguous()
                     _vin = v[0].contiguous() if _V_TM else v[0].permute(1, 0, 2).contiguous()
+                elif _kt_pre is not None and _k_ndl and not _KV_GATHER1 and int(_kt_pre.shape[2]) >= _l:
+                    # LINGBOT_QK_POST_T: the kernel's [n, d, s] K, its real tokens only (a contiguous-run copy when
+                    # the rank pads), no permute round trip
+                    _kin = _kt_pre if int(_kt_pre.shape[2]) == _l else _kt_pre[:, :, :_l].contiguous()
 
                 def _gather_new():
                     if _KV_GATHER1:
@@ -1730,7 +1872,11 @@ class CausalWanSelfAttention(nn.Module):
                         "LINGBOT_CMAX: no ATTN_SPLIT / ATTN_REM / CTE_QMAJOR / KV_CLONE"
                     assert _k_ndl, "LINGBOT_CMAX reads K as [n, d, L]"
                     _kb = _cp if _K_BLOCKED else 1
-                    q_t, lq = cmax_prep_q(roped_query, pad_to=_qpad)
+                    if (_qt_pre is not None and not _DIAG_QK_SCALE
+                            and (not _qpad or int(_qt_pre.shape[2]) % _qpad == 0)):
+                        q_t, lq = _qt_pre, int(_qt_pre.shape[2])          # LINGBOT_QK_POST_T
+                    else:
+                        q_t, lq = cmax_prep_q(roped_query, pad_to=_qpad)
                     lead_k, lead_v = list(k_chunks[:-1]), list(v_chunks[:-1])
                     _lqp = int(q_t.shape[2])
                     if _CMAX_QSPLIT and _lqp > _CMAX_QSPLIT:
@@ -1766,6 +1912,15 @@ class CausalWanSelfAttention(nn.Module):
                                                        torch.clamp(_gfl - 1.0, min=0.0).sum(),
                                                        torch.clamp(_gfl, max=1.0).sum()]))
                         o_n = _on[0] if len(_on) == 1 else torch.cat(_on, dim=1)
+                    elif (_C3_TOKOUT and _CMAX_MODE3 and len(q_ps) == 1 and not _DIAG_BUFS
+                          and getattr(self.o, "_mxq_k", None) is not None
+                          and int(self.o._mxq_k) >= int(q_t.shape[0]) * int(q_t.shape[1])):
+                        # LINGBOT_C3_TOKOUT: [Lq_p, K_o] token-major, already padded for the MX o-projection
+                        o_tok = cmax_final(q_ps[0], kd, vd, accs[0], _c_off, _kb, _V_TM, tok_cols=int(self.o._mxq_k))
+                        out = self._out_proj(o_tok[:lq].unsqueeze(0), _async_out, scatter=_sp_scatter)
+                        if return_cache and not getattr(self, 'tp_enabled', False):
+                            return out, kd, vd
+                        return out
                     else:
                         _on = [cmax_final(q_, kd, vd, a_, _c_off, _kb, _V_TM) for q_, a_ in zip(q_ps, accs)]
                         o_n = _on[0] if len(_on) == 1 else torch.cat(_on, dim=1)  # [n, Lq_p, d]
@@ -1775,7 +1930,11 @@ class CausalWanSelfAttention(nn.Module):
                         if acc is not None and "acc" in _DIAG_BUFS:
                             _DIAG_BUFS["acc"].copy_(acc)
                         _DIAG_BUFS["o_n"].copy_(o_n)
-                    x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)              # [1, Lq, n, d]
+                    if _CMAX_MODE3:
+                        assert len(q_ps) == 1 and not _CMAX_GUARD, "LINGBOT_CMAX=3: no QSPLIT / GUARD"
+                        x = o_n[:, :, :lq].permute(2, 0, 1).unsqueeze(0)       # [n, d, Lq_p] -> [1, Lq, n, d]
+                    else:
+                        x = o_n[:, :lq].permute(1, 0, 2).unsqueeze(0)          # [1, Lq, n, d]
                     out = self._out_proj(x, _async_out, scatter=_sp_scatter)
                     if return_cache and not getattr(self, 'tp_enabled', False):
                         return out, kd, vd
@@ -2100,6 +2259,92 @@ class CausalWanSelfAttention(nn.Module):
             return out, kv_cache["k"], kv_cache["v"]
         return out
 
+    def _qkv_post(self, x, rope_grids, lg):
+        """LINGBOT_QK_POST: q, k (normalized and rotated) and v for x [1, s, C] -> each [1, s, n, d]."""
+        from kernels import ffn_mx, qk_post
+        b, s = x.shape[:2]
+        n, d = self.num_heads, self.head_dim
+        x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16).contiguous()
+        qkv = None
+        if getattr(self, "_mxqkv", None) is not None:
+            # LINGBOT_MX_QKV_FUSED: one MX matmul on [Wq; Wk; Wv] (the input loaded, transposed and quantized once);
+            # the qk_post kernels read q and k as column blocks of its [s, 3F] output
+            F = int(self._qkv_split[0])
+            assert tuple(self._qkv_split) == (F, F, F), self._qkv_split
+            qkv = ffn_mx.mm(x2, self._mxqkv._mxq_data, self._mxqkv._mxq_scales)     # [s, 3F] bf16, no bias
+            v = qkv[:, 2 * F:]
+            bv = getattr(self._mxqkv, "bias", None)
+            if bv is not None:
+                v = v + bv[2 * F:]
+            v = v.reshape(b, s, n, d)
+            qr = kr = None
+        else:
+            qr = ffn_mx.mm(x2, self.q._mxq_data, self.q._mxq_scales)        # [s, F] bf16, no bias
+            kr = ffn_mx.mm(x2, self.k._mxq_data, self.k._mxq_scales)
+            v = self.v(x).view(b, s, n, d)
+            F = int(qr.shape[1])
+
+        def _row(t):
+            return (t if t is not None else torch.zeros(F, device=x.device)).reshape(1, F).to(torch.bfloat16)
+
+        bq, bk = _row(self.q.bias), _row(self.k.bias)
+        if _QK_POST_SPLIT:
+            assert qkv is None, "LINGBOT_QK_POST=2: no LINGBOT_MX_QKV_FUSED"
+            # LINGBOT_QK_POST=2: q's sums, all-reduce and norm + RoPE first, so the cached chunks' attention can
+            # start before k's chain (and v) is done
+            ssq = tp.all_reduce_fn(qk_post.x_ss(qr, bq), "tp")
+            _cos, _sin = rope_grids
+            _g = lg.tolist() if torch.is_tensor(lg) else lg
+            seq = int(_g[0][0]) * int(_g[0][1]) * int(_g[0][2])
+            c = int(_cos[0].shape[-1])
+            cos2 = _cos[0].reshape(seq, c).float()
+            sin2 = _sin[0].reshape(seq, c).float()
+            if seq < s:
+                cos2 = torch_F.pad(cos2, (0, 0, 0, s - seq), value=1.0)
+                sin2 = torch_F.pad(sin2, (0, 0, 0, s - seq), value=0.0)
+            cos2, sin2 = cos2.contiguous(), sin2.contiguous()
+            q = qk_post.x_norm_rope(qr, bq, ssq, _row(self.norm_q.weight), cos2, sin2, 1.0 / float(self.dim),
+                                    float(self.eps))
+            ssk = tp.all_reduce_fn(qk_post.x_ss(kr, bk), "tp")
+            k = qk_post.x_norm_rope(kr, bk, ssk, _row(self.norm_k.weight), cos2, sin2, 1.0 / float(self.dim),
+                                    float(self.eps))
+            return q.view(b, s, n, d), k.view(b, s, n, d), v
+        _tsplit = (_QK_POST_TSPLIT and qkv is not None and _QK_POST_T and _CMAX_MODE3 and _CTE_CHAIN
+                   and getattr(self, 'use_cmax', False))
+        if not _tsplit:
+            ss = (qk_post.qk_ss3(qkv, bq, bk) if qkv is not None
+                  else qk_post.qk_ss(qr, kr, bq, bk))                      # [s, 2] fp32, this rank's features
+            ss = tp.all_reduce_fn(ss, "tp")
+        _cos, _sin = rope_grids
+        _g = lg.tolist() if torch.is_tensor(lg) else lg
+        seq = int(_g[0][0]) * int(_g[0][1]) * int(_g[0][2])
+        c = int(_cos[0].shape[-1])
+        cos2 = _cos[0].reshape(seq, c).float()
+        sin2 = _sin[0].reshape(seq, c).float()
+        if seq < s:     # rows past the real tokens: identity rotation, as causal_rope_apply_rotation leaves them
+            cos2 = torch_F.pad(cos2, (0, 0, 0, s - seq), value=1.0)
+            sin2 = torch_F.pad(sin2, (0, 0, 0, s - seq), value=0.0)
+        if _QK_POST_T and _CMAX_MODE3 and _CTE_CHAIN and getattr(self, 'use_cmax', False):
+            # LINGBOT_QK_POST_T: q_t (scaled) and k_t [n, d, s] straight from the kernel; the [1, s, n, d] views keep
+            # the callers' shapes (only q_t is read for the queries; the K gather's permute of k is a no-op copy)
+            _wn = (_row(self.norm_q.weight), _row(self.norm_k.weight), cos2.contiguous(), sin2.contiguous(),
+                   1.0 / float(self.dim), float(self.eps), 1.0 / math.sqrt(d))
+            if _tsplit:
+                _cs = (cos2.contiguous(), sin2.contiguous(), 1.0 / float(self.dim), float(self.eps))
+                ssq = tp.all_reduce_fn(qk_post.x_ss3(qkv, 0, bq), "tp")
+                q_t = qk_post.x_norm_rope_t3(qkv, 0, bq, ssq, _row(self.norm_q.weight), *_cs, 1.0 / math.sqrt(d))
+                ssk = tp.all_reduce_fn(qk_post.x_ss3(qkv, F, bk), "tp")
+                k_t = qk_post.x_norm_rope_t3(qkv, F, bk, ssk, _row(self.norm_k.weight), *_cs, 1.0)
+            else:
+                q_t, k_t = (qk_post.qk_norm_rope_t3(qkv, bq, bk, ss, *_wn) if qkv is not None
+                            else qk_post.qk_norm_rope_t(qr, kr, bq, bk, ss, *_wn))
+            return q_t.permute(2, 0, 1).unsqueeze(0), k_t.permute(2, 0, 1).unsqueeze(0), v, q_t, k_t
+        _wn = (_row(self.norm_q.weight), _row(self.norm_k.weight), cos2.contiguous(), sin2.contiguous(),
+               1.0 / float(self.dim), float(self.eps))
+        q, k = (qk_post.qk_norm_rope3(qkv, bq, bk, ss, *_wn) if qkv is not None
+                else qk_post.qk_norm_rope(qr, kr, bq, bk, ss, *_wn))
+        return q.view(b, s, n, d), k.view(b, s, n, d), v
+
     def _out_proj_fmaj(self, xt):
         """LINGBOT_ATTN_FMAJ: o-projection of the d-major attention output xt [n, d, L] (L = the
         TP group's gathered tokens): per TP token block W_o @ x (contraction on the partition axis),
@@ -2138,6 +2383,8 @@ class CausalWanSelfAttention(nn.Module):
         if scatter and getattr(self, 'tp_enabled', False):
             # Sequence parallel (LINGBOT_SP): reduce-scatter to this rank's token shard.
             orig_dtype = x.dtype
+            if getattr(self.o, "_bias_full", None) is not None:
+                return _mx_rp_scatter(self.o, x).to(orig_dtype)      # LINGBOT_MX_RP_POST
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 y = self.o(x)
             return tp.reduce_scatter_tokens(y, "tp").to(orig_dtype)
@@ -2380,7 +2627,17 @@ class CausalWanAttentionBlock(nn.Module):
             # instead of all of them, and the per-block fp32 FiLM all-gather of x disappears.
             # Attention, QK-norm, RoPE and the KV write still see all tokens of this rank's heads.
             xs = x
-            h = self.norm1(xs).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+            _C = int(xs.shape[-1])
+            _glue = (_GLUE and xs.shape[0] == 1 and all(int(t_.numel()) == _C for t_ in e)
+                     and dit_cond_dict is not None and "cam_film" in dit_cond_dict
+                     and getattr(self, "_norm3_folded", False))
+            if _glue:
+                # LINGBOT_GLUE: kernels/glue.py for the residual / modulation / LayerNorm steps
+                from kernels import glue as _gl
+                _ev = [t_.reshape(1, _C).float() for t_ in e]
+                h = _gl.ln_mod(xs[0], (1.0 + _ev[1]).contiguous(), _ev[0].contiguous()).unsqueeze(0)
+            else:
+                h = self.norm1(xs).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
             hf = tp.all_gather_tokens(h.to(torch.bfloat16), "tp")
             y = self.self_attn(
                 hf, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
@@ -2391,25 +2648,41 @@ class CausalWanAttentionBlock(nn.Module):
                 kv_roll_dst=kv_roll_dst, kv_roll_src=kv_roll_src, kv_roll_len=kv_roll_len,
                 kv_current_end=kv_current_end, kv_chunks=kv_chunks,
                 grid_ints=grid_ints, _sp_scatter=True, fused=fused, kv_write=kv_write)
-            with torch.amp.autocast('neuron', dtype=torch.float32):
-                xs = (xs + y * e[2].squeeze(2)).to(_rdt)
-            if dit_cond_dict is not None and "cam_film" in dit_cond_dict:
-                # [1, S, C]: this rank's tokens, full width (built once per chunk by _cam_films).
+            if _glue:
                 cam_scale, cam_shift = dit_cond_dict["cam_film"]
-                xs = (1.0 + cam_scale) * xs + cam_shift
-            hf = tp.all_gather_tokens(self.norm3(xs).to(torch.bfloat16), "tp")
-            xs = xs + self.cross_attn(hf, context, context_lens, crossattn_cache=crossattn_cache,
-                                      cross_attn_first_call=cross_attn_first_call,
-                                      _sp_scatter=True)
-            h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
-                self.ffn[0].weight.dtype)
-            if _FFN_MX:
+                xs2, h3 = _gl.res_film_ln(xs[0], y[0].contiguous(), _ev[2].contiguous(), cam_scale[0].contiguous(),
+                                          cam_shift[0].contiguous())
+                xs = xs2.unsqueeze(0)
+                hf = tp.all_gather_tokens(h3.unsqueeze(0), "tp")     # norm3's affine is folded into cross_attn.q
+                yc = self.cross_attn(hf, context, context_lens, crossattn_cache=crossattn_cache,
+                                     cross_attn_first_call=cross_attn_first_call, _sp_scatter=True)
+                xs3, h2 = _gl.res_ln_mod(xs[0], yc[0].contiguous(), (1.0 + _ev[4]).contiguous(), _ev[3].contiguous())
+                xs = xs3.unsqueeze(0)
+                h = h2.unsqueeze(0).to(self.ffn[0].weight.dtype)
+            else:
+                with torch.amp.autocast('neuron', dtype=torch.float32):
+                    xs = (xs + y * e[2].squeeze(2)).to(_rdt)
+                if dit_cond_dict is not None and "cam_film" in dit_cond_dict:
+                    # [1, S, C]: this rank's tokens, full width (built once per chunk by _cam_films).
+                    cam_scale, cam_shift = dit_cond_dict["cam_film"]
+                    xs = (1.0 + cam_scale) * xs + cam_shift
+                hf = tp.all_gather_tokens(self.norm3(xs).to(torch.bfloat16), "tp")
+                xs = xs + self.cross_attn(hf, context, context_lens, crossattn_cache=crossattn_cache,
+                                          cross_attn_first_call=cross_attn_first_call,
+                                          _sp_scatter=True)
+                h = (self.norm2(xs).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(
+                    self.ffn[0].weight.dtype)
+            if _FFN_MX and getattr(self.ffn[2], "_bias_full", None) is not None:
+                y = _ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")).to(h.dtype)   # LINGBOT_MX_RP_POST
+            elif _FFN_MX:
                 y = tp.reduce_scatter_tokens(_ffn_mx(self.ffn, tp.all_gather_tokens(h, "tp")), "tp").to(h.dtype)
             elif _FFN_FMAJ:
                 y = _ffn_feature_major(self.ffn, h)
             else:
                 hf = tp.all_gather_tokens(h, "tp")
                 y = _tp_row_parallel(self.ffn[2], self.ffn[1](self.ffn[0](hf)), scatter=True)
+            if _glue:
+                return _gl.res_gate(xs[0], y[0].contiguous(), _ev[5].contiguous()).unsqueeze(0)
             with torch.amp.autocast('neuron', dtype=torch.float32):
                 xs = (xs + y * e[5].squeeze(2)).to(_rdt)
             return xs

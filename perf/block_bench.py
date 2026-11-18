@@ -97,7 +97,8 @@ def main():
     Lp = -(-L_loc // pad) * pad if pad else L_loc
     g = torch.Generator().manual_seed(1234 + rank // tpd)  # same x on every TP rank of a CP cell
     x = torch.randn(1, L_loc, config["dim"], generator=g) * 0.5
-    x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev).float()
+    x = torch.nn.functional.pad(x, (0, 0, 0, Lp - L_loc)).to(dev)
+    x = x.to(torch.bfloat16) if mf._RESIDUAL_BF16 else x.float()     # LINGBOT_RESIDUAL_BF16: the stream's dtype
     e0 = (torch.randn(1, 1, 6, config["dim"], generator=g) * 0.1).to(dev).float()
     ctx = torch.randn(1, 512, config["dim"], generator=g) * 0.5
     ctx_real = int(os.environ.get("CTX_REAL", "0") or 0)
