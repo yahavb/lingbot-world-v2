@@ -41,6 +41,7 @@ state = {"prompt": ""}
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EXAMPLES = os.path.join(ROOT, "examples")
 SCENES = [
+    ("03", "Lake view, slow camera push-in"),   # the benchmark job's image and prompt
     ("05", "Dragon flight over the jungle"),
     ("02", "City alley walk"),
     ("00", "Fantasy jungle castle"),
