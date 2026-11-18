@@ -244,6 +244,17 @@ def _rms(x, gamma, scale):
     # (channels are the contraction axis), then x * rsqrt(max(sumsq, eps^2)), which is
     # F.normalize's x / max(||x||, eps) up to fp32 rounding. In the default form the profile put
     # ~174 ms of matmul-engine time and 64 ms of GpSimd cross-lane reduce on these reductions.
+    if _NORM_MODE == "mmb":
+        # LINGBOT_VAE_NORM=mmb (kiro_mx4): the channel sum of squares as a bf16 matmul (fp32 accumulation, bf16 result:
+        # its 2^-9 relative error moves rsqrt by 2^-10, below the bf16 rounding of the normalized output the next conv
+        # reads), the scaling in fp32. The 2-chip device profile had the fp32 form at 960 fp32 matmuls (two bf16
+        # passes each) and the rsqrt on GpSimd (385 us) per stage-3 ResidualBlock call.
+        xb = x.to(torch.bfloat16)
+        ones = torch.ones(x.shape[1], dtype=torch.bfloat16, device=x.device)
+        ss = torch.einsum("bcthw,c->bthw", xb * xb, ones) if x.dim() == 5 else \
+            torch.einsum("bchw,c->bhw", xb * xb, ones)
+        inv = torch.rsqrt(torch.clamp(ss.float(), min=1e-24)).unsqueeze(1)
+        return x.float() * inv * scale * gamma + 0.
     x = x.float()
     if _NORM_MODE == "mm":
         ones = torch.ones(x.shape[1], dtype=torch.float32, device=x.device)
@@ -324,11 +335,38 @@ def _up_core(x, w2, b2, sel):
     return y.reshape(b, t, y.shape[1], 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
 
 
+# LINGBOT_VAE_SUBPIX=1 (with LINGBOT_VAE_2D): nearest x2 upsample + 3x3 conv as four 2x2 convs on the low-resolution
+# haloed input, one per output phase (py, px), interleaved: output row 2i + py reads input rows i + py + {0, 1} with
+# the vertical taps folded (py = 0: w0, w1 + w2; py = 1: w0 + w1, w2), the same for columns. Exact in real arithmetic
+# (the folded taps are summed in fp32, then cast), 2.25x fewer FLOPs, and the 4x upsampled input is never built.
+_SUBPIX = os.environ.get("LINGBOT_VAE_SUBPIX", "0") == "1"
+# LINGBOT_VAE_HEAD_BF16=1 (with LINGBOT_VAE_BF16): the output conv (96 -> 3, causal 3x3x3) in bf16 like every other
+# conv (fp32 accumulation) instead of fp32. In the 2-chip LNC1 device profile that fp32 conv was the decode's single
+# most expensive call: 13440 matmuls with 3 stationary columns at the fp32 rate, 6.58 ms per latent frame (16% of 812).
+_HEAD_BF16 = os.environ.get("LINGBOT_VAE_HEAD_BF16", "0") == "1"
+def subpix_weights(w2):
+    """[C', C, 3, 3] -> [4, C', C, 2, 2]: the folded 2x2 kernel of each output phase (py, px), row-major."""
+    wf = w2.float()
+    def fold(k, ax, ph):              # 3 taps -> 2 along axis ax for phase ph
+        t0, t1, t2 = (k.narrow(ax, j, 1) for j in range(3))
+        return torch.cat([t0, t1 + t2] if ph == 0 else [t0 + t1, t2], ax)
+    return torch.stack([fold(fold(wf, 2, py), 3, px) for py in (0, 1) for px in (0, 1)]).to(w2.dtype)
+def _up_core_sp(x, weff, b2, sel):
+    """_up_core (LINGBOT_VAE_2D) in the sub-pixel form: weff from subpix_weights."""
+    b, c, t, h, w = x.shape
+    xh = _halo(x.to(weff.dtype), sel)                                     # [b, c, t, h + 2, w + 2]
+    xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h + 2, w + 2)
+    ys = [F.conv2d(xf[:, :, py:py + h + 1, px:px + w + 1], weff[2 * py + px], b2) for py in (0, 1) for px in (0, 1)]
+    co = ys[0].shape[1]
+    y = torch.stack(ys, 0).view(2, 2, b * t, co, h, w).permute(2, 3, 4, 0, 5, 1).reshape(b * t, co, 2 * h, 2 * w)
+    return y.reshape(b, t, co, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
 def _up3d_unit(x, cache_t, wt, bt, w2, b2, sel):
     b, c, t, h, w = x.shape
     xc = torch.cat([cache_t, x.to(wt.dtype)], 2)
     y = F.conv3d(xc, wt, bt).reshape(b, 2, c, t, h, w)
     y = torch.stack((y[:, 0], y[:, 1]), 3).reshape(b, c, t * 2, h, w)
+    if _SUBPIX and w2.dim() == 5:      # w2 is the folded [4, C', C, 2, 2] (FusedWidthDecoder._wb_up)
+        return _up_core_sp(y, w2, b2, sel), xc[:, :, -2:]
     return _up_core(y, w2, b2, sel), xc[:, :, -2:]
 
 
@@ -342,6 +380,7 @@ def _compile(fn):
 
 _CONV, _RES, _ATTN = _compile(_conv_unit), _compile(_res_unit), _compile(_attn_unit)
 _UP3D, _UP2D, _HEAD = _compile(_up3d_unit), _compile(_up_core), _compile(_head_unit)
+_UP2D_SP = _compile(_up_core_sp)
 
 
 class FusedWidthDecoder:
@@ -384,6 +423,15 @@ class FusedWidthDecoder:
             self._wcache[k] = (w, None if m.bias is None else m.bias.detach().to(dt))
         return self._wcache[k]
 
+    def _wb_up(self, m):
+        """The upsample's 3x3 conv: (weight, bias), or with LINGBOT_VAE_SUBPIX the folded [4, C', C, 2, 2] weight."""
+        w, b = self._wb(m)
+        if not (_SUBPIX and _TWO_D and not _SWAP):
+            return w, b
+        k = (id(m), "subpix")
+        if k not in self._wcache:
+            self._wcache[k] = (subpix_weights(w), b)
+        return self._wcache[k]
     def _zeros(self, x, c, halo=True, fp32=False):
         shape = [x.shape[0], c, 2, x.shape[3], x.shape[4]]
         if halo:
@@ -422,21 +470,23 @@ class FusedWidthDecoder:
             elif kind == "up3d":
                 ct = cache(x.shape[1], halo=False)
                 conv2d = m.resample[1]
+                _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
                 if first:
                     # 'Rep': no time conv on the first frame; the second frame's time conv then
                     # zero-pads, which is what the all-zero cache does.
-                    x = _UP2D(x, *self._wb(conv2d), sel)
+                    x = _up2(x, *self._wb_up(conv2d), sel)
                 else:
-                    x, ct = _UP3D(x, ct, *self._wb(m.time_conv), *self._wb(conv2d), sel)
+                    x, ct = _UP3D(x, ct, *self._wb(m.time_conv), *self._wb_up(conv2d), sel)
                 new.append(ct)
             elif kind == "up2d":
                 conv2d = m.resample[1]
-                x = _UP2D(x, *self._wb(conv2d), sel)
+                _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
+                x = _up2(x, *self._wb_up(conv2d), sel)
             else:  # head
                 norm, conv = m[0], m[2]
                 # fp32 output conv (96 -> 3, cheap) keeps the pixel values at full precision.
-                x, c = _HEAD(x, cache(x.shape[1], fp32=True), norm.gamma, norm.scale,
-                             *self._wb(conv, keep_fp32=True), sel)
+                x, c = _HEAD(x, cache(x.shape[1], fp32=not _HEAD_BF16), norm.gamma, norm.scale,
+                             *self._wb(conv, keep_fp32=not _HEAD_BF16), sel)
                 new.append(c)
         return x, new
 
