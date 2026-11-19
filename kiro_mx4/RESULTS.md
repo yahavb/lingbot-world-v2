@@ -75,7 +75,7 @@ the table above); after: 24.62 fps (+43%).
 # 2 chips (TP4 x CP2, LNC2, decode at LNC1 on 16 ranks): 16.16 fps, gate PASS (t28)
 Same video and fps definition; GEN from one process's last warm pass, gate = the MX gate above (G1 floor 20.05 dB).
 All rows from t5 on ran on the same 2-device pod (kiro-ishaybee-dev2); the other two 2-device pods on the node measure the same GEN flags ~25 ms and ~90 ms slower.
-Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t28 set).
+Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t29b set).
 | Run | Change | GEN (ms) | VAE (ms) | fps | Gate |
 |---|---|---|---|---|---|
 | s0_base | `flags_2chip.txt` | 6976.3 | 889 | 10.30 | FAIL (G1 19.99) |
@@ -103,6 +103,7 @@ Flags: `kiro_mx4/flags_2chip.txt` + `kiro_mx4/flags_2chip_best.txt` (the t28 set
 | t27b | t27 on the second 2-device pod (GEN ~25 ms slower there) | 4552.8 | 508 | 16.01 | PASS (same frames) |
 | **t28** | **`VAE_T=3` (3 latent frames per decode step; 0 of 48 repeat decodes with any frame below 50 dB)** | **4515.8** | **496** | **16.16** | **PASS** (G1 20.48, G2 16.10, c0s0 0.0396) |
 | t28b | t28 on the second 2-device pod | 4558.5 | 495 | 16.03 | PASS |
+| t29b | t28 + `VAE_HEAD_NKILIB=1` (the VAE output conv as nkilib's conv3d), second pod (vs t28b) | 4547.8 | 487 | 16.09 | PASS |
 Refuted on the way (ledger): DVE exp offload (any share), paired exps, GpSimd adds, fused QKV (accuracy), TSPLIT,
 token-major attention output, glue kernels, bf16 residual (accuracy), FiLM bf16 all-reduce (accuracy), collective
 algorithm / DMA knobs, DMA priority for the attention loads, TP-free FFN (M=544 matmuls slower than the collectives
