@@ -49,6 +49,16 @@ def run_server(jobs, state):
     app = FastAPI(title="LingBot-World v2 VAE decode")
 
     @app.post("/decode")
+    @app.post("/link")
+    def link(gen: int, dit_rank: int):
+        """A DiT starts a session here: answer this process's transport rank, then the decode loop
+        builds the RDMA link (wan/rdma_link.py) while the DiT builds its end."""
+        if not state["ready"] or state.get("rank") is None:
+            raise HTTPException(status_code=503, detail="warming up")
+        jobs.put(("__link__", gen, dit_rank))
+        return {"vae_rank": state["rank"]}
+
+    @app.post("/decode")
     async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0):
         """The decode loop puts lists of JPEG futures, one per step, then None or an exception."""
         if not state["ready"]:
@@ -188,15 +198,17 @@ def serve_loop(decode, args, rank):
     # LINGBOT_VAE_RDMA=1: the DiT's rank 0 sends each chunk's latents to this server's rank 0 over EFA
     # (wan/rdma_link.py; this side hosts the rendezvous store); rank 0 then broadcasts them on the device.
     use_rdma = os.environ.get("LINGBOT_VAE_RDMA", "0") == "1"
-    link, zbuf = None, None
+    link, zbuf, store, R = None, None, None, None
+    jobs = queue.Queue()
+    state = {"ready": False}
     if use_rdma:
         dev = torch.device("neuron", torch.neuron.current_device())
         zbuf = torch.empty(16, args.chunk_size, args.lat_h, args.lat_w, dtype=torch.float32, device=dev)
         if rank == 0:
-            from wan.rdma_link import RdmaLink
-            link = RdmaLink("vae", dit_world=int(os.environ.get("DIT_WORLD", "8")))
-    jobs = queue.Queue()
-    state = {"ready": False}
+            import random
+            from wan import rdma_link as R
+            store = R.host_store()                            # one store; a link per DiT session
+            state["rank"] = random.randrange(R.GLOBAL)        # this process's transport rank, for its life
     if rank == 0:
         threading.Thread(target=run_server, args=(jobs, state), daemon=True).start()
     state["ready"] = True
@@ -208,6 +220,16 @@ def serve_loop(decode, args, rank):
                 job = jobs.get(timeout=IDLE_S)
             except queue.Empty:
                 pass
+        if job is not None and job[0] == "__link__":
+            # rank 0 only: a new session's link (the other ranks never see it)
+            if link is not None:
+                link.close()
+            try:
+                link = R.RdmaLink("vae", store, job[1], job[2], state["rank"])
+            except Exception:
+                logging.exception("rdma link failed")
+                link = None
+            job = None
         msg = [None if job is None else {"z": job[0], "first": job[1], "rdma": job[0] is None}]
         dist.broadcast_object_list(msg, src=0)
         if msg[0] is None:
@@ -216,6 +238,8 @@ def serve_loop(decode, args, rank):
             t0 = time.perf_counter()
             if msg[0]["rdma"]:
                 if rank == 0:
+                    if link is None:
+                        raise RuntimeError("no RDMA link (the DiT must POST /link first)")
                     link.recv(zbuf).wait()
                 dist.broadcast(zbuf, src=0)
                 z = zbuf

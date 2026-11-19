@@ -1,7 +1,9 @@
 # lbw-dit: DiT + T5 (serve.py) on 2 trn3 devices with their paired EFAs (m-lnc2-efa, 8 ranks, TP4 x CP2, LNC2),
 # the 2-chip t22 flags. The VAE runs in lbw-vae (lbw-vae-deploy.yaml): rank 0 sends each chunk's latents to it
 # device to device over EFA (LINGBOT_VAE_RDMA=1, wan/rdma_link.py; rendezvous on lbw-vae:29600), the HTTP request
-# (VAE_URL) carries the chunk's metadata and brings the frames back. 1:1 with lbw-vae. Service: lbw-svc.yaml.
+# carries the chunk's metadata and brings the frames back. The VAE is picked per SESSION from the Ready pods
+# labelled VAE_SELECTOR (wan/vae_pool.py, production-stack's pod-watch discovery), with failover to another VAE
+# if one fails mid-session. RBAC: lbw-dit-rbac.yaml. Service: lbw-svc.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,6 +20,7 @@ spec:
       labels:
         app: lbw-dit
     spec:
+      serviceAccountName: lbw-dit   # watches the lbw-vae pods (VAE_SELECTOR) to pick a VAE per session
       nodeSelector:
         node-type: trn3-dev1
         kubernetes.io/hostname: ip-192-168-192-137.us-east-2.compute.internal
@@ -55,7 +58,7 @@ spec:
               echo "neff cache on node (v$CACHE_VERSION): $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
               export HF_HOME=/tmp/hf-cache
 
-              pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
+              pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn kubernetes
               python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
 
               # checkpoint: download + convert once per node (flock; .complete marks a finished entry)
@@ -194,8 +197,8 @@ spec:
               value: "1"
             - name: VAE_URL
               value: "http://lbw-vae.default.svc.cluster.local:8000"
-            - name: RDMA_STORE
-              value: "lbw-vae.default.svc.cluster.local:29600"
+            - name: VAE_SELECTOR
+              value: "app=lbw-vae"
             - name: BRANCH
               value: "serve-2chip"
             - name: SEG_CHUNKS

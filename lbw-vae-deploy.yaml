@@ -1,12 +1,13 @@
 # lbw-vae: the VAE alone (vae_serve.py) for lbw-dit, 1:1. 1 trn3 device + its paired EFA (s-lnc2-efa), LNC2, 4 ranks,
 # fused 2-D decoder tiled 2 x 2. Receives each chunk's latents from lbw-dit rank 0 over EFA RDMA (LINGBOT_VAE_RDMA=1;
-# this pod hosts the rendezvous store on :29600) and streams the frames back on the HTTP response. Service: lbw-svc.yaml.
+# this pod hosts the rendezvous store on :29600; a DiT links per session via POST /link) and streams the frames
+# back on the HTTP response. replicas: N VAEs for lbw-dit to choose from and fail over between. Service: lbw-svc.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: lbw-vae
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
     type: Recreate
   selector:
@@ -96,9 +97,6 @@ spec:
               value: "1"
             - name: DIT_WORLD
               value: "8"
-            - name: RDMA_STORE
-              # this pod hosts the DiT<->VAE rendezvous store
-              value: "0.0.0.0:29600"
             - name: BRANCH
               value: "serve-2chip"
             - name: CACHE_VERSION

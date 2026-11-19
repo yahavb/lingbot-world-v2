@@ -235,8 +235,8 @@ class RemoteDecoder:
         self.error = None
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, first, x0, emit):
-        self.q.put((first, x0, emit))
+    def submit(self, first, x0, emit, url=None):
+        self.q.put((first, x0, emit, url or self.url))
 
     def drain(self):
         """Block until every submitted chunk is decoded; return and clear the first error."""
@@ -246,7 +246,7 @@ class RemoteDecoder:
 
     def _run(self):
         while True:
-            first, x0, emit = self.q.get()
+            first, x0, emit, url = self.q.get()
             try:
                 if self.error is None:
                     buf = io.BytesIO()
@@ -254,7 +254,7 @@ class RemoteDecoder:
                         torch.save(x0, buf)
                     # stream=1: the VAE server sends each decode step's frames (NDJSON) as
                     # soon as they exist, not the whole chunk at the end.
-                    with self.session.post(f"{self.url}/decode", params={"first": int(first), "stream": 1, "rdma": int(x0 is None)},
+                    with self.session.post(f"{url}/decode", params={"first": int(first), "stream": 1, "rdma": int(x0 is None)},
                                            data=buf.getvalue(), timeout=600, stream=True) as r:
                         r.raise_for_status()
                         # Big reads: iter_lines' default 512 B pieces keep this thread busy in
@@ -345,6 +345,8 @@ def run_server(sched):
     def session(req: SessionRequest, request: Request):
         if not sched.ready:
             raise HTTPException(status_code=503, detail="warming up")
+        if rdma is not None and not rdma.available():
+            raise HTTPException(status_code=503, detail="VAE_SERVICE_UNAVAILABLE: no lbw-vae pod is ready")
         if req.scene and not (req.scene.isdigit() and os.path.isfile(f"examples/{req.scene}/poses.npy")):
             raise HTTPException(status_code=400, detail=f"unknown scene {req.scene!r}")
         job = Job(req.prompt, req.seed, req.scene or None, req.live)
@@ -481,8 +483,9 @@ def main():
     # the HTTP request carries only the chunk's metadata and brings the frames back.
     rdma = None
     if remote is not None and os.environ.get("LINGBOT_VAE_RDMA", "0") == "1":
-        from wan.rdma_link import RdmaLink
-        rdma = RdmaLink("dit", dit_world=world)
+        # the VAE is chosen per session from the Ready lbw-vae pods, with failover (wan/vae_pool.py)
+        from wan.vae_pool import VaePool, VaeUnavailable
+        rdma = VaePool()
 
     # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
     # the same path vae_serve.py serve_fused streams with (2-D tiles with LINGBOT_VAE_2D=1). The plain
@@ -560,8 +563,10 @@ def main():
             if VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None and rdma is not None:
-                remote.submit(chunk_id == 0, None, emit)        # the VAE posts its receive on this request
-                rdma.send(x0_dev.float().contiguous()).wait()
+                try:
+                    rdma.send(remote, chunk_id == 0, x0_dev.float().contiguous(), emit)
+                except VaeUnavailable as e:
+                    logging.warning(f"chunk {chunk_id}: no VAE, frames dropped ({e})")
             elif remote is not None:
                 remote.submit(chunk_id == 0, x0, emit)
 

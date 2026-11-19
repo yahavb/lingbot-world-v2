@@ -1,0 +1,26 @@
+# lbw-dit watches the lbw-vae pods to pick a VAE per session (wan/vae_pool.py): read-only access to pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lbw-dit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lbw-dit-pod-reader
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lbw-dit-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: lbw-dit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lbw-dit-pod-reader
