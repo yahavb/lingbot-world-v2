@@ -10,7 +10,7 @@ One link per (DiT, VAE) pairing, so a DiT can move to another VAE mid-stream. Ea
 a generation number `gen`: its rendezvous keys live under a PrefixStore of their own, and
 both ends take fresh transport ranks (torch-neuronx caches EFA endpoints by transport rank
 for the life of a process, which is why torchft gives a replacement pod a new transport
-slot): DiT = 2 * gen, VAE = 2 * gen + 1, in a fixed domain of GLOBAL ranks.
+slot): each process has one transport rank for its life, a restarted pod a new one.
 
 Env: FI_PROVIDER=efa, FI_EFA_USE_DEVICE_RDMA=1, FI_EFA_FORK_SAFE=1, CCOM_SOCKET_IFNAME=eth0.
 """
@@ -21,8 +21,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-# Transport ranks: DiT = 2 * gen, VAE = 2 * gen + 1, in one fixed domain of GLOBAL ranks for the life of
-# the process (the native backend sizes its endpoint tables once; a growing world size broke the 2nd link).
+# Every process has ONE transport rank for its life, in a fixed domain of GLOBAL ranks (the native backend
+# caches EFA endpoints by transport rank per process; a new rank in an old process never connected).
 GLOBAL = int(os.environ.get("RDMA_GLOBAL_RANKS", "512"))
 STORE_PORT = int(os.environ.get("RDMA_STORE_PORT", "29600"))
 
@@ -43,7 +43,7 @@ def client_store(host, timeout_s=60):
 class RdmaLink:
     """role "dit" (group rank 0) or "vae" (group rank 1), on `store` (a TCPStore)."""
 
-    def __init__(self, role, store, gen, timeout_s=None):
+    def __init__(self, role, store, gen, dit_rank, vae_rank, timeout_s=None):
         from torch._C._distributed_c10d import Backend as CBackend
         from torch_neuronx.distributed.cpp_backend import create_neuron_cpp_backend
 
@@ -54,8 +54,10 @@ class RdmaLink:
         timeout = timedelta(seconds=timeout_s or int(os.environ.get("RDMA_OP_TIMEOUT_S", "60")))
         self.timeout = timeout
         pstore = dist.PrefixStore(f"lbw-rdma/{self.gen}", store)
-        assert 0 <= self.gen < GLOBAL // 2, f"link gen {self.gen} outside the transport domain {GLOBAL}"
-        global_ranks = [2 * self.gen, 2 * self.gen + 1]
+        # transport ranks are per PROCESS, fixed for its life (torch-neuronx caches EFA endpoints by them):
+        # a new link between the same two processes reuses them; a restarted pod brings a new one.
+        global_ranks = [int(dit_rank), int(vae_rank)]
+        assert all(0 <= r < GLOBAL for r in global_ranks) and global_ranks[0] != global_ranks[1], global_ranks
         options = CBackend.Options(backend="neuron", timeout=timeout)
         options.global_ranks_in_group = global_ranks
         backend = create_neuron_cpp_backend(pstore, options, self.rank, 2, GLOBAL)

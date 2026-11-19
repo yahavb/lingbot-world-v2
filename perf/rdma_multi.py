@@ -24,7 +24,7 @@ dev = torch.device("neuron:0")
 store = R.host_store() if role == "vae" else R.client_store(os.environ["VAE_HOST"], timeout_s=600)
 shape = (16, 3, 60, 96)
 for gen in (3, 4, 5):
-    link = R.RdmaLink(role, store, gen, timeout_s=180)
+    link = R.RdmaLink(role, store, gen, 0, 1, timeout_s=180)
     t_up = time.time()
     good = 0
     for i in range(5):
@@ -36,7 +36,7 @@ for gen in (3, 4, 5):
     link.close()
     print(f"MULTI gen {gen}: 5 transfers in {time.time() - t_up:.1f} s" + (f", correct {good}/5" if role == "vae" else " sent"), flush=True)
 # 2. timeout: the VAE waits for a tensor the DiT never sends
-link = R.RdmaLink(role, store, 6, timeout_s=10)
+link = R.RdmaLink(role, store, 6, 0, 1, timeout_s=10)
 if role == "vae":
     t = torch.empty(shape, device=dev); t0 = time.time()
     try:
