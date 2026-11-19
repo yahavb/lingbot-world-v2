@@ -224,7 +224,10 @@ def serve_loop(decode, args, rank):
             if link is not None:
                 link.close()
             try:
-                link = R.RdmaLink("vae", store, job[1], job[2], state["rank"])
+                # short receive timeout: a DiT that gave up on this link relinks within seconds, and the
+                # decode loop must be free to take its new /link (the DiT sends right after its request)
+                link = R.RdmaLink("vae", store, job[1], job[2], state["rank"],
+                                  timeout_s=float(os.environ.get("VAE_RECV_TIMEOUT_S", "5")))
             except Exception:
                 logging.exception("rdma link failed")
                 link = None

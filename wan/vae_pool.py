@@ -18,6 +18,7 @@ import time
 import requests
 
 BAD_S = 60
+DRAIN_S = float(os.environ.get("VAE_DRAIN_S", "6"))
 POLL_S = float(os.environ.get("VAE_POLL_S", "5"))
 log = logging.getLogger("vae_pool")
 
@@ -41,6 +42,7 @@ class VaePool:
         self.current = None            # (name, ip, link)
         self.fresh = False             # the current VAE has not decoded a chunk yet
         self.gone = False              # the current VAE disappeared from the pod list
+        self._prefer = None            # relink to this VAE first (after a stale-completion failure)
         self.http = requests.Session()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -84,14 +86,15 @@ class VaePool:
     def url(self):
         return None if self.current is None else f"http://{self.current[1]}:{self.port}"
 
-    def acquire(self):
-        """Keep the current VAE if it is still listed; else link to the next available one."""
+    def acquire(self, prefer=None):
+        """Keep the current VAE if it is still listed; else link to an available one (`prefer` first)."""
         if self.current is not None and not self.gone and self.current[0] in dict(self.available()):
             return True
         self.gone = False
         self.release()
         cands = self.available()
         random.shuffle(cands)
+        cands.sort(key=lambda c: c[0] != prefer)
         for name, ip in cands:
             try:
                 gen = next(self.gen) % (1 << 30)
@@ -126,38 +129,38 @@ class VaePool:
 
     def send(self, remote, first, x_dev, emit):
         """Decode one chunk on the session's VAE: HTTP request (metadata, frames back) + RDMA send of
-        the latents. A failure moves to another VAE (which starts its decode cache fresh) and
-        retries the chunk once."""
-        for attempt in (0, 1):
+        the latents. On a failure: if the VAE is still listed, the failure may be a stale completion from
+        a transfer to a VAE that just died (its error lands on the next transfer of the process): retire the
+        link, wait DRAIN_S for that to clear, and relink to the same VAE; otherwise (or if that fails too)
+        set the VAE aside and move to another one, which starts its decode cache fresh."""
+        import torch
+        relinked = False
+        for attempt in range(3):
             if remote.error is not None:                     # the last HTTP request failed
                 remote.error = None
                 self.fail()
-            if not self.acquire():
+            if not self.acquire(prefer=self._prefer):
                 raise VaeUnavailable("no VAE available")
+            self._prefer = None
+            name = self.current[0]
             try:
                 remote.submit(first or self.fresh, None, emit, url=self.url())
-                import torch
-                link = self.current[2]
-                try:
-                    link.send(x_dev).wait()
-                    # Neuron reports a failed transfer asynchronously, at the next sync point; sync here so
-                    # a dead VAE fails this try (and fails over) instead of surfacing later inside the DiT
-                    torch.neuron.synchronize()
-                except Exception as e:
-                    # Aborting the previous VAE's link cancels its pending transfer, and that cancellation
-                    # ("Operation canceled" / CQ error) can land on the first send of the NEW link. The new
-                    # VAE is fine and its receive is still posted: send again under the same tag.
-                    if not self.fresh:
-                        raise
-                    log.warning(f"first send to {self.current[0]} failed ({type(e).__name__}: {e}); "
-                                f"resending on the same link")
-                    link.send(x_dev, same_tag=True).wait()
-                    torch.neuron.synchronize()
+                self.current[2].send(x_dev).wait()
+                # Neuron reports a failed transfer asynchronously, at the next sync point: sync here so the
+                # failure is caught by this try (and handled) instead of surfacing later inside the DiT
+                torch.neuron.synchronize()
                 self.fresh = False
                 return
             except VaeUnavailable:
                 raise
             except Exception as e:
-                log.warning(f"vae send failed: {type(e).__name__}: {e}")
-                self.fail()
+                log.warning(f"vae {name}: send failed: {type(e).__name__}: {e}")
+                if not relinked and name in dict(self.available()):
+                    relinked = True
+                    self.release()
+                    log.warning(f"vae {name}: relinking after {DRAIN_S} s (a stale completion from a dead peer)")
+                    time.sleep(DRAIN_S)
+                    self._prefer = name
+                else:
+                    self.fail(name)
         raise VaeUnavailable("VAE failover did not succeed")
