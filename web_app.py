@@ -67,7 +67,14 @@ def scene_prompt(sid):
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(ROOT, "web", "index.html"))
+    # HUD_SETUP (env) replaces the page's setup line, so the HUD names the backend this pod points at
+    setup = os.environ.get("HUD_SETUP")
+    if not setup:
+        return FileResponse(os.path.join(ROOT, "web", "index.html"))
+    import json as _json, re as _re
+    from fastapi.responses import HTMLResponse
+    html = open(os.path.join(ROOT, "web", "index.html")).read()
+    return HTMLResponse(_re.sub(r'const SETUP = "[^"]*";', lambda m: f"const SETUP = {_json.dumps(setup)};", html, count=1))
 
 
 @app.get("/api/scenes")
