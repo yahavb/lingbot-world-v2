@@ -22,6 +22,14 @@ spec:
     spec:
       nodeSelector:
         node-type: trn3-dev1
+      affinity:
+        nodeAffinity:
+          # prefer the node that already holds the checkpoint and the compile cache
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: [ip-192-168-192-137.us-east-2.compute.internal]}
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: l-lnc2
@@ -98,9 +106,10 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "90"
-              memory: 900Gi
-              ephemeral-storage: 600Gi
+              # real use ~312 GiB; the trn3 nodes are shared, so request what it needs, not the whole node
+              cpu: "40"
+              memory: 340Gi
+              ephemeral-storage: 300Gi
             limits:
               cpu: "95"
               memory: 950Gi
