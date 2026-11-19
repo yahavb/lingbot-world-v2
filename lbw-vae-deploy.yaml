@@ -1,7 +1,6 @@
-# lbw-vae: the VAE alone (vae_serve.py), so lbw-v2 (DiT + T5) never waits for decodes. lbw-v2 sends each latent chunk
-# to it (VAE_URL, serve.py RemoteDecoder) and streams back the frames of every decode step as they land.
-# 1 trn3 device at LNC1 (s-lnc1, 8 ranks), fused 2-D decoder tiled 2 x 4 (LINGBOT_VAE_PER_DEVICE=2), the VAE flags of
-# lbw-deploy.yaml. Service: lbw-svc.yaml. Compile caches on the node under cache/v<CACHE_VERSION>.
+# lbw-vae: the VAE alone (vae_serve.py) for lbw-dit, 1:1. 1 trn3 device + its paired EFA (s-lnc2-efa), LNC2, 4 ranks,
+# fused 2-D decoder tiled 2 x 2. Receives each chunk's latents from lbw-dit rank 0 over EFA RDMA (LINGBOT_VAE_RDMA=1;
+# this pod hosts the rendezvous store on :29600) and streams the frames back on the HTTP response. Service: lbw-svc.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,10 +19,10 @@ spec:
     spec:
       nodeSelector:
         node-type: trn3-dev1
-        kubernetes.io/hostname: ip-192-168-192-137.us-east-2.compute.internal
+        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
       resourceClaims:
         - name: neuroncores
-          resourceClaimTemplateName: s-lnc1
+          resourceClaimTemplateName: s-lnc2-efa
       containers:
         - name: vae
           image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
@@ -38,7 +37,7 @@ spec:
               install -m 755 tools/neuron-top/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" \
                 && echo "neuron-top: enhanced" || echo "neuron-top: stock"
               NODE=/node-cache; CKPT=$NODE/lingbot-world-v2-14b-causal-fast
-              [ -f "$CKPT/Wan2.1_VAE.pth" ] || { echo "no VAE checkpoint on this node"; exit 1; }
+              [ -f "$CKPT/Wan2.1_VAE.pth" ] || { pip install -q huggingface_hub; hf download robbyant/lingbot-world-v2-14b-causal-fast Wan2.1_VAE.pth --local-dir "$CKPT"; }
               C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}
               export NEURON_COMPILE_CACHE_URL=$C/neuron-compile-cache TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
               export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache HF_HOME=/tmp/hf-cache
@@ -50,6 +49,7 @@ spec:
                 | tee -a /logs/serve.log | grep --line-buffered -avE "AliasingInfo|Mutated inputs|Detected collective"
           ports:
             - containerPort: 8000
+            - containerPort: 29600
           startupProbe:
             httpGet: {path: /readiness, port: 8000}
             periodSeconds: 30
@@ -80,6 +80,20 @@ spec:
             - name: logs
               mountPath: /logs
           env:
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            - name: FI_EFA_ENABLE_SHM_TRANSFER
+              value: "0"
+            - name: CCOM_SOCKET_IFNAME
+              value: "eth0"
+            - name: LINGBOT_VAE_RDMA
+              value: "1"
+            - name: DIT_WORLD
+              value: "8"
             - name: BRANCH
               value: "serve-2chip"
             - name: CACHE_VERSION
@@ -87,9 +101,9 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC
-              value: "8"
+              value: "4"
             - name: LNC
-              value: "1"
+              value: "2"
             - name: LAT_H
               value: "60"
             - name: LAT_W

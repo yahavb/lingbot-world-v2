@@ -1,0 +1,30 @@
+# 1 Neuron device at LNC2 + its paired EFA: devicegroup1_id of a Neuron device is its paired EFA's PCI address
+# (and an EFA's is its own), so matching it gives the EFA the Neuron runtime's RDMA manager looks for.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: s-lnc2-efa
+  namespace: default
+spec:
+  metadata: {}
+  spec:
+    devices:
+      config:
+      - opaque:
+          driver: neuron.aws.com
+          parameters: {apiVersion: neuron.aws.com/v1, kind: NeuronConfig, logicalNeuronCore: 2}
+        requests: [neurons]
+      constraints:
+      - matchAttribute: resource.aws.com/devicegroup1_id
+        requests: [neurons, efas]
+      requests:
+      - name: neurons
+        exactly:
+          allocationMode: ExactCount
+          count: 1
+          deviceClassName: neuron.aws.com
+          selectors:
+          - cel:
+              expression: device.attributes['neuron.aws.com'].instanceType in ['trn2.48xlarge','trn3-dev1.48xlarge']
+      - name: efas
+        exactly: {allocationMode: ExactCount, count: 1, deviceClassName: efa.networking.k8s.aws}
