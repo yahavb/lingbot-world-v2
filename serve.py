@@ -64,6 +64,10 @@ SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
 VAE_POOL = {}       # rank 0, LINGBOT_VAE_RDMA=1: {"pool": wan.vae_pool.VaePool} (the routes read it)
+# LINGBOT_REANCHOR_FRAMES=N (live sessions): every ~N frames, end the generation and start a new one from the
+# last frame on screen, same prompt and camera. A long rollout drifts (positions keep growing, the memory
+# window loses the start image); a fresh run from the current frame continues the scene with a clean state.
+REANCHOR_CHUNKS = -(-int(os.environ.get("LINGBOT_REANCHOR_FRAMES", "0")) // 12)
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
 BACKLOG = int(os.environ.get("LIVE_BACKLOG_FRAMES", "480"))  # unread frames that end a live session
@@ -119,6 +123,7 @@ class Job:
 
     def emit(self, frame, chunk=None, action=None, t=None):
         self.count += 1
+        self.last_frame = frame          # base64 JPEG: the start image of the next re-anchored run
         self.frames.put({"frame_index": self.count - 1, "frame": frame,
                          "chunk": chunk, "action": action, "t": t})
         # A dead connection behind a proxy (kubectl port-forward) may never look
@@ -573,8 +578,8 @@ def main():
             times = {"ctl": ctl_times.pop(chunk_id, None), "start": starts.pop(chunk_id, None),
                      "x0": time.time()}
 
-            def emit(frame):
-                job_emit(frame, chunk_id, action, dict(times, dec=time.time()))
+            def emit(frame, _c=chunk_id + state.get("chunk_base", 0)):
+                job_emit(frame, _c, action, dict(times, dec=time.time()))
             if VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None and rdma is not None:
@@ -714,7 +719,35 @@ def main():
             return ("go", nxt.prompt, action)
 
         try:
-            run_session(m["prompt"], img, m["seed"], m["action_path"], control)
+            cur_img, state["chunk_base"] = img, 0
+            while True:
+                rean = {"hit": False}
+
+                def control_r(chunk_id):
+                    if live and REANCHOR_CHUNKS and chunk_id >= REANCHOR_CHUNKS and not sched.stop:
+                        rean["hit"] = True
+                        return ("stop", None, None)
+                    r = control(chunk_id)
+                    if r[0] == "go" and r[1]:
+                        m["prompt"] = r[1]          # a live prompt switch carries over to the next run
+                    return r
+                run_session(m["prompt"], cur_img, m["seed"], m["action_path"], control_r)
+                # re-anchor: every rank learns it, then starts a new run from rank 0's last frame
+                flag = [bool(rank == 0 and rean["hit"] and seg["open"] and not sched.stop)]
+                dist.broadcast_object_list(flag, src=0)
+                if not flag[0]:
+                    break
+                if rank == 0 and remote is not None:
+                    remote.drain()                  # the last chunk's frames have arrived
+                data = [(seg["job"].last_frame, m["prompt"]) if rank == 0 else None]
+                dist.broadcast_object_list(data, src=0)
+                path = f"/tmp/reanchor_{rank}.jpg"
+                with open(path, "wb") as f:
+                    f.write(base64.b64decode(data[0][0]))
+                cur_img, m["prompt"] = load_image(path), data[0][1]
+                state["chunk_base"] += REANCHOR_CHUNKS
+                if rank == 0:
+                    logging.info(f"re-anchor: new run from the last frame (chunk {state['chunk_base']})")
             if rank == 0 and seg["open"]:
                 close_segment()
         except Exception as e:

@@ -201,6 +201,9 @@ spec:
               value: "http://lbw-vae.default.svc.cluster.local:8000"
             - name: VAE_SELECTOR
               value: "app=lbw-vae"
+            - name: LINGBOT_REANCHOR_FRAMES
+              # live sessions restart from the last frame every ~800 frames (a long rollout drifts)
+              value: "800"
             - name: BRANCH
               value: "main"
             - name: SEG_CHUNKS
