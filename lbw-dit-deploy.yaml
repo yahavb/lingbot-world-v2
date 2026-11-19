@@ -99,9 +99,10 @@ spec:
             claims:
               - name: neuroncores
             requests:
-              cpu: "40"
-              memory: 300Gi
-              ephemeral-storage: 300Gi
+              # node 137 is fully requested on paper (real use is far lower)
+              cpu: "8"
+              memory: 20Gi
+              ephemeral-storage: 100Gi
             limits:
               cpu: "95"
               memory: 950Gi
