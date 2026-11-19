@@ -25,6 +25,7 @@ import torch.distributed as dist
 # caches EFA endpoints by transport rank per process; a new rank in an old process never connected).
 GLOBAL = int(os.environ.get("RDMA_GLOBAL_RANKS", "8192"))
 STORE_PORT = int(os.environ.get("RDMA_STORE_PORT", "29600"))
+RETIRED = []   # links that are no longer used, kept alive on purpose (see RdmaLink.close)
 # torchft lays transport ranks out as slot * stride + local rank (stride = the pod's world), so a rank's
 # residue is the process's local rank. Our link ends are always local rank 0, so a rank is a multiple of
 # SLOT (a multiple of both pods' worlds: DiT 8, VAE 4).
@@ -102,8 +103,8 @@ class RdmaLink:
         return self.pg.recv([t], self.peer, self.tag)
 
     def close(self):
-        """Abort this link's native group (torchft aborts a generation before it builds the next)."""
-        try:
-            self.pg.abort()
-        except Exception as e:  # a dead peer can make abort itself fail; the link is gone either way
-            logging.warning(f"rdma link gen {self.gen}: abort: {type(e).__name__}: {e}")
+        """Retire this link WITHOUT aborting it. Aborting a link whose peer had died broke every later
+        link of the process (the cancellation landed on them as a CQ error, then they timed out), so a
+        retired link is only parked in RETIRED, never torn down; its peer is gone or moved on."""
+        RETIRED.append(self)
+        logging.info(f"rdma link gen {self.gen}: retired")

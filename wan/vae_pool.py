@@ -40,6 +40,7 @@ class VaePool:
         self.rank = R.new_transport_rank(self.store)  # this process's transport rank, never reused
         self.current = None            # (name, ip, link)
         self.fresh = False             # the current VAE has not decoded a chunk yet
+        self.gone = False              # the current VAE disappeared from the pod list
         self.http = requests.Session()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -63,6 +64,8 @@ class VaePool:
                 with self.lock:
                     for n in set(self.endpoints) - set(now):
                         log.info(f"vae gone: {n}")
+                        if self.current is not None and self.current[0] == n:
+                            self.gone = True       # the session's VAE left: the next chunk relinks
                     for n, ip in now.items():
                         if self.endpoints.get(n) != ip:
                             log.info(f"vae ready: {n} {ip}")
@@ -83,8 +86,9 @@ class VaePool:
 
     def acquire(self):
         """Keep the current VAE if it is still listed; else link to the next available one."""
-        if self.current is not None and self.current[0] in dict(self.available()):
+        if self.current is not None and not self.gone and self.current[0] in dict(self.available()):
             return True
+        self.gone = False
         self.release()
         cands = self.available()
         random.shuffle(cands)
