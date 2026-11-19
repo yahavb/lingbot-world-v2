@@ -23,7 +23,7 @@ import torch.distributed as dist
 
 # Every process has ONE transport rank for its life, in a fixed domain of GLOBAL ranks (the native backend
 # caches EFA endpoints by transport rank per process; a new rank in an old process never connected).
-GLOBAL = int(os.environ.get("RDMA_GLOBAL_RANKS", "512"))
+GLOBAL = int(os.environ.get("RDMA_GLOBAL_RANKS", "8192"))
 STORE_PORT = int(os.environ.get("RDMA_STORE_PORT", "29600"))
 # torchft lays transport ranks out as slot * stride + local rank (stride = the pod's world), so a rank's
 # residue is the process's local rank. Our link ends are always local rank 0, so a rank is a multiple of
@@ -31,9 +31,13 @@ STORE_PORT = int(os.environ.get("RDMA_STORE_PORT", "29600"))
 SLOT = int(os.environ.get("RDMA_SLOT", "8"))
 
 
-def new_transport_rank(rng):
-    """A fresh transport rank for this process: a random slot, times SLOT (local rank 0)."""
-    return SLOT * rng.randrange(1, GLOBAL // SLOT)
+def new_transport_rank(store):
+    """A transport rank no process has had before: the next slot from a counter in the shared store,
+    times SLOT (local rank 0). A peer caches EFA endpoints by transport rank for its whole life, so a
+    rank handed to a second process (random slots collided) made the next link fail with a CQ error."""
+    slot = int(store.add("lbw-rdma/next-slot", 1))
+    assert slot * SLOT < GLOBAL, f"transport rank domain exhausted ({slot} slots); raise RDMA_GLOBAL_RANKS"
+    return SLOT * slot
 
 
 def shared_store(timeout_s=60):

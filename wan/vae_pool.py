@@ -35,9 +35,9 @@ class VaePool:
         self.endpoints = {}            # pod name -> pod IP, Ready and not terminating
         self.bad = {}                  # pod name -> time it failed
         self.lock = threading.Lock()
-        self.rank = R.new_transport_rank(random)   # this process's transport rank, for its life
         self.gen = itertools.count(random.randrange(1, 1 << 30))
         self.store = R.shared_store()  # the cluster's one rendezvous store, for this process's life
+        self.rank = R.new_transport_rank(self.store)  # this process's transport rank, never reused
         self.current = None            # (name, ip, link)
         self.fresh = False             # the current VAE has not decoded a chunk yet
         self.http = requests.Session()

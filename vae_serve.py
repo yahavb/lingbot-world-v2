@@ -207,7 +207,7 @@ def serve_loop(decode, args, rank):
             import random
             from wan import rdma_link as R
             store = R.shared_store()                          # the cluster's rendezvous store; a link per DiT session
-            state["rank"] = R.new_transport_rank(random)      # this process's transport rank, for its life
+            state["rank"] = R.new_transport_rank(store)       # this process's transport rank, never reused
     if rank == 0:
         threading.Thread(target=run_server, args=(jobs, state), daemon=True).start()
     state["ready"] = True
