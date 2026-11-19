@@ -12,8 +12,10 @@ import time
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from wan.rdma_link import RdmaLink  # noqa: E402
+import importlib.util as _u  # load wan/rdma_link.py alone (wan/__init__ pulls the whole model stack)
+_p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "wan", "rdma_link.py")
+_s = _u.spec_from_file_location("rdma_link", _p); _m = _u.module_from_spec(_s); _s.loader.exec_module(_m)
+RdmaLink = _m.RdmaLink
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 role = os.environ["ROLE"]
