@@ -132,11 +132,23 @@ class VaePool:
                 raise VaeUnavailable("no VAE available")
             try:
                 remote.submit(first or self.fresh, None, emit, url=self.url())
-                self.current[2].send(x_dev).wait()
-                # Neuron reports a failed transfer asynchronously, at the next sync point; sync here so a
-                # dead VAE fails this try (and fails over) instead of surfacing later inside the DiT
                 import torch
-                torch.neuron.synchronize()
+                link = self.current[2]
+                try:
+                    link.send(x_dev).wait()
+                    # Neuron reports a failed transfer asynchronously, at the next sync point; sync here so
+                    # a dead VAE fails this try (and fails over) instead of surfacing later inside the DiT
+                    torch.neuron.synchronize()
+                except Exception as e:
+                    # Aborting the previous VAE's link cancels its pending transfer, and that cancellation
+                    # ("Operation canceled" / CQ error) can land on the first send of the NEW link. The new
+                    # VAE is fine and its receive is still posted: send again under the same tag.
+                    if not self.fresh:
+                        raise
+                    log.warning(f"first send to {self.current[0]} failed ({type(e).__name__}: {e}); "
+                                f"resending on the same link")
+                    link.send(x_dev, same_tag=True).wait()
+                    torch.neuron.synchronize()
                 self.fresh = False
                 return
             except VaeUnavailable:

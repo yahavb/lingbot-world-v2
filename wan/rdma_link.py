@@ -89,9 +89,11 @@ class RdmaLink:
         self.tag = 0
         logging.info(f"rdma link up: {role}, gen {self.gen}, transport ranks {global_ranks}")
 
-    def send(self, t):
-        """Post a send of device tensor t to the peer; returns the Work (call .wait())."""
-        self.tag += 1
+    def send(self, t, same_tag=False):
+        """Post a send of device tensor t to the peer; returns the Work (call .wait()). same_tag=True
+        re-sends under the last tag (the peer's receive for it is still posted)."""
+        if not same_tag:
+            self.tag += 1
         return self.pg.send([t], self.peer, self.tag)
 
     def recv(self, t):

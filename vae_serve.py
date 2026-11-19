@@ -236,10 +236,29 @@ def serve_loop(decode, args, rank):
         try:
             t0 = time.perf_counter()
             if msg[0]["rdma"]:
+                # A failed receive (the DiT died or gave up) drops the link and fails only this chunk: every
+                # rank learns it from `ok` and skips the decode together, instead of rank 0 raising and taking
+                # the whole server down (the other ranks then failed in their next barrier).
+                ok = torch.ones(1, dtype=torch.int32, device=zbuf.device)
+                err = None
                 if rank == 0:
-                    if link is None:
-                        raise RuntimeError("no RDMA link (the DiT must POST /link first)")
-                    link.recv(zbuf).wait()
+                    try:
+                        if link is None:
+                            raise RuntimeError("no RDMA link (the DiT must POST /link first)")
+                        link.recv(zbuf).wait()
+                        torch.neuron.synchronize()
+                    except Exception as e:
+                        err = e
+                        ok.zero_()
+                        logging.warning(f"rdma recv failed, link dropped: {type(e).__name__}: {e}")
+                        if link is not None:
+                            link.close()
+                        link = None
+                dist.broadcast(ok, src=0)
+                if int(ok.item()) == 0:
+                    if rank == 0:
+                        job[2].put(RuntimeError(f"rdma recv failed: {err}"))
+                    continue
                 dist.broadcast(zbuf, src=0)
                 z = zbuf
             else:
