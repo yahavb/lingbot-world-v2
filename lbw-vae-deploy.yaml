@@ -94,6 +94,9 @@ spec:
               value: "1"
             - name: DIT_WORLD
               value: "8"
+            - name: RDMA_STORE
+              # this pod hosts the DiT<->VAE rendezvous store
+              value: "0.0.0.0:29600"
             - name: BRANCH
               value: "serve-2chip"
             - name: CACHE_VERSION
