@@ -132,6 +132,10 @@ class VaePool:
             try:
                 remote.submit(first or self.fresh, None, emit, url=self.url())
                 self.current[2].send(x_dev).wait()
+                # Neuron reports a failed transfer asynchronously, at the next sync point; sync here so a
+                # dead VAE fails this try (and fails over) instead of surfacing later inside the DiT
+                import torch
+                torch.neuron.synchronize()
                 self.fresh = False
                 return
             except VaeUnavailable:

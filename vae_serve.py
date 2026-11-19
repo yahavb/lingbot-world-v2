@@ -48,7 +48,6 @@ def run_server(jobs, state):
 
     app = FastAPI(title="LingBot-World v2 VAE decode")
 
-    @app.post("/decode")
     @app.post("/link")
     def link(gen: int, dit_rank: int):
         """A DiT starts a session here: answer this process's transport rank, then the decode loop
