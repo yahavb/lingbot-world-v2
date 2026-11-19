@@ -58,7 +58,6 @@
     <img id="frame" alt="Live generated video">
     <div id="hud" class="glass" aria-hidden="true"></div>
     <div id="muse" class="overlay" role="group" aria-label="Content check">
-      <button id="describe" class="glass hudbtn wide">What does Muse Glimmer see?</button>
       <p id="caption" class="glass" aria-live="polite"></p>
     </div>
     <div id="controls" class="overlay" role="group" aria-label="Camera controls">
@@ -250,7 +249,6 @@ let describing = false;
 async function describe() {
   if (describing) return;
   describing = true;
-  $("caption").textContent = "Muse Glimmer is looking...";
   try {
     const r = await fetch("api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const j = await r.json();
@@ -259,7 +257,10 @@ async function describe() {
     $("caption").textContent = `Muse Glimmer: ${e.message}`;
   } finally { describing = false; }
 }
-$("describe").addEventListener("click", describe);
+// Every DESCRIBE_S seconds while frames are streaming, Muse Glimmer describes what is on screen; the caption
+// floats on the video and stays until the next one (?describe=N sets the period, 0 turns it off).
+const DESCRIBE_S = Number(new URLSearchParams(location.search).get("describe") ?? 15);
+if (DESCRIBE_S > 0) setInterval(() => { if (abort && total > 0) describe(); }, DESCRIBE_S * 1000);
 loadScenes();
 requestAnimationFrame(tick);
 </script>
