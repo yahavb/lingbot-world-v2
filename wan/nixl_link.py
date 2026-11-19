@@ -99,10 +99,10 @@ class NixlDit:
         return (remote, slots)
 
     def disconnect(self, conn):
-        try:
-            self.agent.remove_remote_agent(conn[0])
-        except Exception as e:
-            log.warning(f"nixl: remove_remote_agent: {type(e).__name__}: {e}")
+        """Park the connection; do NOT remove_remote_agent: that cancels the dead VAE's pending write, and
+        the cancellation ("Operation canceled") landed on the next VAE's first write."""
+        self.parked = getattr(self, "parked", [])
+        self.parked.append(conn)
 
     def write(self, conn, x, seq, timeout_s=10):
         """Write chunk `seq` (device tensor x) into the VAE's slot seq % SLOTS; raises if it fails."""

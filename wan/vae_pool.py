@@ -200,7 +200,17 @@ class VaePool:
             name, seq = self.current[0], next(self.seq)
             try:
                 remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq)
-                self.nixl.write(self.current[2], x_dev, seq)
+                for retry in range(3):
+                    try:
+                        self.nixl.write(self.current[2], x_dev, seq)
+                        break
+                    except Exception as e:
+                        # a cancelled completion left by the dead VAE can fail this write; the new VAE is still
+                        # waiting for chunk `seq`, so writing it again is safe
+                        if retry == 2:
+                            raise
+                        log.warning(f"vae {name}: nixl write failed ({type(e).__name__}: {e}); retrying")
+                        time.sleep(0.2)
                 self.fresh = False
                 return
             except Exception as e:
