@@ -98,9 +98,6 @@ spec:
               value: "1"
             - name: DIT_WORLD
               value: "8"
-            - name: RDMA_STORE_HOST
-              # the one rendezvous store for every RDMA link (lbw-rdma-store-deploy.yaml)
-              value: "lbw-rdma-store.default.svc.cluster.local"
             - name: BRANCH
               value: "main"
             - name: CACHE_VERSION
