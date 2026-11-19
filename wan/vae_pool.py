@@ -1,7 +1,7 @@
 """lbw-dit rank 0: find a VAE at session time, link to it over RDMA, and fail over to another.
 
 Discovery follows production-stack's K8sPodIPServiceDiscovery (src/vllm_router/service_discovery.py):
-watch the pods that match a label selector and keep the ones whose containers are Ready and that
+list (every POLL_S) the pods that match a label selector and keep the ones whose containers are Ready and that
 are not terminating, by pod IP. A session takes one of them (round-robin); if its HTTP request or
 RDMA send fails, that VAE is set aside for BAD_S seconds and the next chunk goes to another one.
 With none available a session is refused with 503 VAE_SERVICE_UNAVAILABLE.
@@ -18,6 +18,7 @@ import time
 import requests
 
 BAD_S = 60
+POLL_S = float(os.environ.get("VAE_POLL_S", "5"))
 log = logging.getLogger("vae_pool")
 
 
@@ -44,29 +45,31 @@ class VaePool:
 
     # ---- discovery (production-stack: K8sPodIPServiceDiscovery._watch_engines) ----
     def _watch(self):
-        from kubernetes import client, config, watch
+        """Every POLL_S, list the pods matching the selector and keep the Ready, not-terminating ones
+        (production-stack's readiness rules). A fresh list each time: a long-lived watch stream in this
+        process stalled after its first event, and a list can never miss a change."""
+        from kubernetes import client, config
         config.load_incluster_config()
         ns = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read().strip()
         api = client.CoreV1Api()
         while True:
             try:
-                for ev in watch.Watch().stream(api.list_namespaced_pod, namespace=ns,
-                                               label_selector=self.selector, timeout_seconds=30):
-                    pod, kind = ev["object"], ev["type"]
-                    log.debug(f"vae watch event {kind} {pod.metadata.name}")
-                    ready = (pod.metadata.deletion_timestamp is None and pod.status.pod_ip and
-                             all(c.ready for c in (pod.status.container_statuses or [])) and
-                             bool(pod.status.container_statuses))
-                    with self.lock:
-                        if kind == "DELETED" or not ready:
-                            if self.endpoints.pop(pod.metadata.name, None):
-                                log.info(f"vae gone: {pod.metadata.name}")
-                        elif self.endpoints.get(pod.metadata.name) != pod.status.pod_ip:
-                            self.endpoints[pod.metadata.name] = pod.status.pod_ip
-                            log.info(f"vae ready: {pod.metadata.name} {pod.status.pod_ip}")
+                pods = api.list_namespaced_pod(namespace=ns, label_selector=self.selector, _request_timeout=10).items
+                now = {}
+                for pod in pods:
+                    cs = pod.status.container_statuses or []
+                    if pod.metadata.deletion_timestamp is None and pod.status.pod_ip and cs and all(c.ready for c in cs):
+                        now[pod.metadata.name] = pod.status.pod_ip
+                with self.lock:
+                    for n in set(self.endpoints) - set(now):
+                        log.info(f"vae gone: {n}")
+                    for n, ip in now.items():
+                        if self.endpoints.get(n) != ip:
+                            log.info(f"vae ready: {n} {ip}")
+                    self.endpoints = now
             except Exception as e:
-                log.warning(f"vae watch: {type(e).__name__}: {e}")
-                time.sleep(1)
+                log.warning(f"vae list: {type(e).__name__}: {e}")
+            time.sleep(POLL_S)
 
     def available(self):
         now = time.time()
