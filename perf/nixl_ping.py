@@ -77,12 +77,18 @@ else:
             buf.fill_(float(i + 1)); torch.neuron.synchronize()
             t0 = time.perf_counter()
             h = agent.initialize_xfer("WRITE", ldescs, rdescs, remote, f"chunk-{i}".encode())
-            st = agent.transfer(h)
-            t_end = time.time() + 10
-            while st not in ("DONE", "ERR") and time.time() < t_end:
-                st = agent.check_xfer_state(h)
+            try:
+                st = agent.transfer(h)
+                t_end = time.time() + 10
+                while st not in ("DONE", "ERR") and time.time() < t_end:
+                    st = agent.check_xfer_state(h)
+            except Exception as e:                     # NIXL raises on a failed transfer
+                st = f"error {type(e).__name__}"
             times.append(time.perf_counter() - t0)
-            agent.release_xfer_handle(h)
+            try:
+                agent.release_xfer_handle(h)
+            except Exception:
+                pass
             if st != "DONE":
                 why = f"write {i}: {st}"; break
             try:
