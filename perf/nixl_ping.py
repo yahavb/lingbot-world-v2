@@ -24,9 +24,25 @@ store = dist.TCPStore(host, 29600, None, is_master=False, timeout=timedelta(seco
 run = os.environ.get("RUN", "1")
 key = lambda k: f"nixl-ping/{run}/{k}"
 
+def nrt_va(t):
+    """The Neuron runtime's device address of tensor t (what NIXL and libfabric FI_HMEM_NEURON need; a
+    torch-neuronx tensor's data_ptr() is not it): nrt_tensor_get_va on the tensor's nrt_tensor_t, + offset."""
+    import ctypes
+    import torch_neuronx
+    cap = torch_neuronx._C._get_nrt_tensor_capsule(t)
+    api = ctypes.pythonapi
+    api.PyCapsule_GetName.restype, api.PyCapsule_GetName.argtypes = ctypes.c_char_p, [ctypes.py_object]
+    api.PyCapsule_GetPointer.restype, api.PyCapsule_GetPointer.argtypes = ctypes.c_void_p, [ctypes.py_object, ctypes.c_char_p]
+    ptr = api.PyCapsule_GetPointer(cap, api.PyCapsule_GetName(cap))
+    nrt = ctypes.CDLL("libnrt.so.1")
+    nrt.nrt_tensor_get_va.restype, nrt.nrt_tensor_get_va.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+    return nrt.nrt_tensor_get_va(ptr) + t.storage_offset() * t.element_size()
+
+
 buf = torch.zeros(shape, dtype=torch.float32, device=dev)
 torch.neuron.synchronize()
-addr = buf.data_ptr()
+addr = nrt_va(buf)
+print(f"NIXL {role}: data_ptr {buf.data_ptr():#x}, nrt va {addr:#x}", flush=True)
 agent = nixl_agent(role, nixl_agent_config(backends=["LIBFABRIC"]))
 agent.register_memory(agent.get_reg_descs([(addr, nbytes, 0, "")], "VRAM"))
 print(f"NIXL {role}: agent up, registered {nbytes} B of Neuron memory at {addr:#x}", flush=True)
