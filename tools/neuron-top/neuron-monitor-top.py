@@ -2110,7 +2110,9 @@ class NeuronMonitorTop:
         self._set_label('efa_header', crt_y + 1, (2, 0), self.EFA_COLUMNS,
                         (LabelWidget.ALIGN_LEFT, ), (curses.COLOR_WHITE, ), curses.COLOR_BLACK)
         crt_y += 2
-        for idx in range(min(self.EFA_MAX_ROWS, len(self.efa.devices))):
+        # in a pod, one row per EFA of its resource claim; with no claim (a host), the busiest EFA_MAX_ROWS
+        n_claimed = sum(1 for d in self.efa.devices.values() if d['claimed'])
+        for idx in range(min(self.EFA_MAX_ROWS, n_claimed or len(self.efa.devices))):
             self._set_label('efa_row_%d' % (idx, ), crt_y, (2, 0), ('', ), (LabelWidget.ALIGN_LEFT, ),
                             (curses.COLOR_WHITE, ), curses.COLOR_BLACK)
             crt_y += 1
@@ -2132,16 +2134,18 @@ class NeuronMonitorTop:
             title = 'EFA Usage: %d devices · reading counters...' % (len(devices), )
         else:
             # 'claimed' = EFAs this pod can open (its resource claim); 'in use' = opened by a process
-            title = 'EFA Usage: %d of %d claimed, %d in use, TX %s/s RX %s/s · all %d: TX %s/s RX %s/s  (%s)' % (
-                len(claimed), len(devices), len(in_use), total(claimed, 'tx_bytes'), total(claimed, 'rx_bytes'),
-                len(devices), total(devices, 'tx_bytes'), total(devices, 'rx_bytes'), source)
+            title = 'EFA Usage: %d claimed (of %d on the node), %d in use, TX %s/s RX %s/s  (%s)' % (
+                len(claimed), len(devices), len(in_use), total(claimed or devices, 'tx_bytes'),
+                total(claimed or devices, 'rx_bytes'), source)
         self._update_label_text('efa_title', (title, ), (LabelWidget.ALIGN_LEFT, ))
         # claimed first, then in use, then busiest
         def busy(n):
             return rows.get(n, {}).get('tx_bytes', 0) + rows.get(n, {}).get('rx_bytes', 0)
         order = sorted(devices, key=lambda n: (-devices[n]['claimed'], -(rows.get(n, {}).get('users', 0) > 0),
                                                -busy(n), n))
-        shown = min(self.EFA_MAX_ROWS, len(devices))
+        if claimed:
+            order = [n for n in order if devices[n]['claimed']]
+        shown = min(self.EFA_MAX_ROWS, len(order))
         for idx in range(shown):
             name = order[idx]
             dev, r = devices[name], rows.get(name, {})
@@ -2157,8 +2161,8 @@ class NeuronMonitorTop:
                      Utils.format_percentage(100.0 * used) if r else '-',
                      '%d' % (r.get('retrans_pkts', 0), ) if r else '-',
                      '%d' % (r.get('users', 0), ) if r.get('users') else '-')
-            if idx == shown - 1 and len(devices) > shown:
-                texts = texts[:-1] + ('%s  (+%d more)' % (texts[-1], len(devices) - shown), )
+            if idx == shown - 1 and len(order) > shown:
+                texts = texts[:-1] + ('%s  (+%d more)' % (texts[-1], len(order) - shown), )
             self._update_label_text('efa_row_%d' % (idx, ), texts, (LabelWidget.ALIGN_LEFT, ))
 
     def _build_ui_memory_used(self, widget_group, *_):
@@ -2647,6 +2651,8 @@ class NeuronMonitorTop:
         crt_y = self.groups_next_y
         if self.instance_info is not None:
             instance_id = self.instance_info['instance_id']
+            if os.environ.get('KUBERNETES_SERVICE_HOST') and os.environ.get('HOSTNAME'):
+                instance_id = os.environ['HOSTNAME']        # the pod name
             instance_type = self.instance_info['instance_type']
             header = 'neuron-top %s running on %s (%s)' % (NEURON_TOP_VERSION, instance_id, instance_type, )
             if 'ultraserver_id' in self.instance_info:
