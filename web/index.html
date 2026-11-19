@@ -74,8 +74,8 @@ const statusEl = $("status"), hud = $("hud"), img = $("frame");
 const KEYS = { w: "forward", arrowup: "forward", s: "back", arrowdown: "back", a: "left",
   arrowleft: "left", d: "right", arrowright: "right", r: "up", f: "down", " ": "stop", p: "auto" };
 let scenes = [], abort = null, buffer = [], arrivals = [], shown = [], lastChunk = -1;
-// Frames to hold before and during playback (about 1.5 chunks of 12); ?buf=N overrides it.
-const BUF_TARGET = Number(new URLSearchParams(location.search).get("buf")) || 18;
+// Frames to hold before and during playback (2 chunks of 12; 24 tested smoothest); ?buf=N overrides it.
+const BUF_TARGET = Number(new URLSearchParams(location.search).get("buf")) || 24;
 let playing = false, nextAt = 0, playFps = 16, pressed = null, latencyMs = null, total = 0;
 let offsetMs = 0, breakdown = "";  // server clock - local clock (ms), from /control round trips
 
