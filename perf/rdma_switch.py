@@ -22,10 +22,13 @@ dist.init_process_group(backend="neuron")
 dev = torch.device("neuron:0")
 shape = (16, 3, 60, 96)
 DIT = 8 * 3
+SHARED = os.environ.get("STORE_HOST")          # one store for every process (the fix under test)
+if role == "store":
+    st = R.host_store(); print("SWITCH store up", flush=True); time.sleep(3600); sys.exit(0)
 if role == "vae":
-    store = R.host_store()
+    store = R.client_store(SHARED, timeout_s=300) if SHARED else R.host_store()
     me = int(os.environ["VAE_RANK"])
-    gen = int(store.get("gen"))
+    gen = int(store.get(f"gen/{me}"))
     link = R.RdmaLink("vae", store, gen, DIT, me, timeout_s=60)
     good = 0
     for i in range(5):
@@ -41,9 +44,9 @@ if role == "vae":
     time.sleep(3600)
 else:
     for k, host, vae_rank in ((0, os.environ["VAE_A"], 8 * 5), (1, os.environ["VAE_B"], 8 * 7)):
-        store = R.client_store(host, timeout_s=300)
+        store = R.client_store(SHARED or host, timeout_s=300)
         gen = 200 + k
-        store.set("gen", str(gen))
+        store.set(f"gen/{vae_rank}", str(gen))
         link = R.RdmaLink("dit", store, gen, DIT, vae_rank, timeout_s=60)
         try:
             for i in range(5):
