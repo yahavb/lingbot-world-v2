@@ -49,12 +49,13 @@ def run_server(jobs, state):
     app = FastAPI(title="LingBot-World v2 VAE decode")
 
     @app.post("/decode")
-    async def decode(request: Request, first: int = 0, stream: int = 0):
+    async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0):
         """The decode loop puts lists of JPEG futures, one per step, then None or an exception."""
         if not state["ready"]:
             raise HTTPException(status_code=503, detail="warming up")
         result = queue.Queue()
-        jobs.put((await request.body(), bool(first), result))
+        body = await request.body()
+        jobs.put((None if rdma else body, bool(first), result))
 
         def parts():
             while True:
@@ -184,6 +185,16 @@ def serve_loop(decode, args, rank):
     if rank == 0:
         logging.info("VAE warmup done")
 
+    # LINGBOT_VAE_RDMA=1: the DiT's rank 0 sends each chunk's latents to this server's rank 0 over EFA
+    # (wan/rdma_link.py; this side hosts the rendezvous store); rank 0 then broadcasts them on the device.
+    use_rdma = os.environ.get("LINGBOT_VAE_RDMA", "0") == "1"
+    link, zbuf = None, None
+    if use_rdma:
+        dev = torch.device("neuron", torch.neuron.current_device())
+        zbuf = torch.empty(16, args.chunk_size, args.lat_h, args.lat_w, dtype=torch.float32, device=dev)
+        if rank == 0:
+            from wan.rdma_link import RdmaLink
+            link = RdmaLink("vae", dit_world=int(os.environ.get("DIT_WORLD", "8")))
     jobs = queue.Queue()
     state = {"ready": False}
     if rank == 0:
@@ -197,13 +208,19 @@ def serve_loop(decode, args, rank):
                 job = jobs.get(timeout=IDLE_S)
             except queue.Empty:
                 pass
-        msg = [None if job is None else {"z": job[0], "first": job[1]}]
+        msg = [None if job is None else {"z": job[0], "first": job[1], "rdma": job[0] is None}]
         dist.broadcast_object_list(msg, src=0)
         if msg[0] is None:
             continue
         try:
             t0 = time.perf_counter()
-            z = torch.load(io.BytesIO(msg[0]["z"]), map_location="cpu")
+            if msg[0]["rdma"]:
+                if rank == 0:
+                    link.recv(zbuf).wait()
+                dist.broadcast(zbuf, src=0)
+                z = zbuf
+            else:
+                z = torch.load(io.BytesIO(msg[0]["z"]), map_location="cpu")
             n = [0]
 
             def emit(part):

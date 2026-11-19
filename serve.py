@@ -250,10 +250,11 @@ class RemoteDecoder:
             try:
                 if self.error is None:
                     buf = io.BytesIO()
-                    torch.save(x0, buf)
+                    if x0 is not None:              # None: the latents travel over RDMA
+                        torch.save(x0, buf)
                     # stream=1: the VAE server sends each decode step's frames (NDJSON) as
                     # soon as they exist, not the whole chunk at the end.
-                    with self.session.post(f"{self.url}/decode", params={"first": int(first), "stream": 1},
+                    with self.session.post(f"{self.url}/decode", params={"first": int(first), "stream": 1, "rdma": int(x0 is None)},
                                            data=buf.getvalue(), timeout=600, stream=True) as r:
                         r.raise_for_status()
                         # Big reads: iter_lines' default 512 B pieces keep this thread busy in
@@ -476,6 +477,12 @@ def main():
                  text_seq_len=cfg.text_len)
 
     remote = RemoteDecoder(VAE_URL) if (VAE_URL and rank == 0) else None
+    # LINGBOT_VAE_RDMA=1 (with VAE_URL): each chunk's latents go device to device over EFA (wan/rdma_link.py);
+    # the HTTP request carries only the chunk's metadata and brings the frames back.
+    rdma = None
+    if remote is not None and os.environ.get("LINGBOT_VAE_RDMA", "0") == "1":
+        from wan.rdma_link import RdmaLink
+        rdma = RdmaLink("dit", dit_world=world)
 
     # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
     # the same path vae_serve.py serve_fused streams with (2-D tiles with LINGBOT_VAE_2D=1). The plain
@@ -538,7 +545,8 @@ def main():
 
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
-            x0 = x0.cpu() if rank == 0 else x0
+            x0_dev = x0
+            x0 = x0.cpu() if (rank == 0 and rdma is None) or (rank == 0 and (SAVE_LATENTS or SERVE_STATS)) else x0
             if rank == 0 and SAVE_LATENTS:
                 # LINGBOT_SERVE_SAVE_LATENTS=<dir>: every chunk's latents, to decode a live session
                 # offline (decode_latents_width_sharded.py) and compare with the inline VAE's frames
@@ -551,6 +559,9 @@ def main():
                 job_emit(frame, chunk_id, action, dict(times, dec=time.time()))
             if VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
+            elif remote is not None and rdma is not None:
+                remote.submit(chunk_id == 0, None, emit)        # the VAE posts its receive on this request
+                rdma.send(x0_dev.float().contiguous()).wait()
             elif remote is not None:
                 remote.submit(chunk_id == 0, x0, emit)
 
