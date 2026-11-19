@@ -2,7 +2,8 @@
 # 16 ranks, TP4 x CP4), 480x768, DiT + T5 + VAE in one pod. DiT Linears in MXFP8 plus the kiro_mx4
 # 16 fps flags (kiro_mx4/RESULTS.md). Measured 15.2 fps streaming, warm, through the service (2026-11-17).
 # Service: lbw-svc.yaml. Front end: lbw-web-deploy.yaml. ALB: lbw-ing.yaml.
-# The converted checkpoint and compiled NEFFs live on the node (hostPath /opt/lingbot-world-v2).
+# neuron-top: tools/neuron-top (installed at start). Caches on the node (hostPath /opt/lingbot-world-v2): checkpoint,
+# and cache/v<CACHE_VERSION>/{neuron-compile-cache, neff_cache, hlo_cache}.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,18 +32,24 @@ spec:
             - /bin/bash
             - "-c"
             - |
-              # neuron-top with op names in the memory layout and EFA traffic (ConfigMap neuron-top-patch)
-              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched" || true
               set -euo pipefail
               git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
               cd /tmp/lingbot
               echo "commit: $(git log --oneline -1)"
+              # enhanced neuron-top (op names in the memory layout, EFA traffic), from the repo
+              install -m 755 tools/neuron-top/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" \
+                && echo "neuron-top: enhanced" || echo "neuron-top: stock"
               NODE=/node-cache; mkdir -p "$NODE"
               CKPT=$NODE/lingbot-world-v2-14b-causal-fast
-              export NEURON_COMPILE_CACHE_URL=$NODE/neuron-compile-cache
-              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              # compile caches on the node, namespaced by CACHE_VERSION (env below): the first pod on a node fills
+              # them, every later pod there reuses them; bump CACHE_VERSION when pulling new model/kernel code
+              C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}
+              export NEURON_COMPILE_CACHE_URL=$C/neuron-compile-cache
+              export TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
               export NKI_ENABLE_TRACE_CACHE="${NKI_ENABLE_TRACE_CACHE:-1}"
-              export TORCH_NEURONX_HLO_CACHE_DIR=/var/tmp/hlo_cache
+              export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache
+              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR"
+              echo "neff cache on node (v$CACHE_VERSION): $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
               export HF_HOME=/tmp/hf-cache
 
               pip install -q -r requirements_neuron.txt huggingface_hub fastapi uvicorn
@@ -99,7 +106,6 @@ spec:
               memory: 950Gi
               ephemeral-storage: 600Gi
           volumeMounts:
-            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}
             - name: node-cache
               mountPath: /node-cache
             - name: dshm
@@ -107,6 +113,9 @@ spec:
             - name: logs
               mountPath: /logs
           env:
+            - name: CACHE_VERSION
+              # bump on every pull of new model/kernel code (cache dir /opt/lingbot-world-v2/cache/v<N>)
+              value: "4"
             - name: BRANCH
               value: "main"
             - name: SEG_CHUNKS
@@ -298,8 +307,6 @@ spec:
             - name: LINGBOT_VAE_FUSED
               value: "1"
       volumes:
-        - name: neuron-top-patch
-          configMap: {name: neuron-top-patch, optional: true}
         - name: node-cache
           hostPath:
             path: /opt/lingbot-world-v2
