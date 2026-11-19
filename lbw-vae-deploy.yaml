@@ -37,6 +37,8 @@ spec:
               echo "commit: $(git log --oneline -1)"
               install -m 755 tools/neuron-top/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" \
                 && echo "neuron-top: enhanced" || echo "neuron-top: stock"
+              # NIXL (latents DiT -> VAE over EFA, LINGBOT_VAE_TRANSPORT=nixl): built once per node into the node cache
+              eval "$(bash tools/nixl/build_nixl.sh)" && echo "nixl: $NIXL_PLUGIN_DIR"
               NODE=/node-cache; CKPT=$NODE/lingbot-world-v2-14b-causal-fast
               [ -f "$CKPT/Wan2.1_VAE.pth" ] || { pip install -q huggingface_hub; hf download robbyant/lingbot-world-v2-14b-causal-fast Wan2.1_VAE.pth --local-dir "$CKPT"; }
               C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}

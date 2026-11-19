@@ -236,8 +236,8 @@ class RemoteDecoder:
         self.error = None
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, first, x0, emit, url=None):
-        self.q.put((first, x0, emit, url or self.url))
+    def submit(self, first, x0, emit, url=None, seq=None):
+        self.q.put((first, x0, emit, url or self.url, seq))
 
     def drain(self):
         """Block until every submitted chunk is decoded; return and clear the first error."""
@@ -247,7 +247,7 @@ class RemoteDecoder:
 
     def _run(self):
         while True:
-            first, x0, emit, url = self.q.get()
+            first, x0, emit, url, seq = self.q.get()
             try:
                 if self.error is None:
                     buf = io.BytesIO()
@@ -255,7 +255,8 @@ class RemoteDecoder:
                         torch.save(x0, buf)
                     # stream=1: the VAE server sends each decode step's frames (NDJSON) as
                     # soon as they exist, not the whole chunk at the end.
-                    with self.session.post(f"{url}/decode", params={"first": int(first), "stream": 1, "rdma": int(x0 is None)},
+                    with self.session.post(f"{url}/decode", params={"first": int(first), "stream": 1, "rdma": int(x0 is None),
+                                                   **({"seq": seq} if seq is not None else {})},
                                            data=buf.getvalue(), timeout=600, stream=True) as r:
                         r.raise_for_status()
                         # Big reads: iter_lines' default 512 B pieces keep this thread busy in

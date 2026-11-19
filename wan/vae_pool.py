@@ -37,8 +37,15 @@ class VaePool:
         self.bad = {}                  # pod name -> time it failed
         self.lock = threading.Lock()
         self.gen = itertools.count(random.randrange(1, 1 << 30))
-        self.store = R.shared_store()  # the cluster's one rendezvous store, for this process's life
-        self.rank = R.new_transport_rank(self.store)  # this process's transport rank, never reused
+        # transport: "nixl" (default; wan/nixl_link.py, one-sided writes) or "neuron" (wan/rdma_link.py)
+        self.transport = os.environ.get("LINGBOT_VAE_TRANSPORT", "nixl")
+        self.nixl = None               # wan.nixl_link.NixlDit, made at the first chunk (its shape)
+        self.seq = itertools.count()
+        if self.transport != "nixl":
+            self.store = R.shared_store()  # the cluster's one rendezvous store, for this process's life
+            self.rank = R.new_transport_rank(self.store)  # this process's transport rank, never reused
+        else:
+            self.rank = -1
         self.current = None            # (name, ip, link)
         self.fresh = False             # the current VAE has not decoded a chunk yet
         self.gone = False              # the current VAE disappeared from the pod list
@@ -101,7 +108,15 @@ class VaePool:
                 r = self.http.post(f"http://{ip}:{self.port}/link", params={"gen": gen, "dit_rank": self.rank},
                                    timeout=10)
                 r.raise_for_status()
-                vae_rank = int(r.json()["vae_rank"])
+                info = r.json()
+                if self.transport == "nixl":
+                    if info.get("transport") != "nixl":
+                        raise RuntimeError(f"VAE {name} does not speak NIXL")
+                    conn = self.nixl.connect(info)
+                    self.current, self.fresh = (name, ip, conn), True
+                    log.info(f"session VAE: {name} {ip} (nixl, {len(info['slots'])} slots)")
+                    return True
+                vae_rank = int(info["vae_rank"])
                 if vae_rank == self.rank:
                     raise RuntimeError("transport rank clash")
                 link = self.R.RdmaLink("dit", self.store, gen, self.rank, vae_rank)
@@ -124,7 +139,10 @@ class VaePool:
 
     def release(self):
         if self.current is not None:
-            self.current[2].close()
+            if self.transport == "nixl":
+                self.nixl.disconnect(self.current[2])
+            else:
+                self.current[2].close()
             self.current = None
 
     def send(self, remote, first, x_dev, emit):
@@ -134,6 +152,8 @@ class VaePool:
         link, wait DRAIN_S for that to clear, and relink to the same VAE; otherwise (or if that fails too)
         set the VAE aside and move to another one, which starts its decode cache fresh."""
         import torch
+        if self.transport == "nixl":
+            return self._send_nixl(remote, first, x_dev, emit)
         relinked = False
         for attempt in range(3):
             if remote.error is not None:                     # the last HTTP request failed
@@ -163,4 +183,27 @@ class VaePool:
                     self._prefer = name
                 else:
                     self.fail(name)
+        raise VaeUnavailable("VAE failover did not succeed")
+
+    def _send_nixl(self, remote, first, x_dev, emit):
+        """NIXL: a write that fails means that VAE is gone (no stale errors carry over, perf/nixl_ping.py):
+        set it aside and retry the chunk on the next one."""
+        if self.nixl is None:
+            from wan.nixl_link import NixlDit
+            self.nixl = NixlDit(tuple(x_dev.shape), x_dev.device)
+        for attempt in range(3):
+            if remote.error is not None:                     # the last HTTP request failed
+                remote.error = None
+                self.fail()
+            if not self.acquire():
+                raise VaeUnavailable("no VAE available")
+            name, seq = self.current[0], next(self.seq)
+            try:
+                remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq)
+                self.nixl.write(self.current[2], x_dev, seq)
+                self.fresh = False
+                return
+            except Exception as e:
+                log.warning(f"vae {name}: nixl write failed: {type(e).__name__}: {e}")
+                self.fail(name)
         raise VaeUnavailable("VAE failover did not succeed")

@@ -52,19 +52,23 @@ def run_server(jobs, state):
     def link(gen: int, dit_rank: int):
         """A DiT starts a session here: answer this process's transport rank, then the decode loop
         builds the RDMA link (wan/rdma_link.py) while the DiT builds its end."""
-        if not state["ready"] or state.get("rank") is None:
+        if not state["ready"]:
+            raise HTTPException(status_code=503, detail="warming up")
+        if state.get("nixl") is not None:        # NIXL: the DiT writes into our slots; nothing to build here
+            return state["nixl"].info()
+        if state.get("rank") is None:
             raise HTTPException(status_code=503, detail="warming up")
         jobs.put(("__link__", gen, dit_rank))
         return {"vae_rank": state["rank"]}
 
     @app.post("/decode")
-    async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0):
+    async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0, seq: int = -1):
         """The decode loop puts lists of JPEG futures, one per step, then None or an exception."""
         if not state["ready"]:
             raise HTTPException(status_code=503, detail="warming up")
         result = queue.Queue()
         body = await request.body()
-        jobs.put((None if rdma else body, bool(first), result))
+        jobs.put((None if rdma else body, bool(first), result, seq))
 
         def parts():
             while True:
@@ -203,7 +207,10 @@ def serve_loop(decode, args, rank):
     if use_rdma:
         dev = torch.device("neuron", torch.neuron.current_device())
         zbuf = torch.empty(16, args.chunk_size, args.lat_h, args.lat_w, dtype=torch.float32, device=dev)
-        if rank == 0:
+        if rank == 0 and os.environ.get("LINGBOT_VAE_TRANSPORT", "nixl") == "nixl":
+            from wan.nixl_link import NixlVae
+            state["nixl"] = NixlVae((16, args.chunk_size, args.lat_h, args.lat_w), dev)
+        elif rank == 0:
             import random
             from wan import rdma_link as R
             store = R.shared_store()                          # the cluster's rendezvous store; a link per DiT session
@@ -232,7 +239,8 @@ def serve_loop(decode, args, rank):
                 logging.exception("rdma link failed")
                 link = None
             job = None
-        msg = [None if job is None else {"z": job[0], "first": job[1], "rdma": job[0] is None}]
+        msg = [None if job is None else {"z": job[0], "first": job[1], "rdma": job[0] is None,
+                                         "seq": job[3] if len(job) > 3 else -1}]
         dist.broadcast_object_list(msg, src=0)
         if msg[0] is None:
             continue
@@ -246,10 +254,14 @@ def serve_loop(decode, args, rank):
                 err = None
                 if rank == 0:
                     try:
-                        if link is None:
+                        if state.get("nixl") is not None:
+                            zbuf.copy_(state["nixl"].wait(msg[0]["seq"], float(os.environ.get("VAE_RECV_TIMEOUT_S", "5"))))
+                            torch.neuron.synchronize()
+                        elif link is None:
                             raise RuntimeError("no RDMA link (the DiT must POST /link first)")
-                        link.recv(zbuf).wait()
-                        torch.neuron.synchronize()
+                        else:
+                            link.recv(zbuf).wait()
+                            torch.neuron.synchronize()
                     except Exception as e:
                         err = e
                         ok.zero_()
