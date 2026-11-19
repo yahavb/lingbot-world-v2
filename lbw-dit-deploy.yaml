@@ -199,6 +199,9 @@ spec:
               value: "http://lbw-vae.default.svc.cluster.local:8000"
             - name: VAE_SELECTOR
               value: "app=lbw-vae"
+            - name: RDMA_STORE_HOST
+              # the one rendezvous store for every RDMA link (lbw-rdma-store-deploy.yaml)
+              value: "lbw-rdma-store.default.svc.cluster.local"
             - name: BRANCH
               value: "serve-2chip"
             - name: SEG_CHUNKS

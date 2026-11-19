@@ -36,6 +36,13 @@ def new_transport_rank(rng):
     return SLOT * rng.randrange(1, GLOBAL // SLOT)
 
 
+def shared_store(timeout_s=60):
+    """The cluster's one rendezvous store (lbw-rdma-store, RDMA_STORE_HOST). Every DiT and VAE process
+    uses it for all of its links: the native backend binds a process to the first store it rendezvoused
+    on, so a DiT that moved to a second VAE's own store never connected (perf/rdma_switch.py)."""
+    return client_store(os.environ.get("RDMA_STORE_HOST", "lbw-rdma-store.default.svc.cluster.local"), timeout_s)
+
+
 def host_store(timeout_s=None):
     """The VAE pod's one rendezvous store, for every link it will ever take."""
     t = timedelta(seconds=timeout_s or int(os.environ.get("RDMA_TIMEOUT_S", "3600")))

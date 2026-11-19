@@ -37,7 +37,7 @@ class VaePool:
         self.lock = threading.Lock()
         self.rank = R.new_transport_rank(random)   # this process's transport rank, for its life
         self.gen = itertools.count(random.randrange(1, 1 << 30))
-        self.stores = {}               # pod IP -> TCPStore client
+        self.store = R.shared_store()  # the cluster's one rendezvous store, for this process's life
         self.current = None            # (name, ip, link)
         self.fresh = False             # the current VAE has not decoded a chunk yet
         self.http = requests.Session()
@@ -97,9 +97,7 @@ class VaePool:
                 vae_rank = int(r.json()["vae_rank"])
                 if vae_rank == self.rank:
                     raise RuntimeError("transport rank clash")
-                if ip not in self.stores:
-                    self.stores[ip] = self.R.client_store(ip)
-                link = self.R.RdmaLink("dit", self.stores[ip], gen, self.rank, vae_rank)
+                link = self.R.RdmaLink("dit", self.store, gen, self.rank, vae_rank)
                 self.current, self.fresh = (name, ip, link), True
                 log.info(f"session VAE: {name} {ip} (gen {gen}, transport ranks {self.rank}->{vae_rank})")
                 return True
@@ -120,7 +118,6 @@ class VaePool:
     def release(self):
         if self.current is not None:
             self.current[2].close()
-            self.stores.pop(self.current[1], None)
             self.current = None
 
     def send(self, remote, first, x_dev, emit):
