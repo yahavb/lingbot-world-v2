@@ -22,7 +22,7 @@ metadata:
     # Union of this account's two Amazon CORP lists; VPN egress rotates across them.
     alb.ingress.kubernetes.io/security-group-prefix-lists: pl-025f2c1c85ff40379
     # User-requested 2026-11-15: yahavb's home IP (off VPN). Update if it changes.
-    alb.ingress.kubernetes.io/inbound-cidrs: 50.46.241.164/32,15.248.7.0/24
+    alb.ingress.kubernetes.io/inbound-cidrs: 50.46.241.164/32,50.46.243.219/32,15.248.7.0/24
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
     alb.ingress.kubernetes.io/load-balancer-name: keep-trn3-dev1
     alb.ingress.kubernetes.io/healthcheck-path: /lbw/
