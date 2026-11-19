@@ -17,14 +17,15 @@ _p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "
 _s = _u.spec_from_file_location("rdma_link", _p); R = _u.module_from_spec(_s); _s.loader.exec_module(R)
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 role = os.environ["ROLE"]
+if role == "store":                            # a plain TCPStore server, no Neuron device
+    st = dist.TCPStore("0.0.0.0", R.STORE_PORT, None, is_master=True, wait_for_workers=False, multi_tenant=True)
+    print("SWITCH store up", flush=True); time.sleep(3600); sys.exit(0)
 torch.neuron.set_device(0)
 dist.init_process_group(backend="neuron")
 dev = torch.device("neuron:0")
 shape = (16, 3, 60, 96)
 DIT = 8 * 3
 SHARED = os.environ.get("STORE_HOST")          # one store for every process (the fix under test)
-if role == "store":
-    st = R.host_store(); print("SWITCH store up", flush=True); time.sleep(3600); sys.exit(0)
 if role == "vae":
     store = R.client_store(SHARED, timeout_s=300) if SHARED else R.host_store()
     me = int(os.environ["VAE_RANK"])
