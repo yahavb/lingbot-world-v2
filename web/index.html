@@ -74,6 +74,8 @@ const statusEl = $("status"), hud = $("hud"), img = $("frame");
 const KEYS = { w: "forward", arrowup: "forward", s: "back", arrowdown: "back", a: "left",
   arrowleft: "left", d: "right", arrowright: "right", r: "up", f: "down", " ": "stop", p: "auto" };
 let scenes = [], abort = null, buffer = [], arrivals = [], shown = [], lastChunk = -1;
+// Frames to hold before and during playback (about 1.5 chunks of 12); ?buf=N overrides it.
+const BUF_TARGET = Number(new URLSearchParams(location.search).get("buf")) || 18;
 let playing = false, nextAt = 0, playFps = 16, pressed = null, latencyMs = null, total = 0;
 let offsetMs = 0, breakdown = "";  // server clock - local clock (ms), from /control round trips
 
@@ -153,7 +155,9 @@ function tick(now) {
     const gen = rate(arrivals, 6000);
     if (gen > 0) playFps = gen;
     const catchUp = pressed && latencyMs === null;
-    const adj = catchUp ? 1.5 : buffer.length > 20 ? 1.15 : buffer.length < 3 ? 0.85 : 1;
+    // Keep about 1.5 chunks buffered (frames arrive 12 at a time): speed up or slow down in proportion to how
+    // far the buffer is from that target, so a late chunk is absorbed instead of draining the buffer.
+    const adj = catchUp ? 1.5 : Math.min(1.25, Math.max(0.75, 1 + (buffer.length - BUF_TARGET) / (2 * BUF_TARGET)));
     nextAt = Math.max(nextAt + 1000 / (playFps * adj), now - 50);
   }
   if (playing && !buffer.length && abort === null) playing = false;
@@ -196,7 +200,7 @@ async function start() {
           buffer.push(ev); arrivals.push(ev.arrived); total++;
           if (ev.chunk > lastChunk) lastChunk = ev.chunk;
           if (first) { first = false; say("Streaming. Use the arrows or W A S D to steer."); }
-          if (!playing && buffer.length >= 8) { playing = true; nextAt = performance.now(); }
+          if (!playing && buffer.length >= BUF_TARGET) { playing = true; nextAt = performance.now(); }
         } else if (ev.error) say(`Error: ${ev.error}`);
         else if (ev.superseded) say(`Stopped: ${ev.superseded}`);
         else if (ev.done) say(`Session ended: ${ev.frames} frames in ${ev.seconds} s.`);
