@@ -63,6 +63,7 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
+VAE_POOL = {}       # rank 0, LINGBOT_VAE_RDMA=1: {"pool": wan.vae_pool.VaePool} (the routes read it)
 MAX_CHUNKS = 900    # RoPE table: 2880 latent frames / 3 per chunk, with margin
 IDLE_S = 60
 BACKLOG = int(os.environ.get("LIVE_BACKLOG_FRAMES", "480"))  # unread frames that end a live session
@@ -341,11 +342,23 @@ def run_server(sched):
                     sched.stop_job(job)
         return StreamingResponse(events(), media_type="text/event-stream")
 
+    @app.get("/vaes")
+    def vaes():
+        """The VAEs this DiT can use now, and the session's current one."""
+        pool = VAE_POOL.get("pool")
+        if pool is None:
+            return {"rdma": False}
+        cur = pool.current
+        return {"rdma": True, "available": pool.available(), "listed": dict(pool.endpoints),
+                "set_aside": {k: round(time.time() - v, 1) for k, v in pool.bad.items()},
+                "current": None if cur is None else {"name": cur[0], "ip": cur[1]}}
+
     @app.post("/session")
     def session(req: SessionRequest, request: Request):
         if not sched.ready:
             raise HTTPException(status_code=503, detail="warming up")
-        if rdma is not None and not rdma.available():
+        pool = VAE_POOL.get("pool")
+        if pool is not None and not pool.available():
             raise HTTPException(status_code=503, detail="VAE_SERVICE_UNAVAILABLE: no lbw-vae pod is ready")
         if req.scene and not (req.scene.isdigit() and os.path.isfile(f"examples/{req.scene}/poses.npy")):
             raise HTTPException(status_code=400, detail=f"unknown scene {req.scene!r}")
@@ -486,6 +499,7 @@ def main():
         # the VAE is chosen per session from the Ready lbw-vae pods, with failover (wan/vae_pool.py)
         from wan.vae_pool import VaePool, VaeUnavailable
         rdma = VaePool()
+        VAE_POOL["pool"] = rdma
 
     # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
     # the same path vae_serve.py serve_fused streams with (2-D tiles with LINGBOT_VAE_2D=1). The plain

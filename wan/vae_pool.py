@@ -53,6 +53,7 @@ class VaePool:
                 for ev in watch.Watch().stream(api.list_namespaced_pod, namespace=ns,
                                                label_selector=self.selector, timeout_seconds=30):
                     pod, kind = ev["object"], ev["type"]
+                    log.debug(f"vae watch event {kind} {pod.metadata.name}")
                     ready = (pod.metadata.deletion_timestamp is None and pod.status.pod_ip and
                              all(c.ready for c in (pod.status.container_statuses or [])) and
                              bool(pod.status.container_statuses))
