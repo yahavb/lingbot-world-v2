@@ -35,7 +35,7 @@ class VaePool:
         self.endpoints = {}            # pod name -> pod IP, Ready and not terminating
         self.bad = {}                  # pod name -> time it failed
         self.lock = threading.Lock()
-        self.rank = random.randrange(R.GLOBAL)   # this process's transport rank, for its life
+        self.rank = R.new_transport_rank(random)   # this process's transport rank, for its life
         self.gen = itertools.count(random.randrange(1, 1 << 30))
         self.stores = {}               # pod IP -> TCPStore client
         self.current = None            # (name, ip, link)

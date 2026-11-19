@@ -25,6 +25,15 @@ import torch.distributed as dist
 # caches EFA endpoints by transport rank per process; a new rank in an old process never connected).
 GLOBAL = int(os.environ.get("RDMA_GLOBAL_RANKS", "512"))
 STORE_PORT = int(os.environ.get("RDMA_STORE_PORT", "29600"))
+# torchft lays transport ranks out as slot * stride + local rank (stride = the pod's world), so a rank's
+# residue is the process's local rank. Our link ends are always local rank 0, so a rank is a multiple of
+# SLOT (a multiple of both pods' worlds: DiT 8, VAE 4).
+SLOT = int(os.environ.get("RDMA_SLOT", "8"))
+
+
+def new_transport_rank(rng):
+    """A fresh transport rank for this process: a random slot, times SLOT (local rank 0)."""
+    return SLOT * rng.randrange(1, GLOBAL // SLOT)
 
 
 def host_store(timeout_s=None):
