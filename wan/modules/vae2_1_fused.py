@@ -21,6 +21,7 @@ second frame) is a zero cache plus a first-frame graph that skips the time conv.
 """
 
 import os
+import time
 
 import torch
 import torch._dynamo
@@ -244,6 +245,17 @@ def _rms(x, gamma, scale):
     # (channels are the contraction axis), then x * rsqrt(max(sumsq, eps^2)), which is
     # F.normalize's x / max(||x||, eps) up to fp32 rounding. In the default form the profile put
     # ~174 ms of matmul-engine time and 64 ms of GpSimd cross-lane reduce on these reductions.
+    if _NORM_MODE == "mmb":
+        # LINGBOT_VAE_NORM=mmb (kiro_mx4): the channel sum of squares as a bf16 matmul (fp32 accumulation, bf16 result:
+        # its 2^-9 relative error moves rsqrt by 2^-10, below the bf16 rounding of the normalized output the next conv
+        # reads), the scaling in fp32. The 2-chip device profile had the fp32 form at 960 fp32 matmuls (two bf16
+        # passes each) and the rsqrt on GpSimd (385 us) per stage-3 ResidualBlock call.
+        xb = x.to(torch.bfloat16)
+        ones = torch.ones(x.shape[1], dtype=torch.bfloat16, device=x.device)
+        ss = torch.einsum("bcthw,c->bthw", xb * xb, ones) if x.dim() == 5 else \
+            torch.einsum("bchw,c->bhw", xb * xb, ones)
+        inv = torch.rsqrt(torch.clamp(ss.float(), min=1e-24)).unsqueeze(1)
+        return x.float() * inv * scale * gamma + 0.
     x = x.float()
     if _NORM_MODE == "mm":
         ones = torch.ones(x.shape[1], dtype=torch.float32, device=x.device)
@@ -252,6 +264,154 @@ def _rms(x, gamma, scale):
         inv = torch.rsqrt(torch.clamp(ss, min=1e-24)).unsqueeze(1)
         return x * inv * scale * gamma + 0.
     return F.normalize(x, dim=1) * scale * gamma + 0.
+
+
+# LINGBOT_VAE_NKI_NORM=1 (with LINGBOT_VAE_BF16): every F.silu(RMS_norm(x)).to(bf16) of the decoder (the two in each
+# ResidualBlock and the head's, with LINGBOT_VAE_HEAD_BF16) as one fused NKI kernel, kernels/vae_rms_silu.py: the
+# channel sum of squares as an fp32 matmul against ones [C, C] (the sum lands on every channel's partition), rsqrt on
+# the Scalar engine, x * rsqrt and silu(. * scale * gamma) in the same pass. Off: the compiled torch form above.
+# REFUTED in-graph (kiro/sa-vae, 2-chip LNC1 16 ranks): 2.2x faster than the torch form alone (stage 3, 4 frames:
+# 276-331 vs 608 us) and -1.15 ms per stage-3 ResidualBlock in perf/vae_rb_bench.py, but the decode stayed at 813 ms
+# (T=6) and with LINGBOT_VAE_NKI_HALO it costs +18 ms (662 vs 644, T=1); LINGBOT_VAE_NKI_HALO does the stage-3 part.
+_NKI_NORM = os.environ.get("LINGBOT_VAE_NKI_NORM", "0") == "1"
+# LINGBOT_VAE_UNIT_TIMING=1 (DIAGNOSTIC: a device sync around every block call, so slower overall): rank 0 prints the
+# synced wall time per (block kind, input shape) after every decode().
+_UNIT_TIMING = os.environ.get("LINGBOT_VAE_UNIT_TIMING", "0") == "1"
+if _NKI_NORM:
+    from kernels.vae_rms_silu import rms_silu as _nki_rms_silu
+
+
+def _norm_silu(x, gamma, scale, dt):
+    """F.silu(_rms(x, gamma, scale)).to(dt)."""
+    if _NKI_NORM and dt == torch.bfloat16 and x.shape[0] == 1:
+        c = x.shape[1]
+        y = _nki_rms_silu(x.to(torch.bfloat16).reshape(c, -1), gamma.float().reshape(c, 1) * scale)
+        return y.view(x.shape)
+    return F.silu(_rms(x, gamma, scale)).to(dt)
+
+
+# LINGBOT_VAE_NKI_HALO=1 (with LINGBOT_VAE_2D and bf16 convs; by default C <= 128: the stage-3 ResidualBlocks and
+# the head with LINGBOT_VAE_HEAD_BF16): norm + SiLU + both halos + the cache concatenate of every causal conv input
+# as one NKI kernel (kernels/vae_norm_halo.py). The raw (pre-norm) edges are exchanged instead of the normalized
+# ones: the norm is per position, so the kernel normalizing the neighbours' raw edges computes what their own norm
+# does. Removes the three full-tile torch.cat copies (column halo, row halo, cache frames) and the separate norm
+# passes. perf/vae_rb_bench.py, stage-3 ResidualBlock (4 frames, one core): 5754 -> 3499 us, conv input and cache
+# bit-identical to LINGBOT_VAE_NKI_NORM (SQ=fp32) + halo + cat. Decode (2-chip LNC1 16 ranks, T=1, + HEAD_BF16 and
+# -O1 unet-inference): 715 -> 644 ms, vs_R 52.87 dB unchanged.
+# LINGBOT_VAE_NKI_HALO_CMAX=c: use it for blocks of up to c channels (default 128 = stage 3 + head). Bit-identical
+# but slower above 128 (two partition tiles): stage-2 ResidualBlock 2841 -> 3152 us, C=384 conv unit 489 -> 598 us.
+_NKI_HALO = os.environ.get("LINGBOT_VAE_NKI_HALO", "0") == "1"
+_NKI_HALO_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_HALO_CMAX", "128"))
+if _NKI_HALO:
+    from kernels.vae_norm_halo import norm_halo as _nki_norm_halo
+# LINGBOT_VAE_NKI_HEAD=1 (with LINGBOT_VAE_NKI_HALO and LINGBOT_VAE_HEAD_BF16): the output conv (96 -> 3, causal 3x3x3)
+# as kernels/vae_head_conv.py on the halo kernel's buffer: each tap one matmul with the [96, 3] tap weight stationary
+# and an offset slice of the SBUF band as the moving operand (flat-shift over the padded width), 27 taps accumulating
+# in PSUM. One core, stage-3 shape: 1098 us vs 1636 for the compiler's conv, bit-identical (perf/vae_head_bench.py
+# VARIANT=nki; for a 96 -> 96 conv it is 1198 vs 1133 us, so only the head uses it).
+_NKI_HEAD = os.environ.get("LINGBOT_VAE_NKI_HEAD", "0") == "1"
+if _NKI_HEAD:
+    from kernels.vae_head_conv import head_conv as _nki_head_conv, head_conv_weights as _nki_head_conv_w
+# LINGBOT_VAE_NKI_CONV=head|all (with LINGBOT_VAE_NKI_HALO; takes precedence over LINGBOT_VAE_NKI_HEAD): the head's
+# conv (head) or every conv LINGBOT_VAE_NKI_HALO feeds (all: + the stage-3 ResidualBlocks) as one NKI kernel with its
+# norm, halo and cache, kernels/vae_norm_halo_conv.py: the tile in bands of rows, each band normalized in SBUF and
+# convolved from SBUF, so the conv input never goes through HBM and the compiler's conv is replaced by flat-shift
+# matmuls (kernels/vae_head_conv.py). Kernel options (LINGBOT_VAE_NKI_CONV_SQ / _EDGE / _LA / _R) in the kernel's
+# docstring. One core, stage-3 shape (perf/vae_head_bench.py VARIANT=fused, vs the LINGBOT_VAE_NKI_HALO path):
+#   head (96 -> 3):            2941 -> 1683 us (bit-identical conv and cache), + SQ=bf16 1614
+#   96 -> 96 conv unit:        1828 -> 1705 us (bit-identical), + SQ=bf16 1580
+#   stage-3 ResidualBlock:     3497 -> 3136 us (perf/vae_rb_bench.py), + SQ=bf16 2956, + RES 2931
+# (EDGE=copy: another -50..-100 us per conv in the benches, but it broke the decode's accuracy: see the kernel.)
+# SQ=bf16 (bf16 squares + one-pass ones-matmul) moves ~2% of the normalized values by one bf16 ulp; the decode's
+# vs_R stays 52.87 dB. Decode (2-chip LNC1 16 ranks, T=1, HEAD_BF16, -O1 unet-inference, NKI_HALO): 647 / 645 ms
+# (start / end) -> NKI_HEAD=1 624, NKI_CONV=head 616, =all 602-607, =all + SQ=bf16 + LA=1 587 (52.87 dB).
+# LINGBOT_VAE_NKI_CONV_CMAX=c (with =all): also the ResidualBlock convs of up to c in / out channels (default 128;
+# 192 adds the stage-2 ResidualBlocks, whose norm is otherwise the compiled torch form). Stage-2 ResidualBlock
+# (perf/vae_rb_bench.py): torch path 2823-2845 us, fused 2879 (fp32 squares), 2658 with SQ=bf16. Decode with
+# =all SQ=bf16 LA=1: 587-588 -> 582-583 ms, vs_R 52.8743 -> 52.8755 dB (best flag set).
+_NKI_CONV = os.environ.get("LINGBOT_VAE_NKI_CONV", "0")
+assert _NKI_CONV in ("0", "head", "all"), _NKI_CONV
+_NKI_CONV_CMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_CMAX", "128"))
+# LINGBOT_VAE_NKI_CONV_RES=1 (with =all): the ResidualBlock's shortcut add (y + h) in the second conv's kernel, on
+# the PSUM evacuation (bf16 conv output + bf16 h, rounded once more, as torch's bf16 add). Bit-identical
+# (perf/vae_head_bench.py VARIANT=rbres), stage-3 ResidualBlock -27..-34 us; decode neutral (587-589 vs 587 ms with
+# NKI_CONV=all SQ=bf16 LA=1, 52.87 dB), so not in the best flag set.
+_NKI_CONV_RES = os.environ.get("LINGBOT_VAE_NKI_CONV_RES", "0") == "1"
+# LINGBOT_VAE_NKI_CONV_TMAX=n (with =all): at most n frames per call of the fused kernel; a unit with more (LINGBOT_VAE_T
+# > 1 puts 4 x LINGBOT_VAE_T frames on stages 2 / 3) calls it on consecutive pieces chained through the cache.
+# Measured (perf/vae_repeat_check.sh, 12 decodes each): with LA=1 the kernel at 8 frames per call corrupts bursts of
+# frames in about half the decodes (always from frame 5 of an 8-frame step); with LA=0 8 and 12 frames are clean but
+# 16 frames (LINGBOT_VAE_T=4) corrupt 3 of 12. The production 4 frames per call (LINGBOT_VAE_T=1) was clean in every run.
+_NKI_CONV_TMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_TMAX", "0") or 0)
+if _NKI_CONV != "0":
+    from kernels.vae_norm_halo_conv import norm_halo_conv as _nki_norm_halo_conv
+    from kernels.vae_head_conv import head_conv_weights as _nki_conv_w
+
+
+def _raw_edges_2d(x, sel):
+    """_halo_2d's two exchanges on x [1, C, T, H, W] without assembling the haloed tile: (left, right [.., H, 1],
+    up, down [.., 1, W + 2] with the corners), zeros where there is no neighbour."""
+    P, D = _PD
+    wl, wr, hu, hd = (t.to(x.dtype) for t in sel)
+    e = torch.stack([x[..., :1], x[..., -1:]], 0).contiguous()            # [2, ..., h, 1]
+    g = fc.all_gather_tensor(e, 0, _MESH["dev"]).view((D,) + tuple(e.shape))
+    bd = (D,) + (1,) * (e.dim() - 1)
+    left, right = (g[:, 1] * wl.view(bd)).sum(0), (g[:, 0] * wr.view(bd)).sum(0)
+    top = torch.cat([left[..., :1, :], x[..., :1, :], right[..., :1, :]], -1)
+    bot = torch.cat([left[..., -1:, :], x[..., -1:, :], right[..., -1:, :]], -1)
+    e = torch.stack([top, bot], 0).contiguous()                            # [2, ..., 1, w + 2]
+    g = fc.all_gather_tensor(e, 0, _MESH["core"]).view((P,) + tuple(e.shape))
+    bp = (P,) + (1,) * (e.dim() - 1)
+    up, down = (g[:, 1] * hu.view(bp)).sum(0), (g[:, 0] * hd.view(bp)).sum(0)
+    return left, right, up, down
+
+
+def _use_nh(x, w):
+    if _NKI_CONV == "all" and _NKI_HALO and _TWO_D and w.dtype == torch.bfloat16 and x.shape[0] == 1 and \
+            max(x.shape[1], w.shape[0]) <= _NKI_CONV_CMAX:
+        return True
+    return _NKI_HALO and _TWO_D and w.dtype == torch.bfloat16 and x.shape[0] == 1 and x.shape[1] <= _NKI_HALO_CMAX
+
+
+def _nh_fused(x, w, b, head=False):
+    """Does _nh_conv take kernels/vae_norm_halo_conv.py (LINGBOT_VAE_NKI_CONV)?"""
+    return (_NKI_CONV == "all" or (_NKI_CONV == "head" and head)) and b is not None and \
+        max(x.shape[1], w.shape[0]) <= max(_NKI_CONV_CMAX, 128)
+
+
+def _nh_conv(x, cache, gamma, scale, w, b, sel, nki_conv=False, head=False, res=None):
+    """_cconv(_halo(_norm_silu(x, gamma, scale, bf16), sel), cache, w, b) via kernels/vae_norm_halo.py; nki_conv: the
+    conv as kernels/vae_head_conv.py (LINGBOT_VAE_NKI_HEAD)."""
+    xb = x.to(torch.bfloat16)
+    l, r, u, d = _raw_edges_2d(xb, sel)
+    c = x.shape[1]
+    if _nh_fused(x, w, b, head):
+        T = int(xb.shape[2])
+        if _NKI_CONV_TMAX and T > _NKI_CONV_TMAX:
+            # LINGBOT_VAE_NKI_CONV_TMAX: the frames in kernel calls of at most TMAX, chained through the cache
+            # (two calls of T / 2 == one call bit for bit, perf/vae_conv_t_check.py); the halo exchange stays one.
+            g_, w_, b_ = gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1)
+            nc = cache[0].to(torch.bfloat16)
+            ys = []
+            for t0 in range(0, T, _NKI_CONV_TMAX):
+                t1 = min(T, t0 + _NKI_CONV_TMAX)
+                y_, nc = _nki_norm_halo_conv(
+                    xb[0, :, t0:t1].contiguous(), l[0, :, t0:t1].contiguous(), r[0, :, t0:t1].contiguous(),
+                    u[0, :, t0:t1].contiguous(), d[0, :, t0:t1].contiguous(), nc, g_, w_, b_,
+                    None if res is None else res[0, :, t0:t1].contiguous())
+                ys.append(y_)
+            return torch.cat(ys, 1).unsqueeze(0), nc.unsqueeze(0)
+        y, nc = _nki_norm_halo_conv(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
+                                    gamma.float().reshape(c, 1) * scale, _nki_conv_w(w), b.float().reshape(-1, 1),
+                                    None if res is None else res[0])
+        return y.unsqueeze(0), nc.unsqueeze(0)
+    buf = _nki_norm_halo(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
+                         gamma.float().reshape(c, 1) * scale)
+    if nki_conv:
+        y = _nki_head_conv(buf, _nki_head_conv_w(w), b.float().reshape(-1, 1))
+        return y.unsqueeze(0), buf[:, -2:].unsqueeze(0)
+    buf = buf.unsqueeze(0)
+    return F.conv3d(buf, w, b), buf[:, :, -2:]
 
 
 def _cconv(xnew_h, cache_h, w, b):
@@ -269,10 +429,19 @@ def _conv_unit(x, cache, w, b, sel):
 
 def _res_unit(x, c1, c2, g1, s1, w1, b1, g2, s2, w2, b2, wsc, bsc, sel):
     h = F.conv3d(x, wsc, bsc) if wsc is not None else x
-    y = F.silu(_rms(x, g1, s1)).to(w1.dtype)
-    y, c1 = _cconv(_halo(y, sel), c1, w1, b1)
-    y = F.silu(_rms(y, g2, s2)).to(w2.dtype)
-    y, c2 = _cconv(_halo(y, sel), c2, w2, b2)
+    if _use_nh(x, w1):
+        y, c1 = _nh_conv(x, c1, g1, s1, w1, b1, sel)
+    else:
+        y = _norm_silu(x, g1, s1, w1.dtype)
+        y, c1 = _cconv(_halo(y, sel), c1, w1, b1)
+    if _use_nh(y, w2):
+        if _NKI_CONV_RES and _nh_fused(y, w2, b2) and h.dtype == torch.bfloat16 and h.shape[1] == w2.shape[0]:
+            y, c2 = _nh_conv(y, c2, g2, s2, w2, b2, sel, res=h)
+            return y, c1, c2
+        y, c2 = _nh_conv(y, c2, g2, s2, w2, b2, sel)
+    else:
+        y = _norm_silu(y, g2, s2, w2.dtype)
+        y, c2 = _cconv(_halo(y, sel), c2, w2, b2)
     return y + h, c1, c2
 
 
@@ -324,16 +493,97 @@ def _up_core(x, w2, b2, sel):
     return y.reshape(b, t, y.shape[1], 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
 
 
+# LINGBOT_VAE_SUBPIX=1 (with LINGBOT_VAE_2D): nearest x2 upsample + 3x3 conv as four 2x2 convs on the low-resolution
+# haloed input, one per output phase (py, px), interleaved: output row 2i + py reads input rows i + py + {0, 1} with
+# the vertical taps folded (py = 0: w0, w1 + w2; py = 1: w0 + w1, w2), the same for columns. Exact in real arithmetic
+# (the folded taps are summed in fp32, then cast), 2.25x fewer FLOPs, and the 4x upsampled input is never built.
+_SUBPIX = os.environ.get("LINGBOT_VAE_SUBPIX", "0") == "1"
+# LINGBOT_VAE_HEAD_BF16=1 (with LINGBOT_VAE_BF16): the output conv (96 -> 3, causal 3x3x3) in bf16 like every other
+# conv (fp32 accumulation) instead of fp32. In the 2-chip LNC1 device profile that fp32 conv was the decode's single
+# most expensive call: 13440 matmuls with 3 stationary columns at the fp32 rate, 6.58 ms per latent frame (16% of 812).
+_HEAD_BF16 = os.environ.get("LINGBOT_VAE_HEAD_BF16", "0") == "1"
+def subpix_weights(w2):
+    """[C', C, 3, 3] -> [4, C', C, 2, 2]: the folded 2x2 kernel of each output phase (py, px), row-major."""
+    wf = w2.float()
+    def fold(k, ax, ph):              # 3 taps -> 2 along axis ax for phase ph
+        t0, t1, t2 = (k.narrow(ax, j, 1) for j in range(3))
+        return torch.cat([t0, t1 + t2] if ph == 0 else [t0 + t1, t2], ax)
+    return torch.stack([fold(fold(wf, 2, py), 3, px) for py in (0, 1) for px in (0, 1)]).to(w2.dtype)
+def _up_core_sp(x, weff, b2, sel):
+    """_up_core (LINGBOT_VAE_2D) in the sub-pixel form: weff from subpix_weights."""
+    b, c, t, h, w = x.shape
+    xh = _halo(x.to(weff.dtype), sel)                                     # [b, c, t, h + 2, w + 2]
+    xf = xh.permute(0, 2, 1, 3, 4).reshape(b * t, c, h + 2, w + 2)
+    ys = [F.conv2d(xf[:, :, py:py + h + 1, px:px + w + 1], weff[2 * py + px], b2) for py in (0, 1) for px in (0, 1)]
+    co = ys[0].shape[1]
+    y = torch.stack(ys, 0).view(2, 2, b * t, co, h, w).permute(2, 3, 4, 0, 5, 1).reshape(b * t, co, 2 * h, 2 * w)
+    return y.reshape(b, t, co, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
 def _up3d_unit(x, cache_t, wt, bt, w2, b2, sel):
     b, c, t, h, w = x.shape
     xc = torch.cat([cache_t, x.to(wt.dtype)], 2)
     y = F.conv3d(xc, wt, bt).reshape(b, 2, c, t, h, w)
     y = torch.stack((y[:, 0], y[:, 1]), 3).reshape(b, c, t * 2, h, w)
+    if _SUBPIX and w2.dim() == 5:      # w2 is the folded [4, C', C, 2, 2] (FusedWidthDecoder._wb_up)
+        return _up_core_sp(y, w2, b2, sel), xc[:, :, -2:]
     return _up_core(y, w2, b2, sel), xc[:, :, -2:]
 
 
+# LINGBOT_VAE_NKI_UP=2d|all (with LINGBOT_VAE_2D, LINGBOT_VAE_BF16): the spatial upsample (nearest x2 + 3x3 Conv2d) of
+# the upsample2d Resample (2d) or of every Resample (all: + the upsample3d ones' conv after their time conv) as one NKI
+# kernel on the low-resolution haloed tile (kernels/vae_up_conv.py): each output phase is a 3x3 flat-shift conv over
+# the low-res band in SBUF, written to the output with stride 2, so the 4x upsampled input is never built in HBM.
+# Halo: the raw edges of _raw_edges_2d (the same two exchanges as _halo). LINGBOT_VAE_NKI_UP_FOLD=1: the folded
+# 2x2 phase kernels (2.25x fewer matmuls; weights folded in fp32 from the fp32 module weights, rounded once).
+# LINGBOT_VAE_NKI_UP_R: low-res rows per band (default 10).
+_NKI_UP = os.environ.get("LINGBOT_VAE_NKI_UP", "0")
+assert _NKI_UP in ("0", "2d", "all"), _NKI_UP
+_NKI_UP_FOLD = os.environ.get("LINGBOT_VAE_NKI_UP_FOLD", "0") == "1"
+_NKI_UP_R = int(os.environ.get("LINGBOT_VAE_NKI_UP_R", "10"))
+# LINGBOT_VAE_LOW_T=k (decode): after frame 0, the units before the first temporal upsample (conv_in, the mid block
+# and stage 0: C=384 at the latent's 15 x 24 tile) run on k latent frames per step, then the rest frame by frame
+# (LINGBOT_VAE_T). Every temporal op is a causal conv over [2-frame cache, new frames] or per frame, so the layer-wise
+# order computes the same values; it only cuts the low-resolution units' launches and halo exchanges (105 + 21 + 21
+# + 21 tiny calls per decode at k = 1).
+_LOW_T = int(os.environ.get("LINGBOT_VAE_LOW_T", "0") or 0)
+# LINGBOT_VAE_LOW_UPS=u (with LOW_T): the batched phase ends before the u-th temporal upsample (1: stage 0 only; 2: also
+# stage 0's upsample and stage 1). Measured: a LOW_T smaller than the latent's frame count (several low steps) lowered
+# vs_R (52.13 dB at LOW_T=5): use LOW_T >= frames - 1.
+_LOW_UPS = int(os.environ.get("LINGBOT_VAE_LOW_UPS", "1") or 1)
+# Intermittent decode error with more than one latent frame per step (LINGBOT_VAE_T=2, LOW_T=5): bursts of 7-11
+# frames at 28-46 dB vs R in a run-dependent place, more often under host load; the fused conv kernel alone is exact
+# at 8 frames (perf/vae_conv_t_check.py). Diagnostics:
+# LINGBOT_VAE_STEP_SYNC=1: torch.neuron.synchronize() after every decode step (bounds the work in flight).
+# LINGBOT_VAE_HOLD=1: keep every step's unit outputs and its input caches referenced until decode() returns (no
+# device buffer of the decode is freed, and so reused, while queued work may still read it).
+_STEP_SYNC = os.environ.get("LINGBOT_VAE_STEP_SYNC", "0") == "1"
+_HOLD = os.environ.get("LINGBOT_VAE_HOLD", "0") == "1"
+if _NKI_UP != "0":
+    from kernels.vae_up_conv import up_conv as _nki_up_conv, up_conv_weights as _nki_up_w
+
+
+def _up_core_nki(x, wk, b2, sel):
+    """_up_core (LINGBOT_VAE_2D) via kernels/vae_up_conv.py; wk = up_conv_weights(w2[, fold])."""
+    xb = x.to(torch.bfloat16)
+    l, r, u, d = _raw_edges_2d(xb, sel)
+    y = _nki_up_conv(xb[0], l[0], r[0], u[0], d[0], wk, b2.float().reshape(-1, 1), rows=_NKI_UP_R,
+                     fold=_NKI_UP_FOLD)
+    return y.unsqueeze(0)
+
+
+def _up3d_unit_nki(x, cache_t, wt, bt, wk, b2, sel):
+    """_up3d_unit with the spatial part as _up_core_nki."""
+    b, c, t, h, w = x.shape
+    xc = torch.cat([cache_t, x.to(wt.dtype)], 2)
+    y = F.conv3d(xc, wt, bt).reshape(b, 2, c, t, h, w)
+    y = torch.stack((y[:, 0], y[:, 1]), 3).reshape(b, c, t * 2, h, w)
+    return _up_core_nki(y, wk, b2, sel), xc[:, :, -2:]
+
+
 def _head_unit(x, cache, g, s, w, b, sel):
-    return _cconv(_halo(F.silu(_rms(x, g, s)).to(w.dtype), sel), cache, w, b)
+    if _use_nh(x, w):
+        return _nh_conv(x, cache, g, s, w, b, sel, nki_conv=_NKI_HEAD and b is not None and w.shape[0] <= 128,
+                        head=True)
+    return _cconv(_halo(_norm_silu(x, g, s, w.dtype), sel), cache, w, b)
 
 
 def _compile(fn):
@@ -342,6 +592,8 @@ def _compile(fn):
 
 _CONV, _RES, _ATTN = _compile(_conv_unit), _compile(_res_unit), _compile(_attn_unit)
 _UP3D, _UP2D, _HEAD = _compile(_up3d_unit), _compile(_up_core), _compile(_head_unit)
+_UP2D_SP = _compile(_up_core_sp)
+_UP2D_N, _UP3D_N = _compile(_up_core_nki), _compile(_up3d_unit_nki)
 
 
 class FusedWidthDecoder:
@@ -369,6 +621,7 @@ class FusedWidthDecoder:
                 raise TypeError(type(m))
         self.units.append(("head", dec.head))
         self.sel = None
+        self._ut = {}
 
     def _wb(self, m, keep_fp32=False):
         """(weight, bias) of a conv module in the compute dtype (cached bf16 copies); with
@@ -384,6 +637,30 @@ class FusedWidthDecoder:
             self._wcache[k] = (w, None if m.bias is None else m.bias.detach().to(dt))
         return self._wcache[k]
 
+    def _wb_up(self, m):
+        """The upsample's 3x3 conv: (weight, bias), or with LINGBOT_VAE_SUBPIX the folded [4, C', C, 2, 2] weight."""
+        w, b = self._wb(m)
+        if not (_SUBPIX and _TWO_D and not _SWAP):
+            return w, b
+        k = (id(m), "subpix")
+        if k not in self._wcache:
+            self._wcache[k] = (subpix_weights(w), b)
+        return self._wcache[k]
+    def _wb_upn(self, m):
+        """LINGBOT_VAE_NKI_UP: the upsample conv's (kernels/vae_up_conv.py weight, bias); the fold from the fp32 module
+        weight (on the host, once)."""
+        k = (id(m), "nkiup", _NKI_UP_FOLD)
+        if k not in self._wcache:
+            w, b = self._wb(m)
+            src = m.weight.detach() if _NKI_UP_FOLD else w
+            wk = _nki_up_w(src.cpu(), fold=_NKI_UP_FOLD).to(torch.bfloat16).to(w.device)
+            self._wcache[k] = (wk, b)
+        return self._wcache[k]
+
+    def _nki_up(self, kind):
+        return _TWO_D and not _SWAP and self.dt == torch.bfloat16 and \
+            (_NKI_UP == "all" or (_NKI_UP == "2d" and kind == "up2d"))
+
     def _zeros(self, x, c, halo=True, fp32=False):
         shape = [x.shape[0], c, 2, x.shape[3], x.shape[4]]
         if halo:
@@ -393,7 +670,31 @@ class FusedWidthDecoder:
         dt = x.dtype if self.dt is None else (torch.float32 if fp32 else self.dt)
         return torch.zeros(shape, dtype=dt, device=x.device)
 
-    def _step(self, x, caches, first):
+    def _n_caches(self, u0, u1):
+        """Cache tensors the units [u0, u1) read and return, in _step's order."""
+        per = {"conv": 1, "res": 2, "attn": 0, "up3d": 1, "up2d": 0}
+        return sum(per.get(kind, 1) for kind, _ in self.units[u0:u1])
+
+    def _low_split(self):
+        """Index of the decoder's first temporal upsample unit: the units before it (conv_in, the mid block, stage 0)
+        work at the latent's resolution and frame rate (LINGBOT_VAE_LOW_T)."""
+        seen = 0
+        for u, (kind, _) in enumerate(self.units):
+            if kind == "up3d":
+                seen += 1
+                if seen == _LOW_UPS:
+                    return u
+        return len(self.units)
+
+    def _step(self, x, caches, first, u0=0, u1=None):
+        out = self._step_body(x, caches, first, u0, u1)
+        if _HOLD:
+            self.__dict__.setdefault("_held", []).append((x, caches, out))
+        if _STEP_SYNC:
+            torch.neuron.synchronize()
+        return out
+
+    def _step_body(self, x, caches, first, u0=0, u1=None):
         new, i = [], 0
 
         def cache(c, halo=True, fp32=False):
@@ -404,7 +705,11 @@ class FusedWidthDecoder:
             return caches[i - 1]
 
         sel = self.sel
-        for kind, m in self.units:
+        for kind, m in self.units[u0:u1]:
+            if _UNIT_TIMING:
+                torch.neuron.synchronize()
+                _t0 = time.perf_counter()
+                _key = (kind, tuple(x.shape[1:]))
             if kind == "conv":
                 x, c = _CONV(x, cache(x.shape[1]), *self._wb(m), sel)
                 new.append(c)
@@ -422,23 +727,51 @@ class FusedWidthDecoder:
             elif kind == "up3d":
                 ct = cache(x.shape[1], halo=False)
                 conv2d = m.resample[1]
-                if first:
+                _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
+                if self._nki_up(kind):
+                    if first:
+                        x = _UP2D_N(x, *self._wb_upn(conv2d), sel)
+                    else:
+                        x, ct = _UP3D_N(x, ct, *self._wb(m.time_conv), *self._wb_upn(conv2d), sel)
+                elif first:
                     # 'Rep': no time conv on the first frame; the second frame's time conv then
                     # zero-pads, which is what the all-zero cache does.
-                    x = _UP2D(x, *self._wb(conv2d), sel)
+                    x = _up2(x, *self._wb_up(conv2d), sel)
                 else:
-                    x, ct = _UP3D(x, ct, *self._wb(m.time_conv), *self._wb(conv2d), sel)
+                    x, ct = _UP3D(x, ct, *self._wb(m.time_conv), *self._wb_up(conv2d), sel)
                 new.append(ct)
             elif kind == "up2d":
                 conv2d = m.resample[1]
-                x = _UP2D(x, *self._wb(conv2d), sel)
+                _up2 = _UP2D_SP if (_SUBPIX and _TWO_D and not _SWAP) else _UP2D
+                if self._nki_up(kind):
+                    x = _UP2D_N(x, *self._wb_upn(conv2d), sel)
+                else:
+                    x = _up2(x, *self._wb_up(conv2d), sel)
             else:  # head
                 norm, conv = m[0], m[2]
                 # fp32 output conv (96 -> 3, cheap) keeps the pixel values at full precision.
-                x, c = _HEAD(x, cache(x.shape[1], fp32=True), norm.gamma, norm.scale,
-                             *self._wb(conv, keep_fp32=True), sel)
+                x, c = _HEAD(x, cache(x.shape[1], fp32=not _HEAD_BF16), norm.gamma, norm.scale,
+                             *self._wb(conv, keep_fp32=not _HEAD_BF16), sel)
                 new.append(c)
+            if _UNIT_TIMING:
+                torch.neuron.synchronize()
+                s = self._ut.setdefault(_key, [0, 0.0])
+                s[0] += 1
+                s[1] += time.perf_counter() - _t0
+            if _HOLD:
+                self.__dict__.setdefault("_held", []).append(x)
         return x, new
+
+    def unit_timing_report(self):
+        """LINGBOT_VAE_UNIT_TIMING=1: per (unit kind, input shape) calls and synced ms since the last report."""
+        if not _UNIT_TIMING:
+            return
+        tot = sum(v[1] for v in self._ut.values())
+        lines = [f"VAEUNIT {k[0]:5s} {str(k[1]):24s} n={v[0]:3d} ms={v[1] * 1e3:8.1f} per={v[1] * 1e3 / v[0]:6.2f}"
+                 for k, v in sorted(self._ut.items(), key=lambda kv: -kv[1][1])]
+        if dist.get_rank() == 0:
+            print("\n".join(lines) + f"\nVAEUNIT total ms={tot * 1e3:.1f}", flush=True)
+        self._ut = {}
 
     @torch.no_grad()
     def decode(self, z, scale):
@@ -450,6 +783,7 @@ class FusedWidthDecoder:
         one frame; k only changes how many graph launches and halo exchanges the decode takes."""
         if self.sel is None:
             self.sel = _selectors(z.device)
+        self._held = []           # LINGBOT_VAE_HOLD: the previous decode's references (it has completed by now)
         zd = self.model.z_dim
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, zd, 1, 1, 1) + scale[0].view(1, zd, 1, 1, 1)
@@ -461,11 +795,34 @@ class FusedWidthDecoder:
         k = max(1, int(os.environ.get("LINGBOT_VAE_T", "1")))
         out, caches = self._step(x[:, :, :1], None, first=True)
         outs, i, n = [out], 1, x.shape[2]
+        if _LOW_T and n > 1:
+            # LINGBOT_VAE_LOW_T: the low-resolution units on _LOW_T latent frames per step, then the rest on
+            # LINGBOT_VAE_T frames per step (layer-wise instead of frame-wise: the same causal computation)
+            s_ = self._low_split()
+            nl_ = self._n_caches(0, s_)
+            c_lo, c_hi = caches[:nl_], caches[nl_:]
+            lows = []
+            while i < n:
+                j = min(n, i + _LOW_T)
+                y, c_lo = self._step(x[:, :, i:j], c_lo, first=False, u0=0, u1=s_)
+                lows.append(y)
+                i = j
+            y = lows[0] if len(lows) == 1 else torch.cat(lows, 2)
+            i, m_ = 0, y.shape[2]
+            while i < m_:
+                j = min(m_, i + k)
+                out, c_hi = self._step(y[:, :, i:j], c_hi, first=False, u0=s_)
+                outs.append(out)
+                i = j
+            self.unit_timing_report()
+            out = torch.cat(outs, 2)
+            return out.transpose(-1, -2).contiguous() if _SWAP else out
         while i < n:
             j = min(n, i + k)
             out, caches = self._step(x[:, :, i:j], caches, first=False)
             outs.append(out)
             i = j
+        self.unit_timing_report()
         out = torch.cat(outs, 2)
         return out.transpose(-1, -2).contiguous() if _SWAP else out
 

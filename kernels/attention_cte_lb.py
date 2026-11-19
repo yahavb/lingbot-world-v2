@@ -302,8 +302,19 @@ def attention_cte(
     chain_sum: Optional[nl.NkiTensor] = None,
     v_token_major: bool = False,
     prior_full: bool = False,
+    h_cnt: int = 0,
+    one_core: bool = False,
+    rowmax_vec: bool = False,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
+    lingbot: rowmax_vec = True (LINGBOT_HOT_ROWMAX_VEC): this call's MM1 row-max evicts on the Vector engine even
+    under LINGBOT_CTE_SCALAR_ROWMAX=1 (the Scalar engine left to the constant-offset kernel beside it). Same values.
+    lingbot: one_core = True (LINGBOT_HOT_ONECORE): under an LNC2 grid, program 0 attends every head and
+    program 1 none (instead of half the heads each); the caller gives program 1 other work.
+    lingbot: h_cnt = N > 0 (LINGBOT_HOT_NOCOPY): only the first N heads (batch entries) of q, k, v, k_prior and
+    v_prior are attended -- the tensors keep all their heads, their layouts and strides -- and the output and
+    statistics (and chain_o / chain_neg_max / chain_sum) hold those N heads. Same values as passing head-sliced
+    copies of the inputs.
     lingbot: prior_full = True (prefix caching): prior_used_len equals the prior's length on every call, so
     the prior's K tiles need no dynamic mask (range_select, Vector-only); they evict like active tiles.
     lingbot: v_token_major = True: v and v_prior keep their logical shape (bs_kv, seqlen, d) but their
@@ -550,6 +561,9 @@ def attention_cte(
         chain_sum=chain_sum,
         v_token_major=v_token_major,
         prior_full=prior_full,
+        h_cnt=h_cnt,
+        one_core=one_core,
+        rowmax_vec=rowmax_vec,
     )
 
 
@@ -610,6 +624,9 @@ def _attention_cte(
     chain_sum=None,
     v_token_major: bool = False,
     prior_full: bool = False,
+    h_cnt: int = 0,
+    one_core: bool = False,
+    rowmax_vec: bool = False,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -758,6 +775,14 @@ def _attention_cte(
         v_prior_sbuf,
         skip_output_normalization=skip_output_normalization,
     )
+    h_cnt = int(h_cnt or 0)
+    if h_cnt:  # lingbot: the first h_cnt heads only, see attention_cte
+        kernel_assert(0 < h_cnt <= int(q.shape[0]) and k is not None and int(k.shape[0]) == int(q.shape[0]),
+                      f"h_cnt={h_cnt} needs MHA HBM inputs with at least that many heads")
+        kernel_assert(not q_major and out_o_hbm is None and out_neg_max_hbm is None and out_sum_hbm is None
+                      and sink is None, "h_cnt: no q_major / preallocated outputs / sink")
+        out_shape = (h_cnt,) + tuple(out_shape[1:])
+        softmax_shape = [h_cnt] + list(softmax_shape[1:])
     if q_major:  # lingbot: query-major output and statistics, see attention_cte
         kernel_assert(not tp_out and cache_softmax and skip_output_normalization,
                       "q_major needs tp_out=False, cache_softmax and skip_output_normalization")
@@ -828,6 +853,9 @@ def _attention_cte(
         bs_kv = 1
     else:
         bs_kv = k.shape[0]
+    if h_cnt:
+        # lingbot: heads 0 .. h_cnt - 1 (the loads take the head strides from the tensors' own shapes)
+        bs, bs_kv = h_cnt, h_cnt
 
     # Batch size checks
     kernel_assert(bs > 0, f"Batch size must be positive, got {bs}")
@@ -1007,6 +1035,7 @@ def _attention_cte(
         chained=chain_o is not None,
         v_token_major=v_token_major,
         prior_full=prior_full,
+        rowmax_vec=bool(rowmax_vec),
         seqlen_q=seqlen_q,
         seqlen_k_active=seqlen_k_active,
         seqlen_k_prior=seqlen_k_prior,
@@ -1074,6 +1103,10 @@ def _attention_cte(
     # Shard on batch size while it is divisible (if not sharded, num_shard = 1, shard_id = 0)
     num_bs_per_shard = bs // num_shard
     bs_offset = shard_id * num_bs_per_shard
+    one_core = bool(one_core) and num_shard > 1
+    if one_core:  # lingbot: every head on program 0, see attention_cte
+        num_bs_per_shard = bs if shard_id == 0 else 0
+        bs_offset = 0
 
     for batch_idx in range(num_bs_per_shard):
         # When using SBUF KV (from segmented_cte):
@@ -1113,7 +1146,7 @@ def _attention_cte(
             chain_neg_max=chain_neg_max,
             chain_sum=chain_sum,
         )
-    has_remainder = (bs % num_shard) != 0
+    has_remainder = (bs % num_shard) != 0 and not one_core
     last_batch = bs - 1
 
     # shard on seqlen_q for the remainder bs
@@ -1283,6 +1316,7 @@ class AttnConfig(nl.NKIObject):
     chained: bool = False  # lingbot: continue an earlier call's softmax (chain_o / _neg_max / _sum)
     v_token_major: bool = False  # lingbot: V memory is [seqlen, bs_kv, d], see attention_cte
     prior_full: bool = False  # lingbot: the whole prior is used on every call, see attention_cte
+    rowmax_vec: bool = False  # lingbot: row-max evicts on Vector even under LINGBOT_CTE_SCALAR_ROWMAX
 
 
 def _attention_cte_impl(
@@ -4436,7 +4470,7 @@ def _qk_and_max_large_tile_impl(
     # element than nisa.tensor_scalar_reduce for a PSUM read + scale + fused max, so moving the evict
     # to Scalar is slower even where Scalar is otherwise free. The placement logic is retained in
     # _row_max_on_scalar and the chaining below is engine-independent; only the engine choice is off.
-    use_scalar_row_max = _SCALAR_ROWMAX  # lingbot: was False
+    use_scalar_row_max = _SCALAR_ROWMAX and not ac.rowmax_vec  # lingbot: was False
     row_max_chains = _row_max_chain_endpoints(k_tile_selections, ac, atp, qkmax_grp, use_scalar_row_max)
     for k_tile_idx in range(_NUM_K_TILES_IN_LARGE_TILE):
         tile, should_process = k_tile_selections[k_tile_idx]

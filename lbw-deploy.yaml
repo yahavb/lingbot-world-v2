@@ -126,7 +126,7 @@ spec:
           env:
             - name: CACHE_VERSION
               # bump on every pull of new model/kernel code (cache dir /opt/lingbot-world-v2/cache/v<N>)
-              value: "4"
+              value: "6"
             - name: BRANCH
               value: "main"
             - name: SEG_CHUNKS

@@ -215,6 +215,46 @@ def main():
     else:
         video_local = _decode(latent_local)
 
+    # LINGBOT_VAE_REPEAT=n (diagnostic, with --timing): n more decodes of the same latents; rank 0 scores each one's
+    # frames against LINGBOT_VAE_REPEAT_REF (uint8 [F, H, W, 3] frames.pt, default the gate's R) and logs a REPEAT
+    # line (decode ms, PSNR, frames below 50 dB): how often an intermittent decode error occurs, in one process.
+    _rep = int(os.environ.get("LINGBOT_VAE_REPEAT", "0") or 0)
+    if _rep and args.timing:
+        import math
+        _two_d_r = _two_d
+        _ref = None
+        if rank == 0:
+            _ref = torch.load(os.environ.get("LINGBOT_VAE_REPEAT_REF",
+                                             "/node-cache/e2e/gate/r480_ex03_s42/frames.pt")).float()
+            _ref = _ref.permute(1, 2, 3, 0) if _ref.shape[0] == 3 else _ref
+        _nbad = 0
+        for _i in range(_rep):
+            if dist.is_initialized():
+                dist.barrier()
+            t0 = time.perf_counter()
+            _v = _decode(latent_local)
+            _device_sync()
+            if dist.is_initialized():
+                dist.barrier()
+            _dt = (time.perf_counter() - t0) * 1000.0
+            if _two_d_r:
+                from wan.modules.vae2_1_fused import gather_video_2d
+                _vf = gather_video_2d(_v)
+            else:
+                _vf = gather_video_width(_v)
+            if rank == 0:
+                if _pad_w != _lat_w:
+                    _vf = _vf[..., :_lat_w * cfg.vae_stride[2]]
+                _fr = ((_vf.float().clamp(-1, 1) + 1) * 127.5).round().permute(1, 2, 3, 0)
+                _d = (_fr - _ref).pow(2)
+                _per = _d.mean((1, 2, 3)).tolist()
+                _ps = 10 * math.log10(255 ** 2 / max(_d.mean().item(), 1e-12))
+                _bad = [j for j, v in enumerate(_per) if 10 * math.log10(255 ** 2 / max(v, 1e-12)) < 50]
+                _nbad += bool(_bad)
+                logging.info(f"REPEAT {_i} ms={_dt:.0f} psnr={_ps:.2f} bad_frames={_bad}")
+        if rank == 0:
+            logging.info(f"REPEAT summary: {_nbad} of {_rep} decodes with frames below 50 dB")
+
     _tg = time.perf_counter()
     if _two_d:
         from wan.modules.vae2_1_fused import gather_video_2d

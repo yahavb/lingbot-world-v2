@@ -22,6 +22,9 @@ _GROUPS = {}
 # graph, which is what lets them compile whole 40-block stacks at fullgraph=True.
 _MESH = None
 _MESH_DIMS = {}
+# LINGBOT_FFN_TP2=1: a second mesh (cp, tph, tpl) over the same ranks, its "tpl" submesh the PAIRS of adjacent TP
+# ranks (TP rank = 2 * tph + tpl), for the FFN's all-gather / reduce-scatter over 2 ranks instead of 4.
+_MESH_PAIR = None
 
 
 def init_mesh_groups(cp, tp, device_type="neuron", names=None, cp_fast=False):
@@ -60,6 +63,10 @@ def init_mesh_groups(cp, tp, device_type="neuron", names=None, cp_fast=False):
     else:
         _MESH = init_device_mesh(device_type, (cp, tp), mesh_dim_names=("cp", "tp"))
     _MESH_DIMS = {"cp": cp, "tp": tp}
+    global _MESH_PAIR
+    if os.environ.get("LINGBOT_FFN_TP2", "0") == "1" and tp == 4 and not cp_fast:
+        _MESH_PAIR = init_device_mesh(device_type, (cp, 2, tp // 2), mesh_dim_names=("cp", "tph", "tpl"))
+        _MESH_DIMS["tpl"] = tp // 2
     # Register the submeshes' OWN ProcessGroups under `names`, so the eager
     # dist.* call sites and the compiled functional collectives use the same
     # partition BY CONSTRUCTION.
@@ -87,6 +94,8 @@ def mesh_submesh(dim):
     """The DeviceMesh submesh for "tp"/"cp", or None when no mesh was built."""
     if _MESH is None or _MESH_DIMS.get(dim, 1) <= 1:
         return None
+    if dim == "tpl":
+        return _MESH_PAIR["tpl"] if _MESH_PAIR is not None else None
     return _MESH[dim]
 
 
