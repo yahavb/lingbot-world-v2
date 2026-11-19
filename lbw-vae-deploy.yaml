@@ -41,7 +41,9 @@ spec:
               C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}
               export NEURON_COMPILE_CACHE_URL=$C/neuron-compile-cache TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
               export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache HF_HOME=/tmp/hf-cache
-              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR"
+              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR" "$C/nki-intermediate-cache"
+              # compiled graphs reference NKI kernel binaries by path under /var/tmp: keep them with the cache
+              rm -rf /var/tmp/nki-intermediate-cache && ln -s "$C/nki-intermediate-cache" /var/tmp/nki-intermediate-cache
               pip install -q -r requirements_neuron.txt fastapi uvicorn
               python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
               NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun --nproc_per_node="$NPROC" vae_serve.py \
@@ -100,7 +102,7 @@ spec:
             - name: BRANCH
               value: "serve-2chip"
             - name: CACHE_VERSION
-              value: "2"
+              value: "5"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NPROC

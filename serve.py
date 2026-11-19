@@ -546,7 +546,7 @@ def main():
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
             x0_dev = x0
-            x0 = x0.cpu() if (rank == 0 and rdma is None) or (rank == 0 and (SAVE_LATENTS or SERVE_STATS)) else x0
+            x0 = x0.cpu() if (rank == 0 and (rdma is None or SAVE_LATENTS)) else x0
             if rank == 0 and SAVE_LATENTS:
                 # LINGBOT_SERVE_SAVE_LATENTS=<dir>: every chunk's latents, to decode a live session
                 # offline (decode_latents_width_sharded.py) and compare with the inline VAE's frames

@@ -49,7 +49,9 @@ spec:
               export TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
               export NKI_ENABLE_TRACE_CACHE="${NKI_ENABLE_TRACE_CACHE:-1}"
               export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache
-              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR"
+              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR" "$C/nki-intermediate-cache"
+              # compiled graphs reference NKI kernel binaries by path under /var/tmp: keep them with the cache
+              rm -rf /var/tmp/nki-intermediate-cache && ln -s "$C/nki-intermediate-cache" /var/tmp/nki-intermediate-cache
               echo "neff cache on node (v$CACHE_VERSION): $(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' 2>/dev/null | wc -l) NEFFs"
               export HF_HOME=/tmp/hf-cache
 
@@ -177,7 +179,7 @@ spec:
               value: "1"
             - name: CACHE_VERSION
               # bump on every pull of new model/kernel code (cache dir /opt/lingbot-world-v2/cache/v<N>)
-              value: "2"
+              value: "5"
             - name: FI_PROVIDER
               value: "efa"
             - name: FI_EFA_USE_DEVICE_RDMA
