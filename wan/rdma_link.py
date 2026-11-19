@@ -76,3 +76,10 @@ class RdmaLink:
         """Post a receive into device tensor t from the peer; returns the Work."""
         self.tag += 1
         return self.pg.recv([t], self.peer, self.tag)
+
+    def close(self):
+        """Abort this link's native group (torchft aborts a generation before it builds the next)."""
+        try:
+            self.pg.abort()
+        except Exception as e:  # a dead peer can make abort itself fail; the link is gone either way
+            logging.warning(f"rdma link gen {self.gen}: abort: {type(e).__name__}: {e}")
