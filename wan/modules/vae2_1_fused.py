@@ -343,6 +343,14 @@ _NKI_CONV_RES = os.environ.get("LINGBOT_VAE_NKI_CONV_RES", "0") == "1"
 # frames in about half the decodes (always from frame 5 of an 8-frame step); with LA=0 8 and 12 frames are clean but
 # 16 frames (LINGBOT_VAE_T=4) corrupt 3 of 12. The production 4 frames per call (LINGBOT_VAE_T=1) was clean in every run.
 _NKI_CONV_TMAX = int(os.environ.get("LINGBOT_VAE_NKI_CONV_TMAX", "0") or 0)
+# LINGBOT_VAE_HEAD_NKILIB=1 (with LINGBOT_VAE_NKI_HALO): the output conv (96 -> 3) as nkilib's experimental conv3d on the
+# halo kernel's buffer (kernels/vae_norm_halo.py: norm + SiLU + halo + cache) instead of the fused norm + conv kernel.
+# One core, stage-3 shape, conv only (perf/conv3d_nkilib_ab.py): nkilib conv3d 499 us, flat-shift 1121, compiler 2286.
+_HEAD_NKILIB = os.environ.get("LINGBOT_VAE_HEAD_NKILIB", "0") == "1"
+if _HEAD_NKILIB:
+    from nkilib.experimental.conv.conv3d import conv3d as _nkl_conv3d
+    from torch_neuronx.nki_hop import wrap_nki as _wrap_nki
+    _nkl_conv3d = _wrap_nki(_nkl_conv3d)
 if _NKI_CONV != "0":
     from kernels.vae_norm_halo_conv import norm_halo_conv as _nki_norm_halo_conv
     from kernels.vae_head_conv import head_conv_weights as _nki_conv_w
@@ -385,6 +393,13 @@ def _nh_conv(x, cache, gamma, scale, w, b, sel, nki_conv=False, head=False, res=
     xb = x.to(torch.bfloat16)
     l, r, u, d = _raw_edges_2d(xb, sel)
     c = x.shape[1]
+    if head and _HEAD_NKILIB and b is not None:
+        # LINGBOT_VAE_HEAD_NKILIB: the halo kernel's buffer [C, T + 2, H + 2, W + 2], then nkilib conv3d (valid padding)
+        buf = _nki_norm_halo(xb[0], l[0], r[0], u[0], d[0], cache[0].to(torch.bfloat16),
+                             gamma.float().reshape(c, 1) * scale)
+        wk = w.to(torch.bfloat16).permute(2, 3, 4, 1, 0).contiguous()          # [K_d, K_h, K_w, C_in, C_out]
+        y = _nkl_conv3d(buf.unsqueeze(0), wk, b.to(torch.bfloat16))
+        return y, buf[:, -2:].unsqueeze(0)
     if _nh_fused(x, w, b, head):
         T = int(xb.shape[2])
         if _NKI_CONV_TMAX and T > _NKI_CONV_TMAX:
