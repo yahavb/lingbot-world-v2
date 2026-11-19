@@ -24,7 +24,7 @@ import torch.distributed as dist
 class RdmaLink:
     """role "dit" (group rank 0, store client) or "vae" (group rank 1, store host)."""
 
-    def __init__(self, role, dit_world, store=None, timeout_s=600):
+    def __init__(self, role, dit_world, store=None, timeout_s=None):
         from torch._C._distributed_c10d import Backend as CBackend
         from torch_neuronx.distributed.cpp_backend import create_neuron_cpp_backend
 
@@ -32,7 +32,8 @@ class RdmaLink:
         host, port = (store or os.environ["RDMA_STORE"]).rsplit(":", 1)
         self.rank = 0 if role == "dit" else 1
         self.peer = 1 - self.rank
-        timeout = timedelta(seconds=timeout_s)
+        # long enough that the two pods can start in any order (each warms up first)
+        timeout = timedelta(seconds=timeout_s or int(os.environ.get("RDMA_TIMEOUT_S", "3600")))
         self.store = dist.TCPStore(host if role == "dit" else "0.0.0.0", int(port), 2,
                                    is_master=(role == "vae"), timeout=timeout,
                                    wait_for_workers=False)
