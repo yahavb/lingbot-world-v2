@@ -35,9 +35,19 @@
   #controls { left: 10px; bottom: 10px; display: flex; gap: 8px; align-items: end; }
   .pad { display: grid; grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(3, 34px); gap: 4px; }
   .side { display: grid; gap: 4px; }
-  #muse { right: 10px; top: 10px; display: grid; justify-items: end; gap: 6px; max-width: 46%; }
-  #caption { margin: 0; padding: 6px 10px; text-align: left; }
-  #caption:empty { display: none; }
+  /* Muse Glimmer as a rolling terminal in the top-right quarter: newest line at the bottom, older ones
+     scroll up and fade out at the top */
+  #muse { right: 10px; top: 10px; width: 42%; height: 25%; padding: 6px 10px; display: flex;
+    flex-direction: column; justify-content: flex-end; overflow: hidden;
+    background: rgba(5, 10, 16, .42); text-shadow: 0 0 4px rgba(0, 0, 0, .9);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 22%); mask-image: linear-gradient(to bottom, transparent 0, #000 22%); }
+  #muse .ln { color: #f2f8ff; }
+  #muse .ln { margin: 2px 0; white-space: pre-wrap; animation: rise .35s ease-out; }
+  #muse .ts { color: #7fd4ff; }
+  #muse .pr { color: #6fff9c; }
+  #muse .cur::after { content: "\2588"; animation: blink 1s steps(1) infinite; color: #6fff9c; }
+  @keyframes rise { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes blink { 50% { opacity: 0; } }
   #status { color: var(--muted); min-height: 1.5em; }
   textarea { width: 100%; }
   kbd { background: #333; border-radius: 4px; padding: 0 6px; }
@@ -57,9 +67,7 @@
   <div id="view">
     <img id="frame" alt="Live generated video">
     <div id="hud" class="glass" aria-hidden="true"></div>
-    <div id="muse" class="overlay" role="group" aria-label="Content check">
-      <p id="caption" class="glass" aria-live="polite"></p>
-    </div>
+    <div id="muse" class="overlay glass" role="log" aria-live="polite" aria-label="Muse Glimmer"></div>
     <div id="controls" class="overlay" role="group" aria-label="Camera controls">
       <div class="pad">
         <span></span><button class="glass hudbtn" data-action="forward" aria-label="Forward">&#9650;</button><span></span>
@@ -246,15 +254,31 @@ document.addEventListener("keydown", (e) => {
 window.addEventListener("pagehide", () => navigator.sendBeacon && navigator.sendBeacon("api/stop"));
 // Content eval: Muse-Glimmer-30B describes the last ~3 s of the stream (/api/describe).
 let describing = false;
+const MUSE_LINES = 8;
+function museLine(text) {
+  // one terminal line: [hh:mm:ss] muse-glimmer$ text, typed out, newest at the bottom
+  const box = $("muse"), ln = document.createElement("div");
+  ln.className = "ln";
+  const ts = document.createElement("span"); ts.className = "ts";
+  ts.textContent = `[${new Date().toTimeString().slice(0, 8)}] `;
+  const pr = document.createElement("span"); pr.className = "pr"; pr.textContent = "muse-glimmer$ ";
+  const tx = document.createElement("span"); tx.className = "cur";
+  ln.append(ts, pr, tx);
+  for (const c of box.querySelectorAll(".cur")) c.classList.remove("cur");
+  box.append(ln);
+  while (box.children.length > MUSE_LINES) box.firstChild.remove();
+  let i = 0;
+  (function type() { tx.textContent = text.slice(0, ++i); if (i < text.length) setTimeout(type, 18); })();
+}
 async function describe() {
   if (describing) return;
   describing = true;
   try {
     const r = await fetch("api/describe", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const j = await r.json();
-    $("caption").textContent = r.ok ? `Muse Glimmer: ${j.text}` : `Muse Glimmer: ${j.detail || r.status}`;
+    museLine(r.ok ? j.text : `error: ${j.detail || r.status}`);
   } catch (e) {
-    $("caption").textContent = `Muse Glimmer: ${e.message}`;
+    museLine(`error: ${e.message}`);
   } finally { describing = false; }
 }
 // Every DESCRIBE_S seconds while frames are streaming, Muse Glimmer describes what is on screen; the caption
