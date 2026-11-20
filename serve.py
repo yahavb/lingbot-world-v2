@@ -438,14 +438,28 @@ def main():
     from wan.image2video import pre_encode_condition
     scene_imgs = {}
     t0 = time.perf_counter()
+    # LINGBOT_SCENES=03,00: pre-encode only these scenes (each 720p encode is ~2 GB of device memory per rank).
+    # LINGBOT_PRE_ENCODE_RANK0=1: rank 0 encodes, every other rank receives the latents: at 720p all four ranks
+    # of a chip encoding at once ran out of device memory.
+    only = [x for x in os.environ.get("LINGBOT_SCENES", "").split(",") if x]
+    rank0_only = os.environ.get("LINGBOT_PRE_ENCODE_RANK0", "0") == "1"
+    from wan.image2video import _PRE_ENCODED
     for sid in sorted(os.listdir("examples")):
         d = f"examples/{sid}"
         if not (sid.isdigit() and os.path.isfile(f"{d}/image.jpg") and os.path.isfile(f"{d}/poses.npy")):
             continue
+        if only and sid not in only:
+            continue
         scene_imgs[sid] = load_image(f"{d}/image.jpg")
+        if rank0_only and rank != 0:
+            continue
         pre_encode_condition(os.path.join(args.ckpt_dir, cfg.vae_checkpoint), dev, scene_imgs[sid], d,
                              args.frame_num, args.chunk_size, MAX_AREA_CONFIGS[args.size],
                              EXACT_GRID_SIZES.get(args.size), cfg.vae_stride, cfg.patch_size)
+    if rank0_only:
+        box = [dict(_PRE_ENCODED) if rank == 0 else None]
+        dist.broadcast_object_list(box, src=0)
+        _PRE_ENCODED.update(box[0])
     dist.barrier()
     if rank == 0:
         logging.info(f"pre-encoded scenes {sorted(scene_imgs)} in {time.perf_counter() - t0:.1f} s")

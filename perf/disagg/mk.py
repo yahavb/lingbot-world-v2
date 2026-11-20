@@ -112,6 +112,9 @@ def dit(a):
     env_set(c, "TP", TP)
     env_set(c, "CP", nproc // TP)
     env_set(c, "SIZE", a.size)
+    if a.size != "480*768":
+        env_set(c, "LINGBOT_SCENES", "03,00")          # pre-encode only the measured scene + the warmup's second
+        env_set(c, "LINGBOT_PRE_ENCODE_RANK0", "1")
     env_set(c, "CACHE_VERSION", a.cache or f"{a.flags}{a.chips}")   # one cache per flag set x chip count
     # ranks loading the checkpoint at once: all 64 at 16 chips exceeded 950 GiB of host memory (OOMKilled)
     env_set(c, "LINGBOT_LOAD_CONCURRENCY", nproc if a.flags == "t22" else min(nproc, 16))
