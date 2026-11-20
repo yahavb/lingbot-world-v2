@@ -54,3 +54,16 @@ p9_emit1_r1_480: fps 15.53 over 55 chunks, dit_ms 550.8, vae_ms 129.5
 p9_emit0_r1_480: fps 14.24 over 55 chunks, dit_ms 552.6, vae_ms 151.1
 p9_emit1_r2_480: fps 15.55 over 55 chunks, dit_ms 550.5, vae_ms 127.2
 p9_emit0_r2_480: fps 14.18 over 55 chunks, dit_ms 553.3, vae_ms 152.4
+p10_devprof_emit_480: fps 15.50 over 15 chunks, dit_ms 551.9, vae_ms 146.3
+nm_alone_n2a: fps 10.08 over 25 chunks, dit_ms 742.3, vae_ms 488.1
+nm_pair_n2a: fps 10.07 over 25 chunks, dit_ms 745.0, vae_ms 487.1
+nm_pair_n2b: fps 10.06 over 25 chunks, dit_ms 744.1, vae_ms 650.1
+nm2_N1_a: fps 10.07 over 55 chunks, dit_ms 743.1, vae_ms 486.2
+nm2_N2_b: fps 10.06 over 55 chunks, dit_ms 746.6, vae_ms 722.9
+nm2_N2_a: fps 10.06 over 55 chunks, dit_ms 744.6, vae_ms 486.2
+nm2_N3_c: fps 10.08 over 55 chunks, dit_ms 741.8, vae_ms 487.2
+nm2_N3_b: fps 10.08 over 55 chunks, dit_ms 744.3, vae_ms 604.5
+nm2_N3_a: fps 10.08 over 55 chunks, dit_ms 745.2, vae_ms 832.7
+nm4_N1_a: fps 17.52 over 55 chunks, dit_ms 434.9, vae_ms 393.7
+nm4_N2_a: fps 17.53 over 55 chunks, dit_ms 435.9, vae_ms 390.3
+nm4_N2_b: fps 17.54 over 55 chunks, dit_ms 431.3, vae_ms 595.9

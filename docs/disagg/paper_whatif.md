@@ -217,7 +217,9 @@ decoder pool 0 → N under load [H].
 
 Claims
 - C1 Rate matching works in both directions. Slow DiT relative to the decoder: one decoder replica serves several DiT
-  replicas (N:1) [H: SA3 one VAE for 1/2/4/8 DiT jobs at 25 steps; LingBot one VAE, 4 sessions, 1-3 streams; running].
+  replicas (N:1). [M LingBot, one 1-chip VAE, LINGBOT_VAE_SESSIONS=4: 1/2/3 streams of 2-chip DiTs 10.07 / 10.06 / 10.08
+  fps each; 1/2 streams of 4-chip DiTs 17.52 / 17.53 fps each; frames byte-identical alone vs shared; only the decode
+  latency grows with queueing, 486 -> 723 -> 833 ms.] [H: SA3 one VAE for 1/2/4/8 DiT jobs at 25 steps; running].
   Fast DiT relative to the decoder: one DiT needs more decoder capacity (bigger or more decoder replicas) [M: SA3 at 2
   steps, 1800 s audio: monolith 3.06 s, 2 DiT + 1 VAE chip 3.75 s (VAE-bound, loses), 2 + 2 VAE chips 2.51 s (1.22x)].
 - C2 The binding side is predicted by T_d vs T_v, which the step count moves [M: SA3 2-chip DiT, 1800 s: 8 steps
@@ -226,7 +228,7 @@ Claims
   the field raises the value of disaggregation.
 - C3 Memory term of N:M: the decoder's weights are small next to a chip's HBM (Wan2.1 VAE ~0.25 GB bf16, estimate), so
   one decoder chip holds M sessions' causal caches while it has compute to spare; the DiT fills its chips with weights +
-  KV cache (720p co-located 8 chips does not fit [M]) [H: per-session cache bytes and HBM vs M, vae_serve [SESSIONS]].
+  KV cache (720p co-located 8 chips does not fit [M]) [M: 427 MiB causal cache per session per rank; 4 sessions 1.7 GiB; the VAE rank's device use ~3 GiB].
 
 Considerations
 - K1 Sizing is a deploy-time decision. Steps, resolution / window length, chunk size and model are fixed per service
