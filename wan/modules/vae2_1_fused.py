@@ -54,6 +54,25 @@ def apply_vae_cc_flags():
     return extra
 
 
+class vae_cc_scope:
+    """LINGBOT_VAE_CC_FLAGS for the compiles inside the block only, then NEURON_CC_FLAGS as it was. A process that
+    also compiles the DiT (serve.py's inline decode) must use this, not apply_vae_cc_flags(): in a monolith the
+    process-wide version built every DiT graph compiled after the first decode with the VAE's options
+    (-O1 --model-type=unet-inference), and the 16-chip DiT ran 2.1x slower (619 vs 299 ms per chunk)."""
+
+    def __enter__(self):
+        self.prev = os.environ.get("NEURON_CC_FLAGS")
+        apply_vae_cc_flags()
+        return self
+
+    def __exit__(self, *exc):
+        if self.prev is None:
+            os.environ.pop("NEURON_CC_FLAGS", None)
+        else:
+            os.environ["NEURON_CC_FLAGS"] = self.prev
+        return False
+
+
 def _init_mesh():
     global _MESH, _PD
     if _MESH is None:

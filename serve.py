@@ -528,10 +528,13 @@ def main():
         from wan.modules import vae2_1_fused as F
         if not _fused_vae:
             from wan.modules.vae2_1 import Wan2_1_VAE
-            extra = F.apply_vae_cc_flags()
-            v = Wan2_1_VAE(vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=dev,
-                           dtype=torch.bfloat16)
-            _fused_vae.update(vae=v, fdec=F.FusedWidthDecoder(v.model))
+            # the VAE's compiler options apply only inside decode_local_fused (F.vae_cc_scope below); the old
+            # process-wide F.apply_vae_cc_flags() leaked them into every later DiT compile
+            extra = os.environ.get("LINGBOT_VAE_CC_FLAGS", "").replace("+", " ").strip()
+            with F.vae_cc_scope():
+                v = Wan2_1_VAE(vae_pth=os.path.join(args.ckpt_dir, cfg.vae_checkpoint), device=dev,
+                               dtype=torch.bfloat16)
+                _fused_vae.update(vae=v, fdec=F.FusedWidthDecoder(v.model))
             if rank == 0:
                 logging.info(f"inline fused VAE decoder, {'2-D tiles' if F._TWO_D else 'width slices'}"
                              + (f", compiler flags + {extra}" if extra else ""))
@@ -545,7 +548,8 @@ def main():
             if rank == 0:
                 for t in range(video.shape[1]):
                     emit(b64_jpeg(to_pil(video[:, t])))
-        fdec.decode_chunk(local.unsqueeze(0), v.scale, chunk_id == 0, on_step=step)
+        with F.vae_cc_scope():      # VAE compiler options for the decoder's graphs only, never the DiT's
+            fdec.decode_chunk(local.unsqueeze(0), v.scale, chunk_id == 0, on_step=step)
         dist.barrier()
 
     def decode_local(chunk_id, x0, emit):
