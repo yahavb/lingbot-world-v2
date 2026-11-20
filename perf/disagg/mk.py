@@ -144,6 +144,7 @@ def dit(a):
         assert old in cmd
         c["command"][2] = cmd.replace(old, 'torchrun --nproc_per_node="$NPROC" --no-python bash perf/sysprof_rank0.sh python3 serve.py')
         env_set(c, "SYSPROF_DIR", "/logs/sysprof")
+        c.pop("livenessProbe", None)     # the server is stopped on purpose before the captures
         # keep the container (and an idle device) after the server stops, so the NEFF+NTFF captures can run in it
         c["command"][2] = c["command"][2].replace('NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun', 'set +e\n              NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun') + "\n              echo SERVER STOPPED; sleep infinity\n"
     for kv in a.env:
