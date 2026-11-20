@@ -190,9 +190,24 @@ def serve_fused(args, cfg, dev, rank):
         # copied unless it is the only session (LINGBOT_VAE_SESSIONS=1 keeps the old, copy-free path)
         from wan.nixl_link import SESSIONS
         caches[sid] = _clone(fdec._caches) if SESSIONS > 1 else fdec._caches
+        if rank == 0 and first and SESSIONS > 1:
+            nb = _nbytes(caches[sid])
+            logging.info(f"[SESSIONS] session {sid}: causal cache {nb / 2**20:.1f} MiB on this rank; "
+                         f"{len(caches)} sessions hold {sum(_nbytes(c) for c in caches.values()) / 2**20:.1f} MiB; "
+                         f"device allocated {torch.neuron.memory_allocated() / 2**30:.2f} GiB" if hasattr(torch.neuron, "memory_allocated") else "")
         dist.barrier()
 
     serve_loop(decode, args, rank)
+
+
+def _nbytes(x):
+    if isinstance(x, torch.Tensor):
+        return x.numel() * x.element_size()
+    if isinstance(x, (list, tuple)):
+        return sum(_nbytes(v) for v in x)
+    if isinstance(x, dict):
+        return sum(_nbytes(v) for v in x.values())
+    return 0
 
 
 def _clone(x):

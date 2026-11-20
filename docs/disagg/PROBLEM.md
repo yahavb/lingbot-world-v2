@@ -56,6 +56,12 @@ not scale (co-location wastes chips on it); SA3's DiT does not scale past 2 chip
 VAE busy fraction with one VAE chip: LingBot ~70% of the 8-chip DiT period (324 of 465 ms), ~87% at 16 chips;
 SA3 ~70% (0.56 of 0.8 s a window): at these settings one VAE cannot serve two DiTs.
 
+**Memory term of rate matching (user, 2026-11-20).** The decoder's weights are small next to a chip's HBM (Wan2.1 VAE
+~0.13B parameters, ~0.25 GB bf16, estimate), so a decoder replica on one chip has room for M sessions' causal caches
+while it has compute to spare; the DiT is the opposite (weights + KV cache fill 2-4 chips; the 720p co-located 8-chip
+config does not fit). N:M is a compute AND a memory argument: measure per-session cache bytes and HBM in use vs M
+([SESSIONS] lines in vae_serve.py).
+
 ### Experiments to confirm it
 1. Device profiles of a DiT block and a VAE conv NEFF: Tensor-engine busy, achieved vs peak TFLOPs, DMA time
    (is each stage compute-bound?).
