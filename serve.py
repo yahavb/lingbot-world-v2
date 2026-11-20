@@ -63,6 +63,16 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "90"))
 SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
+NULL_DECODE = os.environ.get("LINGBOT_NULL_DECODE", "0") == "1"
+NULL_FRAMES = lambda c: 4 * int(os.environ.get("CHUNK_SIZE", "3")) - (3 if c == 0 else 0)   # 9, then 12 per chunk
+
+
+@__import__('functools').lru_cache(None)
+def _null_jpeg():
+    from PIL import Image
+    b = io.BytesIO()
+    Image.new("RGB", (64, 64), (40, 40, 40)).save(b, "JPEG")
+    return base64.b64encode(b.getvalue()).decode()
 VAE_POOL = {}       # rank 0, LINGBOT_VAE_RDMA=1: {"pool": wan.vae_pool.VaePool} (the routes read it)
 # LINGBOT_REANCHOR_FRAMES=N (live sessions): every ~N frames, end the generation and start a new one from the
 # last frame on screen, same prompt and camera. A long rollout drifts (positions keep growing, the memory
@@ -580,7 +590,14 @@ def main():
 
             def emit(frame, _c=chunk_id + state.get("chunk_base", 0)):
                 job_emit(frame, _c, action, dict(times, dec=time.time()))
-            if VAE_URL is None:
+            if NULL_DECODE:
+                # LINGBOT_NULL_DECODE=1: DiT only (phase characterization): no VAE; rank 0 emits one constant
+                # frame per video frame once the latent exists, so the client measures the DiT's pace
+                if rank == 0:
+                    x0_dev.sum().item()               # the chunk's latents are really done
+                    for _ in range(NULL_FRAMES(chunk_id)):
+                        emit(_null_jpeg())
+            elif VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None and rdma is not None:
                 try:
