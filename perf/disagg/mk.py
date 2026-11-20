@@ -38,27 +38,45 @@ def env_del(c, name):
 
 
 def claim(n):
-    """n Neuron devices at LNC2, each with its own paired EFA (devicegroup1_id), all in one device group."""
-    reqs, cons = [], []
-    for i in range(n):
-        reqs.append({"name": f"neurons-{i}", "exactly": {
-            "allocationMode": "ExactCount", "count": 1, "deviceClassName": "neuron.aws.com",
-            "selectors": [{"cel": {"expression":
-                "device.attributes['neuron.aws.com'].instanceType == 'trn3-dev1.48xlarge'"}}]}})
-        reqs.append({"name": f"efas-{i}", "exactly": {
-            "allocationMode": "ExactCount", "count": 1, "deviceClassName": "efa.networking.k8s.aws"}})
-        cons.append({"matchAttribute": "resource.aws.com/devicegroup1_id", "requests": [f"neurons-{i}", f"efas-{i}"]})
-    if n in (2, 4, 8):
-        cons.append({"matchAttribute": f"resource.aws.com/devicegroup{n}_id",
-                     "requests": [r["name"] for r in reqs]})
+    """n Neuron devices at LNC2 and the n EFAs of the same device group (devicegroup<n>_id: a group holds its
+    devices' paired EFAs, so every device's own EFA is in the claim; 16 = the whole node). Count requests:
+    the per-device pairing constraints (one request per device) time out the scheduler at 16."""
+    if n <= 2:
+        return claim_paired(n)
+    group = f"devicegroup{n}_id"      # trn3-dev1 has devicegroup 1, 4, 8, 16
+    sel = [{"cel": {"expression": "device.attributes['neuron.aws.com'].instanceType == 'trn3-dev1.48xlarge'"}}]
+    reqs = [{"name": "neurons", "exactly": {"allocationMode": "ExactCount", "count": n,
+                                            "deviceClassName": "neuron.aws.com", "selectors": sel}},
+            {"name": "efas", "exactly": {"allocationMode": "ExactCount", "count": n,
+                                         "deviceClassName": "efa.networking.k8s.aws"}}]
+    cons = [{"matchAttribute": f"resource.aws.com/{group}", "requests": ["neurons", "efas"]}] if group else []
     return {"apiVersion": "resource.k8s.io/v1", "kind": "ResourceClaimTemplate",
             "metadata": {"name": f"x-lnc2-efa-{n}", "namespace": "default"},
             "spec": {"spec": {"devices": {
                 "requests": reqs, "constraints": cons,
-                "config": [{"requests": [f"neurons-{i}" for i in range(n)], "opaque": {
+                "config": [{"requests": ["neurons"], "opaque": {
                     "driver": "neuron.aws.com",
                     "parameters": {"apiVersion": "neuron.aws.com/v1", "kind": "NeuronConfig",
                                    "logicalNeuronCore": 2}}}]}}}}
+
+
+def claim_paired(n):
+    """n (1 or 2) devices, each with its own EFA (devicegroup1_id), all in one devicegroup4."""
+    reqs, cons = [], []
+    sel = [{"cel": {"expression": "device.attributes['neuron.aws.com'].instanceType == 'trn3-dev1.48xlarge'"}}]
+    for i in range(n):
+        reqs += [{"name": f"neurons-{i}", "exactly": {"allocationMode": "ExactCount", "count": 1,
+                                                      "deviceClassName": "neuron.aws.com", "selectors": sel}},
+                 {"name": f"efas-{i}", "exactly": {"allocationMode": "ExactCount", "count": 1,
+                                                   "deviceClassName": "efa.networking.k8s.aws"}}]
+        cons.append({"matchAttribute": "resource.aws.com/devicegroup1_id", "requests": [f"neurons-{i}", f"efas-{i}"]})
+    if n > 1:
+        cons.append({"matchAttribute": "resource.aws.com/devicegroup4_id", "requests": [r["name"] for r in reqs]})
+    return {"apiVersion": "resource.k8s.io/v1", "kind": "ResourceClaimTemplate",
+            "metadata": {"name": f"x-lnc2-efa-{n}", "namespace": "default"},
+            "spec": {"spec": {"devices": {"requests": reqs, "constraints": cons, "config": [{
+                "requests": [f"neurons-{i}" for i in range(n)], "opaque": {"driver": "neuron.aws.com",
+                "parameters": {"apiVersion": "neuron.aws.com/v1", "kind": "NeuronConfig", "logicalNeuronCore": 2}}}]}}}}
 
 
 def rename(d, name):
