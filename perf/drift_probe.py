@@ -86,7 +86,9 @@ def main():
         mid = fr[len(fr) // 2]
         if first is None:
             first = np.asarray(mid.convert("RGB"), dtype=np.float32) / 255.0
-        ms = [metrics(f, first) for f in fr]
+        # one frame per chunk: metrics on all 12 cost ~45 ms a frame (480x768) and capped the client at ~22 fps,
+        # below what the server produces; the frame count and timing still cover every frame
+        ms = [metrics(mid, first)]
         row = {"chunk": chunk, "frames": len(fr), "t": round(time.time() - t0, 2)}
         e = tim.get(chunk, {})
         if e.get("start") and e.get("x0"):
