@@ -119,7 +119,9 @@ def dit(a):
         c["resources"]["limits"]["memory"] = "1600Gi"
     if a.mode == "split":
         env_set(c, "VAE_URL", f"http://{a.vae_app}.default.svc.cluster.local:8000")
-        env_set(c, "VAE_SELECTOR", f"app={a.vae_app}")
+        # the DiT uses the VAE pods labelled pool=<its name> (kubectl label pod ... pool=NAME): VAEs move between
+        # DiTs by relabelling, with no restart (wan/vae_pool.py lists pods by this selector every 5 s)
+        env_set(c, "VAE_SELECTOR", f"pool={a.name}")
     else:
         for k in ("VAE_URL", "VAE_SELECTOR", "LINGBOT_VAE_RDMA"):
             env_del(c, k)
