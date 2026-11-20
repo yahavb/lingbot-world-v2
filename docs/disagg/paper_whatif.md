@@ -213,6 +213,40 @@ per stream-hour: the Pareto frontier of co-located against disaggregated.
 **6.8 Resilience.** Decoder pod deletion and device-fault taint: ~3 s switch, 140/140 chunks [M]. Scaling the
 decoder pool 0 → N under load [H].
 
+## Claims, considerations and constraints (added 2026-11-20, from the SA3 step sweeps and N:M work)
+
+Claims
+- C1 Rate matching works in both directions. Slow DiT relative to the decoder: one decoder replica serves several DiT
+  replicas (N:1) [H: SA3 one VAE for 1/2/4/8 DiT jobs at 25 steps; LingBot one VAE, 4 sessions, 1-3 streams; running].
+  Fast DiT relative to the decoder: one DiT needs more decoder capacity (bigger or more decoder replicas) [M: SA3 at 2
+  steps, 1800 s audio: monolith 3.06 s, 2 DiT + 1 VAE chip 3.75 s (VAE-bound, loses), 2 + 2 VAE chips 2.51 s (1.22x)].
+- C2 The binding side is predicted by T_d vs T_v, which the step count moves [M: SA3 2-chip DiT, 1800 s: 8 steps
+  6.15 -> 5.48 s with 1 VAE chip; 4 steps 4.07 -> 3.89 s (1 chip) / 3.32 s (2 chips); 25 steps 14.88 -> 14.39 s;
+  50 steps 27.81 -> 27.02 s]. Few-step distilled DiTs (SA3 8, LingBot 4) make the decoder a larger share: the trend in
+  the field raises the value of disaggregation.
+- C3 Memory term of N:M: the decoder's weights are small next to a chip's HBM (Wan2.1 VAE ~0.25 GB bf16, estimate), so
+  one decoder chip holds M sessions' causal caches while it has compute to spare; the DiT fills its chips with weights +
+  KV cache (720p co-located 8 chips does not fit [M]) [H: per-session cache bytes and HBM vs M, vae_serve [SESSIONS]].
+
+Considerations
+- K1 Sizing is a deploy-time decision. Steps, resolution / window length, chunk size and model are fixed per service
+  before serving, so T_d and T_v are known in advance and the planner picks n_d, n_v and the N:M ratio from measured
+  per-stage curves; nothing depends on the input content at run time.
+- K2 When a service mixes configurations (steps, resolutions, durations) or the mix shifts, each role's pool scales on
+  its own (e.g. add decoder pods); a co-located replica has a fixed DiT:decoder ratio and cannot.
+- K3 Larger decoder replicas buy latency, not throughput, once the decoder keeps up: LingBot decode per chunk with a
+  4-chip DiT 391 / 273 / 237 ms on 1 / 2 / 4 VAE chips at the same 17.5 fps [M].
+
+Constraints
+- X1 Stateful decoders (LingBot's causal 3-D VAE) keep a per-stream cache: one stream's chunks cannot spread over
+  decoder replicas; N:M shares a decoder across streams (per-session cache, swapped per chunk) [implemented:
+  LINGBOT_VAE_SESSIONS], or moves the cache on failover. Stateless decoders (SA3 chunks) spread freely.
+- X2 Splitting a fixed budget can starve the stage that scales: LingBot 8 chips co-located 20.0 fps vs 4 + x 17.5 [M];
+  SA3 2 chips co-located 6.15 s vs 1 + 1 7.50 s [M]. Disaggregation pays when it adds chips the co-located replica
+  cannot use, or frees chips the decoder wastes.
+- X3 A DiT that cannot shard further (SA3 TP16 fails: head split) caps the co-located replica; only a separate
+  decoder role can add chips [M].
+
 ## 7 Discussion
 
 - Where disaggregation does not pay (8-chip LingBot).
