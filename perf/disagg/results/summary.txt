@@ -24,3 +24,11 @@ p3_split_d16v2_480: fps 32.21 over 55 chunks, dit_ms 244.7, vae_ms 208.7
 p3_split_d8v4_480: fps 25.48 over 55 chunks, dit_ms 305.1, vae_ms 195.2
 p2_mono8_480: fps 19.98 over 55 chunks, dit_ms 376.1, vae_ms 129.1
 p2_mono16_480: fps 14.38 over 55 chunks, dit_ms 620.0, vae_ms 137.0
+p3_split_d8v8_480: fps 25.60 over 55 chunks, dit_ms 303.9, vae_ms 174.6
+p3_split_d4v4_480: fps 17.47 over 55 chunks, dit_ms 436.9, vae_ms 237.0
+p3_split_d2v2_480: fps 10.06 over 55 chunks, dit_ms 746.2, vae_ms 367.8
+p3_split_d2tv1_480: fps 14.66 over 55 chunks, dit_ms 515.5, vae_ms 418.5
+p3_split_d4v1_480: fps 17.54 over 55 chunks, dit_ms 435.2, vae_ms 391.2
+p3_split_d2tv2_480: fps 14.58 over 55 chunks, dit_ms 521.6, vae_ms 302.5
+p3_split_d4v2_480: fps 17.52 over 55 chunks, dit_ms 435.1, vae_ms 272.6
+p3_split_d2v1_480: fps 10.07 over 55 chunks, dit_ms 744.7, vae_ms 489.3
