@@ -1,0 +1,191 @@
+events: 523618 | names: nrt_tensor_free=170789, dmem_buf_copyin=88837, enc_barrier_recv=83721, cc_running=59569, nrt_dma_mem_dealloc=17097, nrt_dma_mem_alloc=17060, nc_exec_running=11357, exec_consume_gpsimd_stdio=11357, notification_consume_errors=11357, nc_model_switch=6001, kbl_exec_wait=5691, kbl_exec_post=5691
+pcores: [np.int64(4), np.int64(5)] -> using 4
+
+window: 886 executions over 3034.1 ms, device busy 2642.6 ms, idle 391.5 ms
+
+per NEFF (executions, summed ms, median us):
+    284   2075.46    7292.4  module.neff_acf3fe867e5523d1c08c94b40790594b
+     80    264.23    3295.7  module.neff_87c6663aa5321fae2ecba5ff5c17e029
+     12     55.48    4627.5  module.neff_158f6e5ab791e65344c5c58abe174820
+     12     48.40    4032.4  module.neff_54007499ac329489c95210f9541fef79
+     12     30.69    2557.1  module.neff_de13bb45aa89517b8b66ec87c64b749e
+      3     30.13   10051.8  module.neff_cacf47ed314881021ccbfdfcb7c4ceaa
+     12     27.08    2255.5  module.neff_3b0326ea91aa4c5ee7ac4cbdf2005e00
+     20     12.06     600.2  module.neff_a983bfeedb3f9873980a257210cc56e1
+     20     10.72     532.6  module.neff_535369fd89a04ba502763351dfe429fd
+      8     10.30    1288.2  module.neff_2ae4ed135f3eedf701970ec7f1967d07
+      8      6.74     842.9  module.neff_fe523442c41986621e021f305b1f7267
+      4      6.49    1624.3  module.neff_5563ee62ee0ebd7fae2990051faa6e9b
+     18      6.48     358.6  module.neff_1420ce34f8769e82f9082c1845a18183
+      4      4.75    1192.0  module.neff_dba6055c31c795c282d8113c7709b430
+      4      4.70    1174.9  module.neff_b00424e7da722511be2e756c6a9541cf
+      4      4.34    1084.5  module.neff_5394cf1f07141041c90f8b402c27b793
+      4      3.88     970.4  module.neff_9b26e6c7bc2e513ddcb521eff01f76ac
+      4      3.67     916.4  module.neff_d1342a4fe8bc0d30371ffb4436b88778
+     18      3.63     201.8  module.neff_9a963a5f3cd3645a2799d509b46f413b
+      4      3.37     844.0  module.neff_da495ab80fbfe7d62058592df6161685
+      4      2.88     717.5  module.neff_41be28a49fbd351a590cbefe7efd4099
+      4      2.28     571.4  module.neff_fff05e6a4acbc5bee3b687ede39c5c77
+     15      2.17     143.4  module.neff_7e684f4c0d74f5626d2fef84f97bc210
+      4      1.87     466.4  module.neff_dd018f4f8193e4aeb3f0b9cffc34c4ee
+      4      1.73     433.6  module.neff_6bc4dfc2b92774713fd9c9cf5dd9b01d
+      4      1.73     424.8  module.neff_eea155465f71632140dc6c5e88403bca
+      4      1.69     419.8  module.neff_e826bdb4b8f579aa33409405bcb68445
+      4      1.39     346.8  module.neff_68cc85d80bb5c1c49447073a70e959ed
+      4      1.35     337.4  module.neff_63b3451be520267b91f3cd1db3b5ab50
+      6      1.06     177.0  module.neff_ef37c1b0e9a116d8067301727afb273b
+      4      1.04     263.1  module.neff_812c306e42174808cca2fbc481c48ac5
+      4      1.01     251.8  module.neff_67747eca1e85267033417baacaa270fc
+      4      0.84     209.8  module.neff_4f068fa958e6a5e767d44593990c4791
+     18      0.69      38.3  module.neff_afa6ca6e61fb37225773a6cfdc950ed4
+     18      0.65      33.5  module.neff_288e11b777aac2d75d9f104abd126c49
+      3      0.64     213.2  module.neff_788d612ddf2e3367b67d35c991b903cb
+      5      0.52     105.3  x_561826fb125f4bb8991c29e085c8949a
+     18      0.52      27.6  module.neff_4c4fdfb4f29151deae45d84e2ccabecc
+      5      0.51     103.9  module.neff_4015926d13f77bbb512398d137014e62
+     18      0.51      28.2  module.neff_50ac2556e82cf529dcf2bebcf59e7c8f
+     18      0.42      21.6  module.neff_6364e5bd49cb08492470c1e8dd5dcd0c
+     15      0.36      24.1  module.neff_f3d4cff7c29c0b74f8425b99e7099abd
+     15      0.32      21.4  module.neff_07cf76660a0832c49310576e10ba79f8
+      3      0.31      98.3  module.neff_12506ae145fb8aca3593a02d20432dfa
+      4      0.31      76.9  module.neff_4c674c46ce80927274aecc08bc8c6213
+     15      0.22      14.5  module.neff_d7f7e1c1fce8ac24a2b4cc9167b87b6d
+     15      0.21      14.2  module.neff_1758a7da98862b10e3be05bdc2dddfe5
+      3      0.21      70.0  module.neff_8ff146bcd2c56ee5625c41c63beca35f
+      4      0.18      44.8  module.neff_0cb5bb514b472eda837447b3e7b98048
+      4      0.13      32.4  module.neff_b89795747eb2e49228acbc68c6eee5f0
+      4      0.13      32.4  module.neff_8edcc37ccd89bb7aff7ced0c460397db
+     10      0.12      11.6  module.neff_586e28c47094f7d5d276cd504b8e92fe
+      3      0.11      37.9  module.neff_9bd9c5e5645c633e2205e2de6bb0b7a6
+      4      0.11      28.3  module.neff_2011baf231d7e0c687b495d42af44cc8
+      3      0.11      37.6  module.neff_26a641c9e99f3c0842b85adbbe65247e
+      4      0.11      27.3  module.neff_a4cf0b42f1e203decfd8cc518ffeb2ef
+      4      0.11      27.5  module.neff_61292b821b5310a2026a958b25819f65
+      4      0.11      26.8  module.neff_ab22cb6a5c8b174628686b36a343b105
+      4      0.10      25.5  module.neff_1a0502573ae85bb98b6669daf5db445f
+      1      0.10      97.8  module.neff_101f3f9aad32693dd02511ce72c2390c
+      4      0.10      24.3  module.neff_a0d06d2fc84ee0e82893695840159a27
+      3      0.10      32.5  module.neff_ebf4b0d3d86227fcc4ca00d460f78ea3
+      1      0.09      92.4  module.neff_081d1ec45874f11a79f4959eb663c463
+      3      0.08      26.9  module.neff_cd5a5cad313554c40ef46dc20a0428b7
+      3      0.08      27.7  module.neff_79c97f99b4df53889362b4a3e608b26c
+      4      0.08      19.9  module.neff_556f119501759e2f863cac5cb9c9b61b
+      5      0.07      14.7  module.neff_d409cefc27647fb7a9de22219e2a299e
+      4      0.07      17.7  module.neff_c2d125e2674a961b303df0b87d34d67b
+      5      0.07      14.0  module.neff_e0259c17cef924a99c23539e6f3ee480
+      4      0.07      17.2  module.neff_67eec996e13db2f68bb0316c25940b8f
+      4      0.06      15.5  module.neff_78a396807dbc5a9507a715357d868b25
+      4      0.06      14.7  module.neff_c346d24c90e8e4164a56f74b298e6c6f
+      4      0.06      14.3  module.neff_d0ab2377d74f3e22bcec501f6f277ce9
+      4      0.06      13.8  module.neff_e976f90ff1b4121a5683fd6eaaa66561
+      4      0.05      13.6  module.neff_c1a4fbd41626e73405c7112124a9e22c
+      4      0.05      12.4  module.neff_c63352ec7cf0f727df4afeeca3d982e9
+      4      0.05      11.6  module.neff_db1f1d788ef34e356f1e4726b0f8bf6c
+
+idle between executions: total 391.5 ms, median 24.5 us, p90 262.6 us, 0 overlaps
+
+idle by (previous NEFF -> next NEFF): count, summed ms, median us
+      4    176.20   44086.7  n4_med77us -> n4_med14us
+      4     88.34   21982.3  n4_med45us -> n5_med105us
+      3     23.25    5278.9  n18_med28us -> n3_med10052us
+     11     16.68    1511.7  n18_med28us -> n284_med7292us
+      8     10.11    1271.3  n15_med24us -> n4_med32us
+      4      7.65    1836.2  n18_med28us -> n80_med3296us
+    269      6.84       2.3  n284_med7292us -> n284_med7292us
+      3      6.42    1979.9  n3_med98us -> n18_med33us
+      3      4.65    1545.3  n10_med12us -> n3_med98us
+      3      3.95    1343.3  n15_med24us -> n3_med32us
+      4      3.43     856.7  n4_med24us -> n4_med27us
+      4      3.11     781.9  n4_med210us -> n20_med533us
+      5      2.83     526.4  n10_med12us -> n5_med104us
+      4      2.22     556.9  n5_med105us -> n18_med33us
+     76      2.14       6.3  n80_med3296us -> n80_med3296us
+      4      1.95     474.8  n80_med3296us -> n10_med12us
+      1      1.79    1791.1  n1_med98us -> n5_med105us
+      8      1.67     201.3  n4_med32us -> n18_med33us
+      1      1.54    1541.3  n10_med12us -> n1_med98us
+      1      1.48    1483.9  n10_med12us -> n1_med92us
+     18      1.22      55.9  n18_med28us -> n18_med359us
+     15      1.16      77.2  n284_med7292us -> n15_med143us
+      4      1.11     281.0  n4_med263us -> n20_med600us
+      4      1.09     274.9  n4_med17us -> n4_med263us
+      4      1.08     268.1  n4_med14us -> n4_med210us
+
+gaps > 500 us: 67, summed 360.1 ms
+  at    30.84 ms    1203.6 us  n15_med24us -> n4_med32us
+  at    33.55 ms    1594.1 us  n18_med28us -> n284_med7292us
+  at   181.37 ms    1248.9 us  n15_med24us -> n4_med32us
+  at   184.07 ms    1572.8 us  n18_med28us -> n284_med7292us
+  at   195.41 ms    4029.4 us  n284_med7292us -> n284_med7292us
+  at   335.72 ms     899.2 us  n4_med24us -> n4_med27us
+  at   421.25 ms   43758.0 us  n4_med77us -> n4_med14us
+  at   422.49 ms     763.7 us  n4_med210us -> n20_med533us
+  at   468.93 ms   22060.2 us  n4_med45us -> n5_med105us
+  at   469.60 ms     568.6 us  n5_med105us -> n18_med33us
+  at   472.34 ms    1725.9 us  n18_med28us -> n80_med3296us
+  at   541.74 ms    1534.3 us  n10_med12us -> n3_med98us
+  at   543.80 ms    1948.8 us  n3_med98us -> n18_med33us
+  at   550.51 ms    4654.1 us  n18_med28us -> n3_med10052us
+  at   709.96 ms    1243.9 us  n15_med24us -> n3_med32us
+  at   712.76 ms    1511.7 us  n18_med28us -> n284_med7292us
+  at   860.58 ms    1293.8 us  n15_med24us -> n4_med32us
+  at   863.16 ms    1362.4 us  n18_med28us -> n284_med7292us
+  at  1010.94 ms    1323.3 us  n15_med24us -> n4_med32us
+  at  1013.60 ms    1449.1 us  n18_med28us -> n284_med7292us
+  at  1021.46 ms     639.9 us  n284_med7292us -> n284_med7292us
+  at  1161.49 ms     824.5 us  n4_med24us -> n4_med27us
+  at  1246.15 ms   43330.0 us  n4_med77us -> n4_med14us
+  at  1247.44 ms     785.6 us  n4_med210us -> n20_med533us
+  at  1293.73 ms   21904.3 us  n4_med45us -> n5_med105us
+  at  1294.35 ms     513.9 us  n5_med105us -> n18_med33us
+  at  1297.21 ms    1946.5 us  n18_med28us -> n80_med3296us
+  at  1364.08 ms     554.3 us  n80_med3296us -> n10_med12us
+  at  1366.57 ms    1570.1 us  n10_med12us -> n3_med98us
+  at  1369.16 ms    2490.9 us  n3_med98us -> n18_med33us
+  at  1376.43 ms    5278.9 us  n18_med28us -> n3_med10052us
+  at  1534.86 ms    1343.3 us  n15_med24us -> n3_med32us
+  at  1537.70 ms    1577.6 us  n18_med28us -> n284_med7292us
+  at  1545.74 ms     788.0 us  n284_med7292us -> n284_med7292us
+  at  1686.17 ms    1126.1 us  n15_med24us -> n4_med32us
+  at  1689.20 ms    1857.0 us  n18_med28us -> n284_med7292us
+  at  1836.88 ms    1182.2 us  n15_med24us -> n4_med32us
+  at  1839.54 ms    1520.5 us  n18_med28us -> n284_med7292us
+  at  1987.15 ms     819.5 us  n4_med24us -> n4_med27us
+  at  2073.23 ms   44697.2 us  n4_med77us -> n4_med14us
+  at  2074.50 ms     779.9 us  n4_med210us -> n20_med533us
+  at  2121.34 ms   22476.8 us  n4_med45us -> n5_med105us
+  at  2122.03 ms     590.6 us  n5_med105us -> n18_med33us
+  at  2124.65 ms    1678.6 us  n18_med28us -> n80_med3296us
+  at  2191.76 ms     542.4 us  n10_med12us -> n5_med104us
+  at  2193.69 ms    1545.3 us  n10_med12us -> n3_med98us
+  at  2195.77 ms    1979.9 us  n3_med98us -> n18_med33us
+  at  2211.10 ms   13316.1 us  n18_med28us -> n3_med10052us
+  at  2368.98 ms    1362.8 us  n15_med24us -> n3_med32us
+  at  2371.71 ms    1501.1 us  n18_med28us -> n284_med7292us
+  at  2519.56 ms    1383.9 us  n15_med24us -> n4_med32us
+  at  2522.16 ms    1360.2 us  n18_med28us -> n284_med7292us
+  at  2669.91 ms    1352.0 us  n15_med24us -> n4_med32us
+  at  2672.49 ms    1374.1 us  n18_med28us -> n284_med7292us
+  at  2820.88 ms     888.9 us  n4_med24us -> n4_med27us
+  at  2906.70 ms   44415.4 us  n4_med77us -> n4_med14us
+  at  2907.99 ms     783.9 us  n4_med210us -> n20_med533us
+  at  2954.25 ms   21899.9 us  n4_med45us -> n5_med105us
+  at  2954.90 ms     545.2 us  n5_med105us -> n18_med33us
+  at  2958.10 ms    2296.1 us  n18_med28us -> n80_med3296us
+
+other runtime events in the window (count, summed ms):
+     886    2654.47  kbl_exec_wait
+    8965     413.74  cc_running
+     874     407.13  nrta_execute_schedule
+     560     342.18  enc_barrier
+   13310      59.28  enc_barrier_recv
+     879      45.49  nrt_model_submit
+     879      39.24  kbl_exec_pre
+     565      35.83  cc_exec_barrier
+     947      20.43  nc_model_switch
+     123      19.10  io_xu_complete
+     887      13.85  kbl_exec_post
+   13719      13.14  dmem_buf_copyin
+    2587      12.13  nrt_dma_mem_alloc
+     566       8.42  exec_consume_cc_core_notifications
+   25858       6.86  nrt_tensor_free

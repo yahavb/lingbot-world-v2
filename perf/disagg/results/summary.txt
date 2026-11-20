@@ -2,9 +2,9 @@ p1_dit8_480: fps 25.84 over 55 chunks, dit_ms 371.7, vae_ms 0.4
 p1_dit4_480: fps 17.49 over 55 chunks, dit_ms 551.7, vae_ms 0.3
 p1_dit16_480: fps 31.97 over 55 chunks, dit_ms 299.1, vae_ms 0.4
 p1_dit2_480: fps 10.07 over 55 chunks, dit_ms 957.5, vae_ms 0.3
-RECHECK p2_mono4_480: fps 14.30 over 55 chunks, dit_ms 555.0, vae_ms 148.6
+FLAGLEAK RECHECK p2_mono4_480: fps 14.30 over 55 chunks, dit_ms 555.0, vae_ms 148.6
 INVALID-probe-cap p2_mono8_480: fps 19.72 over 55 chunks, dit_ms 376.9, vae_ms 128.0
-RECHECK p2_mono2_480: fps 8.48 over 55 chunks, dit_ms 983.8, vae_ms 196.5
+FLAGLEAK RECHECK p2_mono2_480: fps 8.48 over 55 chunks, dit_ms 983.8, vae_ms 196.5
 INVALID-probe-cap p2_mono16_480: fps 14.41 over 55 chunks, dit_ms 620.2, vae_ms 135.5
 INVALID-probe-cap p3_split_d8v2_480: fps 19.76 over 55 chunks, dit_ms 301.6, vae_ms 225.3
 INVALID-probe-cap p3_split_d16v1_480: fps 20.63 over 55 chunks, dit_ms 246.9, vae_ms 327.2
@@ -22,8 +22,8 @@ p3_split_d16v1_480: fps 32.14 over 55 chunks, dit_ms 246.9, vae_ms 326.5
 p3_split_d8v2_480: fps 25.95 over 55 chunks, dit_ms 301.0, vae_ms 226.2
 p3_split_d16v2_480: fps 32.21 over 55 chunks, dit_ms 244.7, vae_ms 208.7
 p3_split_d8v4_480: fps 25.48 over 55 chunks, dit_ms 305.1, vae_ms 195.2
-p2_mono8_480: fps 19.98 over 55 chunks, dit_ms 376.1, vae_ms 129.1
-p2_mono16_480: fps 14.38 over 55 chunks, dit_ms 620.0, vae_ms 137.0
+FLAGLEAK p2_mono8_480: fps 19.98 over 55 chunks, dit_ms 376.1, vae_ms 129.1
+FLAGLEAK p2_mono16_480: fps 14.38 over 55 chunks, dit_ms 620.0, vae_ms 137.0
 p3_split_d8v8_480: fps 25.60 over 55 chunks, dit_ms 303.9, vae_ms 174.6
 p3_split_d4v4_480: fps 17.47 over 55 chunks, dit_ms 436.9, vae_ms 237.0
 p3_split_d2v2_480: fps 10.06 over 55 chunks, dit_ms 746.2, vae_ms 367.8
@@ -32,3 +32,11 @@ p3_split_d4v1_480: fps 17.54 over 55 chunks, dit_ms 435.2, vae_ms 391.2
 p3_split_d2tv2_480: fps 14.58 over 55 chunks, dit_ms 521.6, vae_ms 302.5
 p3_split_d4v2_480: fps 17.52 over 55 chunks, dit_ms 435.1, vae_ms 272.6
 p3_split_d2v1_480: fps 10.07 over 55 chunks, dit_ms 744.7, vae_ms 489.3
+FLAGLEAK p4_monosync8_480: fps 19.87 over 35 chunks, dit_ms 375.1, vae_ms 132.8
+FLAGLEAK p4_monosync16_480: fps 14.28 over 35 chunks, dit_ms 619.1, vae_ms 141.9
+FLAGLEAK p4_monosync4_480: fps 14.34 over 35 chunks, dit_ms 553.7, vae_ms 148.4
+FLAGLEAK p5_prof_mono16_480: fps 14.40 over 25 chunks, dit_ms 619.6, vae_ms 136.0
+p5_prof_dit16_480: fps 32.07 over 25 chunks, dit_ms 298.5, vae_ms 0.4
+p6_monofix16_480: fps 23.13 over 55 chunks, dit_ms 299.5, vae_ms 141.9
+p6_monofix4_480: fps 14.33 over 55 chunks, dit_ms 551.3, vae_ms 151.3
+p6_monofix8_480: fps 20.03 over 55 chunks, dit_ms 370.9, vae_ms 132.9
