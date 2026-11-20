@@ -42,3 +42,6 @@ p6_monofix4_480: fps 14.33 over 55 chunks, dit_ms 551.3, vae_ms 151.3
 p6_monofix8_480: fps 20.03 over 55 chunks, dit_ms 370.9, vae_ms 132.9
 p6_monofix16u_480: fps 23.37 over 55 chunks, dit_ms 299.5, vae_ms 134.6
 p7_mono16_720: fps 9.96 over 55 chunks, dit_ms 758.6, vae_ms 254.4
+p3_split_d8v1_720: fps 8.46 over 55 chunks, dit_ms 891.6, vae_ms 920.8
+p3_split_d8v2_720: fps 8.28 over 55 chunks, dit_ms 892.5, vae_ms 630.5
+p3_split_d8v4_720: fps 8.38 over 55 chunks, dit_ms 888.9, vae_ms 497.7
