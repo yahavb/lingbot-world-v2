@@ -67,3 +67,9 @@ nm2_N3_a: fps 10.08 over 55 chunks, dit_ms 745.2, vae_ms 832.7
 nm4_N1_a: fps 17.52 over 55 chunks, dit_ms 434.9, vae_ms 393.7
 nm4_N2_a: fps 17.53 over 55 chunks, dit_ms 435.9, vae_ms 390.3
 nm4_N2_b: fps 17.54 over 55 chunks, dit_ms 431.3, vae_ms 595.9
+hs_6x2_a: fps 10.03 over 55 chunks, dit_ms 747.6, vae_ms 495.4
+hs_6x2_b: fps 10.01 over 55 chunks, dit_ms 752.0, vae_ms 491.8
+hs_6x2_c: fps 10.05 over 55 chunks, dit_ms 743.7, vae_ms 545.4
+hs_6x2_d: fps 10.04 over 55 chunks, dit_ms 747.9, vae_ms 486.5
+hs_6x2_e: fps 10.03 over 55 chunks, dit_ms 750.2, vae_ms 485.9
+hs_6x2_f: fps 10.05 over 55 chunks, dit_ms 746.0, vae_ms 490.0

@@ -233,7 +233,8 @@ Claims
 - C4 Horizontal scaling per role (the OS claim): one decoder replica serves about T_d / T_v DiT streams (LingBot 2-chip
   DiT ~3.7, measured 3 without slowdown; 4-chip ~2, measured 2; SA3 25 steps ~4.5, measured 4, 6 saturate [M]); beyond
   that ratio the operating layer adds decoder replicas and spreads sessions over them (least-loaded placement), keeping
-  the ratio while streams scale out; DiT and decoder pools grow independently [H: 2 VAEs x 6 streams, 3 x 9].
+  the ratio while streams scale out; DiT and decoder pools grow independently [M: 2 one-chip VAEs (LINGBOT_VAE_SESSIONS=4) x 6 streams of 2-chip DiTs, LINGBOT_VAE_LEAST_LOADED=1: placed 3 + 3,
+  every stream 10.01-10.05 fps vs 10.07 alone; 14 chips for 6 streams] [H: 3 x 9].
 
 Considerations
 - K1 Sizing is a deploy-time decision. Steps, resolution / window length, chunk size and model are fixed per service
