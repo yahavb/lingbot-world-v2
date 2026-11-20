@@ -91,12 +91,26 @@ def dit(a):
     rename(d, a.name)
     d["spec"]["template"]["spec"]["resourceClaims"][0]["resourceClaimTemplateName"] = f"x-lnc2-efa-{a.chips}"
     c = d["spec"]["template"]["spec"]["containers"][0]
+    if a.flags == "mono":
+        # one flag set for every chip count: the 4-chip monolith's DiT flags (lbw-deploy.yaml; the 2-chip t22
+        # kernels are tuned to CP2 shapes and fail at CP4+), the split VAE's VAE flags (lbw-vae-deploy.yaml) so
+        # inline and split decode with the same kernels, and the split's transport env
+        mono = json.load(open(os.path.join(HERE, "base", "lbw-deploy.json")))["spec"]["template"]["spec"]["containers"][0]["env"]
+        vae_env = json.load(open(os.path.join(HERE, "base", "lbw-vae-deploy.json")))["spec"]["template"]["spec"]["containers"][0]["env"]
+        keep = [e for e in c["env"] if e["name"].startswith(("FI_", "CCOM_")) or e["name"] in
+                ("VAE_URL", "VAE_SELECTOR", "LINGBOT_VAE_RDMA", "HF_TOKEN")]
+        env = {e["name"]: e for e in mono}
+        env.update({e["name"]: e for e in vae_env if e["name"].startswith("LINGBOT_VAE_")})
+        env.update({e["name"]: e for e in keep})
+        c["env"] = list(env.values())
+        env_set(c, "LINGBOT_REANCHOR_FRAMES", "0")
     nproc = RANKS_PER_CHIP * a.chips
     env_set(c, "NPROC", nproc)
     env_set(c, "TP", TP)
     env_set(c, "CP", nproc // TP)
     env_set(c, "SIZE", a.size)
-    env_set(c, "CACHE_VERSION", a.cache)
+    env_set(c, "CACHE_VERSION", a.cache or f"{a.flags}{a.chips}")   # one cache per flag set x chip count
+    env_set(c, "LINGBOT_LOAD_CONCURRENCY", nproc)
     if a.mode == "split":
         env_set(c, "VAE_URL", f"http://{a.vae_app}.default.svc.cluster.local:8000")
         env_set(c, "VAE_SELECTOR", f"app={a.vae_app}")
@@ -132,7 +146,8 @@ def main():
     p = sub.add_parser("claim"); p.add_argument("chips", type=int)
     p = sub.add_parser("dit"); p.add_argument("name"); p.add_argument("chips", type=int)
     p.add_argument("mode", choices=["split", "inline", "null"]); p.add_argument("--vae-app", default="")
-    p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="5")
+    p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="")
+    p.add_argument("--flags", choices=["mono", "t22"], default="mono")
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
