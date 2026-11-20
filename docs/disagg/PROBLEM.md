@@ -116,6 +116,21 @@ measured), and a deeper pipeline can add a chunk of delay.
 3. M5 fan-in and the Pareto chart; M3 memory limits.
 4. M8 latency; M6 trn2; M7 failure timeline; placement (NeuronLink vs EFA).
 
+## The core experiment (agreed with the user 2026-11-19): is disaggregation advantageous?
+Each monolith size is compared with a split whose DiT has HALF the monolith's chips, plus a VAE of 1, 2, 4 (or 8)
+chips. The split wins if it gets the same fps on fewer chips (cheaper) or more fps on the same chips (faster).
+
+| Monolith (DiT + VAE inline) | Split: DiT chips + VAE chips (total) |
+|---|---|
+| 4 chips | 2 + 1 (3), 2 + 2 (4) |
+| 8 chips | 4 + 1 (5), 4 + 2 (6), 4 + 4 (8) |
+| 16 chips | 8 + 1 (9), 8 + 2 (10), 8 + 4 (12), 8 + 8 (16) |
+| none (the monolith stops scaling) | 16 + 1, 2, 4, 8 (VAE on the second node, over EFA) |
+
+Rules: one stream, 480x768 first (then 720p), the same DiT and VAE flags in the monolith and the split (the
+common set, plus the tuned 2-chip flags as a second data point at 4 chips), 60 chunks, the scene's own camera
+path, fps measured at the client (perf/disagg/run_cell.sh, results in perf/disagg/results/summary.txt).
+
 ## Scaling matrix (user request 2026-11-19): does the split keep winning as chips grow?
 Equal chip budgets, monolith (DiT + VAE inline, TP4 x CP n) vs split (DiT pod + VAE capacity):
 
