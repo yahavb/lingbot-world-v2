@@ -21,7 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GEN = os.path.join(HERE, "gen")
 RANKS_PER_CHIP = 4  # LNC2 on trn3: 8 physical cores per chip, 4 logical ranks
 TP = 4
-LAT = {"480*768": (60, 96), "720*1280": (90, 160), "704*1280": (88, 160)}
+# 720*1280 runs on the 704 x 1280 grid (EXACT_GRID_SIZES), so its latent is 88 x 160
+LAT = {"480*768": (60, 96), "720*1280": (88, 160), "704*1280": (88, 160)}
 
 
 def env_set(c, name, value):
