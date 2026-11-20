@@ -19,6 +19,9 @@ import uuid
 import torch
 
 SLOTS = int(os.environ.get("NIXL_SLOTS", "4"))
+# LINGBOT_VAE_SESSIONS=K: a VAE serves up to K DiT sessions at once; each gets its own block of SLOTS buffers and tags
+# its notifications with its session id ("s<sid>:<seq>"), so sessions never share a slot or a sequence number
+SESSIONS = int(os.environ.get("LINGBOT_VAE_SESSIONS", "1"))
 log = logging.getLogger("nixl_link")
 
 
@@ -49,35 +52,43 @@ class NixlVae:
     """VAE rank 0: SLOTS receive buffers, and the notifications that say which one holds which chunk."""
 
     def __init__(self, shape, dev):
-        self.buf = torch.zeros((SLOTS,) + tuple(shape), dtype=torch.float32, device=dev)
+        self.buf = torch.zeros((SLOTS * SESSIONS,) + tuple(shape), dtype=torch.float32, device=dev)
         torch.neuron.synchronize()
         self.slot_bytes = self.buf[0].numel() * 4
         va = nrt_va(self.buf)
         self.agent, self.name = _agent("lbw-vae")
-        self.agent.register_memory(self.agent.get_reg_descs([(va, SLOTS * self.slot_bytes, 0, "")], "VRAM"))
+        self.agent.register_memory(self.agent.get_reg_descs([(va, SLOTS * SESSIONS * self.slot_bytes, 0, "")], "VRAM"))
         self.slot_descs = [_b64(self.agent.get_serialized_descs(
-            self.agent.get_xfer_descs([(va + i * self.slot_bytes, self.slot_bytes, 0)], "VRAM"))) for i in range(SLOTS)]
+            self.agent.get_xfer_descs([(va + i * self.slot_bytes, self.slot_bytes, 0)], "VRAM")))
+            for i in range(SLOTS * SESSIONS)]
         self.seen = set()
         log.info(f"nixl vae: agent {self.name}, {SLOTS} slots x {self.slot_bytes} B at {va:#x}")
 
-    def info(self):
-        return {"transport": "nixl", "meta": _b64(self.agent.get_agent_metadata()), "slots": self.slot_descs}
+    def info(self, sid=0):
+        """Link info for session `sid`: its block of SLOTS slots (sid < SESSIONS)."""
+        b = (sid % SESSIONS) * SLOTS
+        return {"transport": "nixl", "meta": _b64(self.agent.get_agent_metadata()),
+                "slots": self.slot_descs[b:b + SLOTS], "sid": sid}
 
-    def wait(self, seq, timeout_s):
-        """The slot holding chunk `seq`, once its write has landed; raises after timeout_s."""
+    def wait(self, seq, timeout_s, sid=0):
+        """The slot holding session `sid`'s chunk `seq`, once its write has landed; raises after timeout_s."""
+        key = (sid, seq)
         t_end = time.time() + timeout_s
-        while seq not in self.seen:
+        while key not in self.seen:
             for msgs in self.agent.get_new_notifs().values():
                 for m in msgs:
                     if m.startswith(b"seq:"):
-                        self.seen.add(int(m[4:]))
-            if seq in self.seen:
+                        self.seen.add((0, int(m[4:])))
+                    elif m.startswith(b"s") and b":" in m:
+                        a, b_ = m[1:].split(b":", 1)
+                        self.seen.add((int(a), int(b_)))
+            if key in self.seen:
                 break
             if time.time() > t_end:
-                raise TimeoutError(f"nixl: chunk {seq} not written within {timeout_s} s")
+                raise TimeoutError(f"nixl: session {sid} chunk {seq} not written within {timeout_s} s")
             time.sleep(0.0002)
-        self.seen.discard(seq)
-        return self.buf[seq % SLOTS]
+        self.seen.discard(key)
+        return self.buf[(sid % SESSIONS) * SLOTS + seq % SLOTS]
 
 
 class NixlDit:
@@ -96,7 +107,7 @@ class NixlDit:
     def connect(self, info):
         remote = self.agent.add_remote_agent(base64.b64decode(info["meta"]))
         slots = [self.agent.deserialize_descs(base64.b64decode(d)) for d in info["slots"]]
-        return (remote, slots)
+        return (remote, slots, int(info.get("sid", 0)))
 
     def disconnect(self, conn):
         """Park the connection; do NOT remove_remote_agent: that cancels the dead VAE's pending write, and
@@ -108,8 +119,9 @@ class NixlDit:
         """Write chunk `seq` (device tensor x) into the VAE's slot seq % SLOTS; raises if it fails."""
         self.buf.copy_(x)
         torch.neuron.synchronize()
-        remote, slots = conn
-        h = self.agent.initialize_xfer("WRITE", self.local, slots[seq % len(slots)], remote, f"seq:{seq}".encode())
+        remote, slots, sid = conn
+        tag = f"s{sid}:{seq}" if sid else f"seq:{seq}"
+        h = self.agent.initialize_xfer("WRITE", self.local, slots[seq % len(slots)], remote, tag.encode())
         try:
             st = self.agent.transfer(h)
             t_end = time.time() + timeout_s

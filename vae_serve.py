@@ -55,20 +55,25 @@ def run_server(jobs, state):
         if not state["ready"]:
             raise HTTPException(status_code=503, detail="warming up")
         if state.get("nixl") is not None:        # NIXL: the DiT writes into our slots; nothing to build here
-            return state["nixl"].info()
+            # LINGBOT_VAE_SESSIONS=K: each new session takes the next of K slot blocks / decoder caches (round robin;
+            # the K+1-th session reuses the oldest block, so K must cover the sessions served at once)
+            from wan.nixl_link import SESSIONS
+            sid = state.get("next_sid", 0)
+            state["next_sid"] = (sid + 1) % SESSIONS
+            return state["nixl"].info(sid)
         if state.get("rank") is None:
             raise HTTPException(status_code=503, detail="warming up")
         jobs.put(("__link__", gen, dit_rank))
         return {"vae_rank": state["rank"]}
 
     @app.post("/decode")
-    async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0, seq: int = -1):
+    async def decode(request: Request, first: int = 0, stream: int = 0, rdma: int = 0, seq: int = -1, sid: int = 0):
         """The decode loop puts lists of JPEG futures, one per step, then None or an exception."""
         if not state["ready"]:
             raise HTTPException(status_code=503, detail="warming up")
         result = queue.Queue()
         body = await request.body()
-        jobs.put((None if rdma else body, bool(first), result, seq))
+        jobs.put((None if rdma else body, bool(first), result, seq, sid))
 
         def parts():
             while True:
@@ -136,7 +141,7 @@ def main():
         return serve_fused(args, cfg, dev, rank)
     vae, vae_world, pad_w = G._width_sharded_vae(args, cfg, dev, rank, world, args.lat_w)
 
-    def decode(z, first, emit):
+    def decode(z, first, emit, sid=0):
         """Decode one chunk on every rank; rank 0 emits JPEG futures."""
         lat_w = z.shape[-1]
         assert lat_w == args.lat_w, f"latent width {lat_w}, server built for {args.lat_w}"
@@ -165,9 +170,14 @@ def serve_fused(args, cfg, dev, rank):
         logging.info(f"fused VAE decoder, {'2-D tiles' if two_d else 'width slices'}"
                      + (f", compiler flags + {extra}" if extra else ""))
 
-    def decode(z, first, emit):
-        """Decode one chunk on every rank; rank 0 emits each step's JPEG futures as it lands."""
+    caches = {}     # session id -> the fused decoder's causal caches (LINGBOT_VAE_SESSIONS)
+
+    def decode(z, first, emit, sid=0):
+        """Decode one chunk on every rank; rank 0 emits each step's JPEG futures as it lands. Each session keeps its
+        own causal decoder cache, swapped in before its chunk and saved after (sessions interleave chunk by chunk)."""
         assert z.shape[-1] == args.lat_w, f"latent width {z.shape[-1]}, server built for {args.lat_w}"
+        if not first:
+            fdec._caches = caches.get(sid)
         local = F.shard_latent_2d(z) if two_d else width_shard_latent(z, rank=rank, world=dist.get_world_size())
 
         def step(out):
@@ -176,9 +186,23 @@ def serve_fused(args, cfg, dev, rank):
             if rank == 0:
                 emit([POOL.submit(jpeg, video[:, t]) for t in range(video.shape[1])])
         fdec.decode_chunk(local.to(dev).unsqueeze(0), vae.scale, first, on_step=step)
+        # a compiled graph may write its next outputs into the same device buffers, so a session's saved cache is
+        # copied unless it is the only session (LINGBOT_VAE_SESSIONS=1 keeps the old, copy-free path)
+        from wan.nixl_link import SESSIONS
+        caches[sid] = _clone(fdec._caches) if SESSIONS > 1 else fdec._caches
         dist.barrier()
 
     serve_loop(decode, args, rank)
+
+
+def _clone(x):
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    if isinstance(x, (list, tuple)):
+        return type(x)(_clone(v) for v in x)
+    if isinstance(x, dict):
+        return {k: _clone(v) for k, v in x.items()}
+    return x
 
 
 def jpeg(frame):
@@ -240,7 +264,7 @@ def serve_loop(decode, args, rank):
                 link = None
             job = None
         msg = [None if job is None else {"z": job[0], "first": job[1], "rdma": job[0] is None,
-                                         "seq": job[3] if len(job) > 3 else -1}]
+                                         "seq": job[3] if len(job) > 3 else -1, "sid": job[4] if len(job) > 4 else 0}]
         dist.broadcast_object_list(msg, src=0)
         if msg[0] is None:
             continue
@@ -255,7 +279,8 @@ def serve_loop(decode, args, rank):
                 if rank == 0:
                     try:
                         if state.get("nixl") is not None:
-                            zbuf.copy_(state["nixl"].wait(msg[0]["seq"], float(os.environ.get("VAE_RECV_TIMEOUT_S", "5"))))
+                            zbuf.copy_(state["nixl"].wait(msg[0]["seq"], float(os.environ.get("VAE_RECV_TIMEOUT_S", "5")),
+                                                                     sid=msg[0]["sid"]))
                             torch.neuron.synchronize()
                         elif link is None:
                             raise RuntimeError("no RDMA link (the DiT must POST /link first)")
@@ -283,7 +308,7 @@ def serve_loop(decode, args, rank):
             def emit(part):
                 n[0] += len(part)
                 job[2].put(part)
-            decode(z, msg[0]["first"], emit)
+            decode(z, msg[0]["first"], emit, msg[0]["sid"])
             if rank == 0:
                 logging.info(f"decode first={int(msg[0]['first'])} latent={tuple(z.shape)} "
                              f"-> {n[0]} frames in {(time.perf_counter() - t0) * 1000:.0f} ms")

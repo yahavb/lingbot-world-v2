@@ -199,7 +199,7 @@ class VaePool:
                 raise VaeUnavailable("no VAE available")
             name, seq = self.current[0], next(self.seq)
             try:
-                remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq)
+                remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq, sid=self.current[2][2])
                 for retry in range(3):
                     try:
                         self.nixl.write(self.current[2], x_dev, seq)
