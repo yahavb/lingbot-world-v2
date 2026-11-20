@@ -115,3 +115,21 @@ measured), and a deeper pipeline can add a chunk of delay.
 2. Build setup B, then measure M2 (DiT time per chunk in A, B, C).
 3. M5 fan-in and the Pareto chart; M3 memory limits.
 4. M8 latency; M6 trn2; M7 failure timeline; placement (NeuronLink vs EFA).
+
+## Scaling matrix (user request 2026-11-19): does the split keep winning as chips grow?
+Equal chip budgets, monolith (DiT + VAE inline, TP4 x CP n) vs split (DiT pod + VAE capacity):
+
+| Budget | Monolith | Split options |
+|---|---|---|
+| 3-4 chips | 4 (TP4xCP4) | 2 DiT + 1 VAE, 2 + 2 |
+| 8 chips | 8 (TP4xCP8) | 4 + 1, 4 + 2, 6 + 2 |
+| 16 chips | 16 (TP4xCP16) | 8 + 1, 8 + 2, 8 + 4, 12 + 4 |
+| 17-24 chips (2 nodes) | not possible (one node max; cross-node inline VAE) | 16 + 1, 2, 4, 8 (VAE on the 2nd node over EFA) |
+
+Each at 480x768 and 720p (if it compiles), single stream and N streams (xDiT : yVAE, the xPyD analogue).
+Outputs per cell: fps per stream, press-to-frame latency, fps per chip, streams per chip at >= 16 fps.
+
+Design point found while planning: the VAE is causal and keeps a temporal cache per stream, so one stream's
+chunks cannot be spread round-robin over several VAE pods. "More VAE" for one stream means a bigger VAE
+pod (more chips, more tiles) or handing the causal cache between pods; several VAE pods help across
+streams (fan-in/fan-out). Both are measured; the cache hand-off is a candidate new contribution.
