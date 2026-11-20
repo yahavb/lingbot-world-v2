@@ -204,7 +204,9 @@ again dominates [H: 720p, 16-chip DiT + decoders on the second node vs the cost 
 monolith = P_d(N) + T_v(N) and split = max(P_d(n_d), T_v(n_v)) predict all 15 measured LingBot 480 cells within 1.4%
 (3 monoliths, 12 splits); the 720p inline VAE implied at 16 chips is 258 ms vs 254 measured; streams per VAE
 P_d / T_v predicts 3.7 and 2.1 vs 3 and 2 run without slowdown. Scaling extrapolation: P_d(n) = a/n + b fitted on 2, 4, 8
-chips predicts 334 ms at 16 vs 375 measured (12%): a communication term is needed [H: from profiled collective time].
+chips predicts 334 ms at 16 vs 375 measured (12%); with a communication term, P_d(n) = a/n + b + c log2 n fitted on 2, 4,
+8 predicts 385 ms at 16 (+2.5%) [M]. The VAE pod curve fitted on 1, 2, 4 chips predicts 168 ms at 8 vs 153 (+10%):
+conservative, it overstates the decoder's cost [M] (perf/disagg/model_check.py).
 - [H] Fit on 480 and predict 720p; fit on 380 s windows and predict 190 s. Prediction error within z%.
 - [H] Project to larger DiTs (FLOPs scale with parameters × tokens, the decoder with pixels or samples).
 
