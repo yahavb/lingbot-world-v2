@@ -12,3 +12,15 @@ INVALID-probe-cap p3_split_d16v2_480: fps 21.18 over 55 chunks, dit_ms 244.3, va
 INVALID-probe-cap p3_split_d8v4_480: fps 19.65 over 55 chunks, dit_ms 303.1, vae_ms 199.4
 INVALID-probe-cap p3_split_d16v4_480: fps 20.85 over 55 chunks, dit_ms 244.9, vae_ms 176.2
 INVALID-probe-cap p3_split_d8v1_480: fps 19.79 over 55 chunks, dit_ms 302.2, vae_ms 347.6
+p3_split_d16v4_480: fps 32.17 over 55 chunks, dit_ms 245.9, vae_ms 175.4
+p3_split_d8v1_480: fps 25.76 over 55 chunks, dit_ms 303.2, vae_ms 346.4
+STALE-label p3_split_d16v1_480: fps 32.24 over 55 chunks, dit_ms 245.7, vae_ms 175.4
+STALE-label p3_split_d8v2_480: fps 26.03 over 55 chunks, dit_ms 297.6, vae_ms 227.2
+STALE-label p3_split_d16v2_480: fps 32.11 over 55 chunks, dit_ms 243.8, vae_ms 328.5
+STALE-label p3_split_d8v4_480: fps 25.43 over 55 chunks, dit_ms 306.9, vae_ms 195.1
+p3_split_d16v1_480: fps 32.14 over 55 chunks, dit_ms 246.9, vae_ms 326.5
+p3_split_d8v2_480: fps 25.95 over 55 chunks, dit_ms 301.0, vae_ms 226.2
+p3_split_d16v2_480: fps 32.21 over 55 chunks, dit_ms 244.7, vae_ms 208.7
+p3_split_d8v4_480: fps 25.48 over 55 chunks, dit_ms 305.1, vae_ms 195.2
+p2_mono8_480: fps 19.98 over 55 chunks, dit_ms 376.1, vae_ms 129.1
+p2_mono16_480: fps 14.38 over 55 chunks, dit_ms 620.0, vae_ms 137.0
