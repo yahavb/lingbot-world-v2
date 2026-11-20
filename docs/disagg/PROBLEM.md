@@ -30,6 +30,45 @@ same number of chips:
 
 A paper that only compares A and C overstates the case. B is the baseline that makes it honest.
 
+## The model (agreed with the user 2026-11-20): two compute-bound stages, coupled
+Unlike LLM prefill (compute-bound) vs decode (memory/DMA-bound), the DiT and the VAE decoder are both expected
+to be compute-bound (to verify with device profiles). The bottleneck of co-location is the coupling: every chip
+runs the DiT, then every chip runs the VAE, so each stage is charged at the other's chip count.
+
+T_i(n): time of stage i per unit of work (LingBot: a 12-frame chunk; SA3: a window) on n chips;
+e_i(n) = T_i(1) / (n T_i(n)) its parallel efficiency.
+
+- Co-located on N chips: period P_co = T_d(N) + T_v(N); chip-seconds per unit C_co = N T_d(N) + N T_v(N).
+- Disaggregated, n_d DiT chips + n_v VAE chips, replicas rate-matched across roles:
+  P_dis = max(T_d(n_d), T_v(n_v)) (+ hand-off, measured 0.17 ms); C_dis = n_d T_d(n_d) + n_v T_v(n_v).
+- Throughput-per-chip gain = C_co / C_dis, from two terms: (1) parallelism mismatch, each stage at its own
+  efficient n instead of the shared N; (2) serialization, neither stage's compute waits on the other's.
+- Rate matching: if T_v < T_d, one VAE replica serves k = floor(T_d / T_v) DiT replicas; if T_v > T_d, several VAE
+  replicas serve one DiT (SA3: decode chunks are independent; LingBot: per-stream causal VAE state, so across
+  streams or by handing the state over).
+
+Measured so far (480 / 380 s windows): LingBot DiT 2/4/8/16 chips 957/552/372/299 ms (e vs 2 chips 0.87, 0.64,
+0.40); LingBot VAE pod 1/2/4/8 chips 324/213/173/153 ms (e 0.76, 0.47, 0.26), inline on 16 chips 143 ms (e 0.14);
+SA3 DiT 1/2 chips 5.8/4.05 s (e 0.72; TP16 does not shard); SA3 decode 1/2 chips 3.07/1.61 s (e 0.95).
+Example, LingBot at 16 chips: the VAE costs 16 x 143 = 2.29 chip-s per chunk co-located vs 0.32 on its own chip;
+per chunk 7.1 chip-s co-located vs 3.3 for the 8 + 1 split. The two models fail differently: LingBot's VAE does
+not scale (co-location wastes chips on it); SA3's DiT does not scale past 2 chips (co-location cannot add chips).
+VAE busy fraction with one VAE chip: LingBot ~70% of the 8-chip DiT period (324 of 465 ms), ~87% at 16 chips;
+SA3 ~70% (0.56 of 0.8 s a window): at these settings one VAE cannot serve two DiTs.
+
+### Experiments to confirm it
+1. Device profiles of a DiT block and a VAE conv NEFF: Tensor-engine busy, achieved vs peak TFLOPs, DMA time
+   (is each stage compute-bound?).
+2. Efficiency curves: VAE pods 1-16 chips, DiT at every chip count that runs, both sizes; fit serial fraction +
+   communication term.
+3. Device timelines of one co-located and one split period (engine idle time per stage).
+4. Move T_d / T_v (SA3 steps 8 / 25 / 50, LingBot steps 4 / 8, CFG) and check C_co / C_dis against measured
+   throughput per chip, including rate-matched N:M replicas.
+5. Co-located with devices partitioned inside one process group (separates term 1 from per-role scaling).
+6. Extrapolation: a roofline cost model per stage (FLOPs, bytes, collective volume per unit) fitted to 1-4,
+   validated on held-out cells (fit 480 -> predict 720p; fit 380 s -> predict 190 s), then projected to larger
+   DiTs and chip counts.
+
 ## The mechanisms (candidate reasons)
 
 ### M1. Overlap: the VAE leaves the critical path
