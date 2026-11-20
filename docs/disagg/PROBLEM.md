@@ -1,0 +1,117 @@
+# Why split the DiT from the VAE? The research problem, distilled
+
+Companion to RESEARCH_PLAN.md (design space, experiment list). This file states the one question, the
+mechanisms that could answer it, the evidence we already have for each, and the experiment that isolates
+each one. A number marked (measured) comes from a run on KEEP-trn3-dev1; everything else is a hypothesis.
+
+## The question
+
+A streaming video world model makes every chunk in two steps: a DiT denoises a latent chunk, then a VAE
+decodes it to pixels. **Is it worth running the two on different chips, and if so, why?** "Why" means which
+mechanisms produce the gain, how big each one is, and when the gain disappears.
+
+The LLM analogue (prefill/decode disaggregation: DistServe, Splitwise, the NVIDIA study arXiv 2506.05508)
+separates two phases of a *request*. Here the two phases alternate in *every chunk of a stream*, both keep
+state across chunks, and the hand-off is 1.1 MB. So the LLM reasons do not carry over as they are; each one
+has to be re-tested.
+
+## One thing must be ruled out first
+
+Disaggregation has a simpler rival: **co-located pipelining**. Keep one pod but run the VAE of chunk n on
+some of its own cores while the DiT does chunk n+1. If that gets the same result, splitting into pods
+adds nothing but network and operations. So every mechanism below is tested against three setups with the
+same number of chips:
+
+| Setup | What it is |
+|---|---|
+| A. Co-located, serial | today's monolith: DiT, then VAE, on the same cores |
+| B. Co-located, pipelined | one pod; the VAE on dedicated cores of the same chips, overlapped with the DiT |
+| C. Disaggregated | DiT pod + VAE pod(s), latent over NeuronLink (same node) or EFA (cross node), NIXL |
+
+A paper that only compares A and C overstates the case. B is the baseline that makes it honest.
+
+## The mechanisms (candidate reasons)
+
+### M1. Overlap: the VAE leaves the critical path
+Serial: time per chunk = T_dit + T_vae. Overlapped: max(T_dit, T_vae). Both B and C get this.
+- Evidence (measured): 2 chips co-located 11.53 fps; 2 + 1 chips split 14.65-14.75 fps.
+- Open gap (measured): in the split, the DiT takes 519 ms per chunk, which allows 23 fps, but the stream runs
+  at about 14.7 fps (816 ms per 12 frames). Something other than the DiT and the VAE sets the pace. It has to
+  be explained before any claim about overlap: host scheduling, the KV-cache commit step, broadcasts.
+- Test: per-chunk timeline (DiT forward, commit, hand-off, VAE, frames out) for A, B, C.
+
+### M2. Interference: the DiT runs faster when the VAE is not beside it
+- Evidence (measured): the DiT's own time per chunk is 676 ms co-located and 519 ms split, on the same 2 chips
+  and the same graphs. That 23% is not overlap; it is the DiT itself slowing down when the VAE shares its
+  chips. Candidates: switching between the two programs (NEFF loads), HBM and allocator pressure, cache
+  thrash, the VAE's collectives on the DiT's rank group.
+- Why it matters: B (same chips, other cores) may keep this interference; C removes it. This is the
+  mechanism most likely to separate B from C, and the closest analogue to DistServe's prefill/decode
+  interference.
+- Test: DiT-only time per chunk in A, B, C; neuron-profile of the DiT forward with and without the VAE
+  resident; HBM in use; NEFF switch counts.
+
+### M3. Memory headroom: the DiT fills the chips
+- Evidence (measured): with the DiT loaded, the VAE-encode of a new start image (needed to re-anchor a long
+  stream) failed with out-of-memory on the DiT chips (2026-11-19, re-anchor test). Scenes only work today
+  because their images are encoded at startup, before the DiT loads.
+- Why it matters: features that need the VAE at run time (re-anchoring, new start images, a larger decode
+  window, higher resolution) do not fit co-located. A VAE pod with its own memory allows them. This is a
+  capability reason, not a speed reason.
+- Test: largest decode resolution and longest decode window that fit in A/B vs C; whether re-anchoring
+  works (encode on the VAE pod).
+
+### M4. Each side gets its own parallelism
+The DiT wants tensor x sequence parallel over many ranks; the VAE wants a few spatial tiles.
+- Evidence (measured): co-located, the VAE has to run on the DiT's 8 ranks; one tiling (4 x 2) decoded black
+  frames, and 2 x 4 needed a special layout. Split, the VAE uses 4 ranks with 2 x 2 tiles.
+- Test: VAE time per chunk vs number of ranks (1, 2, 4, 8) and tiling; how much of it is halo exchange.
+
+### M5. Rate matching: one VAE can feed several streams
+- Estimate: in the split, the VAE is busy about 202 ms of every 816 ms chunk (~25%), so one VAE chip could
+  serve 3-4 DiT streams. Co-located, each stream carries a VAE that sits idle most of the time.
+- Evidence (measured, cost side): 4-chip monolith 14.1 fps vs 2 + 1 split 14.7 fps: the same speed on 25%
+  fewer chips (4.9 vs 3.5 fps per chip).
+- Test: k DiT streams : 1 VAE for k = 1..4: fps per stream, VAE utilization, chips per stream, cost per
+  stream-hour. This is the Pareto chart (fps per stream vs streams per chip).
+
+### M6. Heterogeneity: the VAE does not need the newest chip
+- Test: VAE on trn2 (or a part of a trn3) with the DiT on trn3: fps and cost per stream-hour.
+
+### M7. Failure isolation and elasticity
+- Evidence (measured): a VAE pod deleted or its device tainted mid-stream: switch in about 3 s, 140/140
+  chunks, no pause over 1.5 s. Co-located, any fault restarts the whole pod (about 15 minutes with warmup).
+- Test: failure timeline (fps over time with fault events); scaling the VAE pool 0 -> N under load.
+
+### M8. Latency for control (robotics, games)
+Splitting does not make one chunk faster: it is still DiT, then VAE. What can change is the wait: a key press
+waits for the current DiT step, not the current DiT + VAE step. But the hand-off adds a hop (0.17 ms over EFA,
+measured), and a deeper pipeline can add a chunk of delay.
+- Test: scripted key presses, press-to-first-changed-frame, split into wait / DiT / hand-off / VAE / network
+  / client buffer, as a CDF over 100 presses, for A, B, C.
+- This could come out against splitting. Either result goes in the paper.
+
+## Where splitting should not pay (to map, not to hide)
+- One stream with chips to spare: the 4-chip monolith is about as fast as the split.
+- A VAE that is a small share of the chunk time (low resolution, many denoise steps).
+- The operating cost of two services (discovery, failover, a transport).
+
+## What the paper would claim, if the data holds
+1. For streaming diffusion, the gain from splitting comes from interference and memory (M2, M3) and rate
+   matching (M5), not only from overlap (M1), which co-located pipelining also gets.
+2. The hand-off is so small that placement is nearly free: same node over NeuronLink or cross node over EFA.
+   That makes fan-in and mixed chip types practical in a way they are not for LLM KV-cache transfer.
+3. The Trainium stack to do it (EKS, DRA claims with paired EFA, NIXL on Neuron memory) and what broke along
+   the way.
+
+## Use cases each metric speaks to
+- Games and interactive worlds: fps per stream, press-to-frame latency.
+- Robotics (world model as a closed-loop simulator; many parallel rollouts for policy training): latency
+  bound, streams per chip, cost per stream-hour.
+- Synthetic data (long offline rollouts): throughput per chip, quality over minutes.
+
+## Order of work (each step can change the next)
+1. Explain the 519 ms vs 816 ms gap (M1). Without it, the overlap numbers mean little.
+2. Build setup B, then measure M2 (DiT time per chunk in A, B, C).
+3. M5 fan-in and the Pareto chart; M3 memory limits.
+4. M8 latency; M6 trn2; M7 failure timeline; placement (NeuronLink vs EFA).

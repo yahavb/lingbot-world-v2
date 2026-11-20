@@ -1,5 +1,7 @@
 # DiT/VAE disaggregation for streaming video world models: research plan
 
+See PROBLEM.md for the distilled question and the mechanisms behind it.
+
 Working title: **"Split the Denoiser from the Decoder: Disaggregated Serving for Streaming Video World Models
 on AWS Trainium"**. Modeled on NVIDIA's "Beyond the Buzz: A Pragmatic Take on Inference Disaggregation"
 (arXiv 2506.05508), which studies prefill/decode for LLMs, but for the diffusion pattern: a DiT that
