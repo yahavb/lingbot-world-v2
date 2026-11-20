@@ -199,6 +199,13 @@ async function start() {
   abort = ctl;
   $("start").disabled = true; $("stopBtn").disabled = false;
   say("Starting. The first frames take a few seconds.");
+  // Muse's first line, 5 s in: the scene prompt's first sentence (true of the video by construction), so the
+  // terminal is not blank until the first description comes back
+  const sp = (scenes.find((x) => x.id === scene) || {}).prompt || "";
+  let first1 = (sp.match(/^[^.!?]*[.!?]?/) || [""])[0].trim();
+  if (first1.length > 160) first1 = first1.slice(0, first1.lastIndexOf(",", 160)) + ".";  // a prompt with no early period
+  first1 = first1.charAt(0).toUpperCase() + first1.slice(1);
+  if (first1) setTimeout(() => { if (abort === ctl) museLine(first1); }, 5000);
   try {
     const r = await fetch("api/session", { method: "POST", signal: ctl.signal,
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scene }) });
