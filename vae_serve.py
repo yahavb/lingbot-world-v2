@@ -60,6 +60,7 @@ def run_server(jobs, state):
             from wan.nixl_link import SESSIONS
             sid = state.get("next_sid", 0)
             state["next_sid"] = (sid + 1) % SESSIONS
+            state.setdefault("seen", {})[sid] = time.time()
             return state["nixl"].info(sid)
         if state.get("rank") is None:
             raise HTTPException(status_code=503, detail="warming up")
@@ -73,6 +74,7 @@ def run_server(jobs, state):
             raise HTTPException(status_code=503, detail="warming up")
         result = queue.Queue()
         body = await request.body()
+        state.setdefault("seen", {})[sid] = time.time()
         jobs.put((None if rdma else body, bool(first), result, seq, sid))
 
         def parts():
@@ -102,6 +104,12 @@ def run_server(jobs, state):
             if part is not None:
                 frames += part
         return {"frames": frames}
+
+    @app.get("/load")
+    def load():
+        """Sessions linked or decoding in the last LOAD_WINDOW_S seconds (the DiT's least-loaded VAE choice)."""
+        now, win = time.time(), float(os.environ.get("LOAD_WINDOW_S", "30"))
+        return {"sessions": sum(1 for t in state.get("seen", {}).values() if now - t < win)}
 
     @app.get("/health")
     def health():

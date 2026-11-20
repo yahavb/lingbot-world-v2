@@ -101,6 +101,16 @@ class VaePool:
         self.release()
         cands = self.available()
         random.shuffle(cands)
+        if os.environ.get("LINGBOT_VAE_LEAST_LOADED", "0") == "1":
+            # horizontal scaling of the decoder role: link to the VAE serving the fewest sessions (GET /load)
+            def load(c):
+                try:
+                    return int(self.http.get(f"http://{c[1]}:{self.port}/load", timeout=1).json()["sessions"])
+                except Exception:
+                    return 1 << 20
+            loads = {c[0]: load(c) for c in cands}
+            cands.sort(key=lambda c: loads[c[0]])
+            log.info(f"VAE loads: {loads}")
         cands.sort(key=lambda c: c[0] != prefer)
         for name, ip in cands:
             try:
