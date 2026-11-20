@@ -1,0 +1,4 @@
+p1_dit8_480: fps 25.84 over 55 chunks, dit_ms 371.7, vae_ms 0.4
+p1_dit4_480: fps 17.49 over 55 chunks, dit_ms 551.7, vae_ms 0.3
+p1_dit16_480: fps 31.97 over 55 chunks, dit_ms 299.1, vae_ms 0.4
+p1_dit2_480: fps 10.07 over 55 chunks, dit_ms 957.5, vae_ms 0.3
