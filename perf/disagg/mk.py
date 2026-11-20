@@ -72,6 +72,9 @@ def claim_paired(n):
         cons.append({"matchAttribute": "resource.aws.com/devicegroup1_id", "requests": [f"neurons-{i}", f"efas-{i}"]})
     if n > 1:
         cons.append({"matchAttribute": "resource.aws.com/devicegroup4_id", "requests": [r["name"] for r in reqs]})
+        # a directly linked pair: devices 5 + 6 (same group of 4) failed "ALLREDUCE over 8 ranks not supported";
+        # linked pairs share topology_x
+        cons.append({"matchAttribute": "neuron.aws.com/topology_x", "requests": [f"neurons-{i}" for i in range(n)]})
     return {"apiVersion": "resource.k8s.io/v1", "kind": "ResourceClaimTemplate",
             "metadata": {"name": f"x-lnc2-efa-{n}", "namespace": "default"},
             "spec": {"spec": {"devices": {"requests": reqs, "constraints": cons, "config": [{
