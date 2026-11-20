@@ -23,7 +23,6 @@ spec:
       serviceAccountName: lbw-dit   # watches the lbw-vae pods (VAE_SELECTOR) to pick a VAE per session
       nodeSelector:
         node-type: trn3-dev1
-        kubernetes.io/hostname: ip-192-168-192-137.us-east-2.compute.internal
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: m-lnc2-efa
@@ -202,8 +201,8 @@ spec:
             - name: VAE_SELECTOR
               value: "app=lbw-vae"
             - name: LINGBOT_REANCHOR_FRAMES
-              # live sessions restart from the last frame every ~800 frames (a long rollout drifts)
-              value: "800"
+              # 0 = off. 800 failed: a new start image needs a ~10 s VAE encode that OOMs next to the DiT
+              value: "0"
             - name: BRANCH
               value: "main"
             - name: SEG_CHUNKS

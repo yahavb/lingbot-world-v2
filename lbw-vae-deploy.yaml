@@ -20,7 +20,6 @@ spec:
     spec:
       nodeSelector:
         node-type: trn3-dev1
-        kubernetes.io/hostname: ip-192-168-192-229.us-east-2.compute.internal
       resourceClaims:
         - name: neuroncores
           resourceClaimTemplateName: s-lnc2-efa
