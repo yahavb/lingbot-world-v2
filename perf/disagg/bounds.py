@@ -37,9 +37,9 @@ def load(p):
 
 
 def eng_busy(eo, name):
-    for e in eo.get("engines", []):
-        if e.get("engine", "").lower().startswith(name):
-            return e.get("busy_ms")
+    for k, e in (eo.get("engines") or {}).items():
+        if k.lower().startswith(name):
+            return e["busy_ns"] / 1e6
     return None
 
 
@@ -60,10 +60,11 @@ def main():
         bw = peak / s["peak_flops_bandwidth_ratio"] if peak else 0
         comp = s["model_flops"] / peak * 1e3 if peak else 0
         hbm = (s["hbm_read_bytes"] + s["hbm_write_bytes"]) / bw * 1e3 if bw else 0
-        tensor = eng_busy(eo, "tensor") or 100 * 0 + s.get("tensor_engine_active_time_percent", 0) * t
+        tensor = eng_busy(eo, "tensor") or s.get("tensor_engine_active_time_percent", 0) * t
         dma = s.get("dma_active_time_percent", 0) * t
-        serial = (eo.get("one_engine_ms") or 0) + (eo.get("all_idle_ms") or 0)
-        role = "vae" if re.search(r"vae", open(os.path.join(p, "pair.json")).read() if os.path.exists(os.path.join(p, "pair.json")) else name) else "dit"
+        serial = ((eo.get("n_busy_ns") or {}).get("1", 0) + (eo.get("idle_ns") or 0)) / 1e6
+        src = " ".join(x[1] for x in eo.get("serial_src", []))
+        role = "vae" if re.search(r"vae", src + (open(os.path.join(p, "pair.json")).read() if os.path.exists(os.path.join(p, "pair.json")) else "")) else "dit"
         cand = {"COMPUTE/ARRAY": tensor, "HBM": hbm, "ONCHIP-MOVE" if dma > 2 * hbm else "HBM": dma, "SERIAL": serial}
         cls = max(cand, key=cand.get)
         if cls == "COMPUTE/ARRAY":
