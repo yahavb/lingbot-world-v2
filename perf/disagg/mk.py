@@ -168,6 +168,9 @@ def vae(a):
     env_set(c, "LAT_W", lw)
     env_set(c, "LINGBOT_VAE_PER_DEVICE", a.per_device)
     env_set(c, "CACHE_VERSION", a.cache)
+    for kv in getattr(a, "env", []):
+        k, v = kv.split("=", 1)
+        env_set(c, k, v)
     return d
 
 
@@ -184,6 +187,7 @@ def main():
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
+    p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     a = ap.parse_args()
     os.makedirs(GEN, exist_ok=True)
     if a.cmd == "claim":
