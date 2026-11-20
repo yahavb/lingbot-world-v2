@@ -6,20 +6,20 @@ set -uo pipefail
 K="kubectl --context yahavb-Isengard@KEEP-trn3-dev1.us-east-2.eksctl.io"
 tag=$1; pairs=$2
 cd "$(dirname "$0")/../.."
-$K label pod -l 'app in (vae-1c,vae-2c,vae-4c)' pool- >/dev/null 2>&1   # every VAE out of every pool first
+$K label pod -l 'app in (vae-1c,vae-2c,vae-4c,vae-8c,hvae-1c,hvae-2c,hvae-4c,hvae-8c)' pool- >/dev/null 2>&1   # every VAE out of every pool first
 for pr in $pairs; do
   d=${pr%%:*}; v=${pr##*:}
-  until $K get pods -l app=vae-${v}c --no-headers | grep -q " 1/1 "; do sleep 20; done
-  $K label pod -l app=vae-${v}c pool=s$d-split --overwrite >/dev/null
+  until $K get pods -l app=${VPFX:-vae}-${v}c --no-headers | grep -q " 1/1 "; do sleep 20; done
+  $K label pod -l app=${VPFX:-vae}-${v}c pool=${PFX:-s}$d-split --overwrite >/dev/null
 done
 sleep 15   # the DiT's pool re-lists pods every 5 s
 for pr in $pairs; do
   d=${pr%%:*}; v=${pr##*:}
-  perf/disagg/run_cell.sh s$d-split p3_split_d${d}v${v}_$tag 60 > perf/disagg/results/run_s${d}v$v.out 2>&1 &
+  perf/disagg/run_cell.sh ${PFX:-s}$d-split p3_split_d${d}v${v}_$tag 60 > perf/disagg/results/run_s${d}v$v.out 2>&1 &
 done
 wait
 for pr in $pairs; do
   d=${pr%%:*}; v=${pr##*:}
-  used=$($K logs "$($K get pods -l app=s$d-split --no-headers | awk '{print $1}')" --since=10m 2>/dev/null | grep -ao "session VAE: [a-z0-9-]*" | tail -1)
+  used=$($K logs "$($K get pods -l app=${PFX:-s}$d-split --no-headers | awk '{print $1}')" --since=10m 2>/dev/null | grep -ao "session VAE: [a-z0-9-]*" | tail -1)
   echo "$(tail -1 perf/disagg/results/run_s${d}v$v.out)  [$used]"
 done
