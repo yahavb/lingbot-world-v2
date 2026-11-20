@@ -117,6 +117,10 @@ def dit(a):
         env_set(c, "LINGBOT_PRE_ENCODE_RANK0", "1")
         # 720p: the blocked-key CTE kernel rejects 10560 keys a chunk ("k_blocks: keys exceed the section")
         env_set(c, "LINGBOT_K_BLOCKED", "0")
+        # and its chained calls need one flash section ("chained calls: one flash section only"); V token-major
+        # goes with the chain
+        env_set(c, "LINGBOT_CTE_CHAIN", "0")
+        env_set(c, "LINGBOT_V_TOKEN_MAJOR", "0")
     env_set(c, "CACHE_VERSION", a.cache or f"{a.flags}{a.chips}")   # one cache per flag set x chip count
     # ranks loading the checkpoint at once: all 64 at 16 chips exceeded 950 GiB of host memory (OOMKilled)
     env_set(c, "LINGBOT_LOAD_CONCURRENCY", nproc if a.flags == "t22" else min(nproc, 16))
