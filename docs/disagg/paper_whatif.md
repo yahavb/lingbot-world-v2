@@ -230,6 +230,11 @@ Claims
   one decoder chip holds M sessions' causal caches while it has compute to spare; the DiT fills its chips with weights +
   KV cache (720p co-located 8 chips does not fit [M]) [M: 427 MiB causal cache per session per rank; 4 sessions 1.7 GiB; the VAE rank's device use ~3 GiB].
 
+- C4 Horizontal scaling per role (the OS claim): one decoder replica serves about T_d / T_v DiT streams (LingBot 2-chip
+  DiT ~3.7, measured 3 without slowdown; 4-chip ~2, measured 2; SA3 25 steps ~4.5, measured 4, 6 saturate [M]); beyond
+  that ratio the operating layer adds decoder replicas and spreads sessions over them (least-loaded placement), keeping
+  the ratio while streams scale out; DiT and decoder pools grow independently [H: 2 VAEs x 6 streams, 3 x 9].
+
 Considerations
 - K1 Sizing is a deploy-time decision. Steps, resolution / window length, chunk size and model are fixed per service
   before serving, so T_d and T_v are known in advance and the planner picks n_d, n_v and the N:M ratio from measured
