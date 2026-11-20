@@ -457,9 +457,14 @@ def main():
                              args.frame_num, args.chunk_size, MAX_AREA_CONFIGS[args.size],
                              EXACT_GRID_SIZES.get(args.size), cfg.vae_stride, cfg.patch_size)
     if rank0_only:
-        box = [dict(_PRE_ENCODED) if rank == 0 else None]
-        dist.broadcast_object_list(box, src=0)
-        _PRE_ENCODED.update(box[0])
+        # through a host file (every rank is in this pod): broadcast_object_list stages the pickle in device
+        # memory, which the encode had just filled (720p: 1.4 GB allocation failed)
+        shared = "/dev/shm/lbw_pre_encoded.pt"
+        if rank == 0:
+            torch.save({k: v.cpu() for k, v in _PRE_ENCODED.items()}, shared)
+        dist.barrier()
+        if rank != 0:
+            _PRE_ENCODED.update(torch.load(shared))
     dist.barrier()
     if rank == 0:
         logging.info(f"pre-encoded scenes {sorted(scene_imgs)} in {time.perf_counter() - t0:.1f} s")
