@@ -188,6 +188,14 @@ the LLM decode stage.
 - 720p: co-located 8 chips does not fit [M]; 16+1 gives 1.27x [M].
 - SA3: monolith 2 chips 6.15 s, 2+1 split 5.40 s, for 1800 s of audio [M].
 
+**6.3b Resolution: memory, not only speed.** At 720p (704x1280 grid, 10560 tokens a chunk vs 4320) [M]:
+co-located 8 chips does not fit in device memory once the decoder loads, while the 8-chip DiT alone fits and runs at
+8.5 fps split [M]; co-located 4 chips does not fit either way [M]. At 16 chips the split gains 1.27x (16+1: 12.7 vs
+10.0 fps) [M], less than at 480 (1.37x), because attention grows with the square of the tokens and the decoder's share
+falls (~33% of the DiT step vs 48%) [M]. So at high resolution disaggregation decides whether a chip budget can serve
+the model at all (the memory term); the speed term returns at larger DiT chip counts, where the decoder's flat time
+again dominates [H: 720p, 16-chip DiT + decoders on the second node vs the cost model's co-located 32-chip estimate].
+
 **6.4 Moving the stage ratio.**
 - [H] SA3 at 8, 25 and 50 steps; LingBot at 4 and 8 steps; CFG on and off.
 - The gain follows (T_d + T_v) / max(T_d, T_v) toward 2x per stream at T_d ≈ T_v.
