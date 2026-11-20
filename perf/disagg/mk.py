@@ -127,6 +127,13 @@ def dit(a):
             env_del(c, k)
     if a.mode == "null":
         env_set(c, "LINGBOT_NULL_DECODE", "1")
+    if a.sysprof:
+        # Neuron runtime system profile of global rank 0 (perf/sysprof_rank0.sh): one span per NEFF execution
+        cmd = c["command"][2]
+        old = 'torchrun --nproc_per_node="$NPROC" serve.py'
+        assert old in cmd
+        c["command"][2] = cmd.replace(old, 'torchrun --nproc_per_node="$NPROC" --no-python bash perf/sysprof_rank0.sh python3 serve.py')
+        env_set(c, "SYSPROF_DIR", "/logs/sysprof")
     for kv in a.env:
         k, v = kv.split("=", 1)
         env_set(c, k, v)
@@ -160,6 +167,7 @@ def main():
     p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="")
     p.add_argument("--flags", choices=["mono", "t22"], default="mono")
     p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
+    p.add_argument("--sysprof", action="store_true", help="runtime system profile of rank 0")
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
