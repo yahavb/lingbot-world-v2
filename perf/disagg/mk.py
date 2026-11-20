@@ -110,7 +110,10 @@ def dit(a):
     env_set(c, "CP", nproc // TP)
     env_set(c, "SIZE", a.size)
     env_set(c, "CACHE_VERSION", a.cache or f"{a.flags}{a.chips}")   # one cache per flag set x chip count
-    env_set(c, "LINGBOT_LOAD_CONCURRENCY", nproc)
+    # ranks loading the checkpoint at once: all 64 at 16 chips exceeded 950 GiB of host memory (OOMKilled)
+    env_set(c, "LINGBOT_LOAD_CONCURRENCY", nproc if a.flags == "t22" else min(nproc, 16))
+    if a.chips >= 16:
+        c["resources"]["limits"]["memory"] = "1600Gi"
     if a.mode == "split":
         env_set(c, "VAE_URL", f"http://{a.vae_app}.default.svc.cluster.local:8000")
         env_set(c, "VAE_SELECTOR", f"app={a.vae_app}")
