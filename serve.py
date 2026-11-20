@@ -64,6 +64,7 @@ SEG_CHUNKS = int(os.environ.get("SEG_CHUNKS", "7"))
 SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
 NULL_DECODE = os.environ.get("LINGBOT_NULL_DECODE", "0") == "1"
+PHASE_SYNC = os.environ.get("LINGBOT_PHASE_SYNC", "0") == "1"
 NULL_FRAMES = lambda c: 4 * int(os.environ.get("CHUNK_SIZE", "3")) - (3 if c == 0 else 0)   # 9, then 12 per chunk
 
 
@@ -597,6 +598,18 @@ def main():
                     x0_dev.sum().item()               # the chunk's latents are really done
                     for _ in range(NULL_FRAMES(chunk_id)):
                         emit(_null_jpeg())
+            elif VAE_URL is None and PHASE_SYNC:
+                # LINGBOT_PHASE_SYNC=1 (measurement): wait for the device before and after the inline decode, so
+                # [PHASE] gives each chunk's true DiT time (start -> device done) and VAE time on the same ranks;
+                # with async execution a decode's device work otherwise lands inside the next chunk's DiT time
+                torch.neuron.synchronize()
+                t_dit = time.time()
+                decode_local(chunk_id, x0, emit)
+                torch.neuron.synchronize()
+                if rank == 0:
+                    st = times.get("start") or t_dit
+                    logging.info(f"[PHASE] chunk {chunk_id} dit_ms {1000 * (t_dit - st):.1f} "
+                                 f"vae_ms {1000 * (time.time() - t_dit):.1f}")
             elif VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None and rdma is not None:

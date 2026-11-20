@@ -127,6 +127,9 @@ def dit(a):
             env_del(c, k)
     if a.mode == "null":
         env_set(c, "LINGBOT_NULL_DECODE", "1")
+    for kv in a.env:
+        k, v = kv.split("=", 1)
+        env_set(c, k, v)
     return d
 
 
@@ -156,6 +159,7 @@ def main():
     p.add_argument("mode", choices=["split", "inline", "null"]); p.add_argument("--vae-app", default="")
     p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="")
     p.add_argument("--flags", choices=["mono", "t22"], default="mono")
+    p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
