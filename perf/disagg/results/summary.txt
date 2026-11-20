@@ -73,3 +73,12 @@ hs_6x2_c: fps 10.05 over 55 chunks, dit_ms 743.7, vae_ms 545.4
 hs_6x2_d: fps 10.04 over 55 chunks, dit_ms 747.9, vae_ms 486.5
 hs_6x2_e: fps 10.03 over 55 chunks, dit_ms 750.2, vae_ms 485.9
 hs_6x2_f: fps 10.05 over 55 chunks, dit_ms 746.0, vae_ms 490.0
+hs_9x3_a: fps 10.04 over 55 chunks, dit_ms 748.1, vae_ms 486.1
+hs_9x3_b: fps 10.02 over 55 chunks, dit_ms 749.7, vae_ms 491.4
+hs_9x3_c: fps 10.07 over 55 chunks, dit_ms 742.6, vae_ms 497.6
+hs_9x3_d: fps 10.02 over 55 chunks, dit_ms 747.0, vae_ms 487.0
+hs_9x3_e: fps 10.04 over 55 chunks, dit_ms 749.9, vae_ms 667.3
+hs_9x3_f: fps 10.04 over 55 chunks, dit_ms 749.4, vae_ms 523.7
+hs_9x3_g: fps 10.10 over 55 chunks, dit_ms 742.8, vae_ms 487.4
+hs_9x3_h: fps 10.07 over 55 chunks, dit_ms 748.0, vae_ms 492.2
+hs_9x3_i: fps 10.07 over 55 chunks, dit_ms 744.0, vae_ms 488.8
