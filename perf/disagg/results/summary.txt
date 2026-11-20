@@ -48,3 +48,9 @@ p3_split_d8v4_720: fps 8.38 over 55 chunks, dit_ms 888.9, vae_ms 497.7
 p3_split_d16v1_720: fps 12.68 over 55 chunks, dit_ms 593.2, vae_ms 831.5
 p3_split_d16v2_720: fps 12.65 over 55 chunks, dit_ms 590.6, vae_ms 542.9
 p3_split_d16v4_720: fps 12.16 over 55 chunks, dit_ms 617.1, vae_ms 408.5
+p8_devprof_mono4_480: fps 14.33 over 15 chunks, dit_ms 549.5, vae_ms 151.9
+p8_devprof_mono4_480: fps 14.33 over 15 chunks, dit_ms 549.2, vae_ms 152.7
+p9_emit1_r1_480: fps 15.53 over 55 chunks, dit_ms 550.8, vae_ms 129.5
+p9_emit0_r1_480: fps 14.24 over 55 chunks, dit_ms 552.6, vae_ms 151.1
+p9_emit1_r2_480: fps 15.55 over 55 chunks, dit_ms 550.5, vae_ms 127.2
+p9_emit0_r2_480: fps 14.18 over 55 chunks, dit_ms 553.3, vae_ms 152.4

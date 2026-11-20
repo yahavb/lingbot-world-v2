@@ -320,6 +320,9 @@ spec:
               value: "1"
             - name: LINGBOT_VAE_FUSED
               value: "1"
+            # JPEG encode + emit of each decoded chunk on a worker thread (4-chip serving 14.2 -> 15.5 fps, same bytes)
+            - name: LINGBOT_EMIT_ASYNC
+              value: "1"
       volumes:
         - name: node-cache
           hostPath:
