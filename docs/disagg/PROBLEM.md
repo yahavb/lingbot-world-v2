@@ -127,6 +127,9 @@ chips. The split wins if it gets the same fps on fewer chips (cheaper) or more f
 | 16 chips | 8 + 1 (9), 8 + 2 (10), 8 + 4 (12), 8 + 8 (16) |
 | none (the monolith stops scaling) | 16 + 1, 2, 4, 8 (VAE on the second node, over EFA) |
 
+Then the same sweep at 720p (agreed 2026-11-19): ~2.5x the pixels per chunk pushes the VAE decode, so the
+scaling gap between the phases should grow; it is the second proof of the mechanism.
+
 Rules: one stream, 480x768 first (then 720p), the same DiT and VAE flags in the monolith and the split (the
 common set, plus the tuned 2-chip flags as a second data point at 4 chips), 60 chunks, the scene's own camera
 path, fps measured at the client (perf/disagg/run_cell.sh, results in perf/disagg/results/summary.txt).
