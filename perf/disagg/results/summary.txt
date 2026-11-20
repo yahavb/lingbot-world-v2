@@ -45,3 +45,6 @@ p7_mono16_720: fps 9.96 over 55 chunks, dit_ms 758.6, vae_ms 254.4
 p3_split_d8v1_720: fps 8.46 over 55 chunks, dit_ms 891.6, vae_ms 920.8
 p3_split_d8v2_720: fps 8.28 over 55 chunks, dit_ms 892.5, vae_ms 630.5
 p3_split_d8v4_720: fps 8.38 over 55 chunks, dit_ms 888.9, vae_ms 497.7
+p3_split_d16v1_720: fps 12.68 over 55 chunks, dit_ms 593.2, vae_ms 831.5
+p3_split_d16v2_720: fps 12.65 over 55 chunks, dit_ms 590.6, vae_ms 542.9
+p3_split_d16v4_720: fps 12.16 over 55 chunks, dit_ms 617.1, vae_ms 408.5
