@@ -314,6 +314,31 @@ def b64_jpeg(img):
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# LINGBOT_EMIT_ASYNC=1: rank 0 copies a decoded chunk to the host once and JPEG-encodes / emits its frames on one
+# worker thread (in order), instead of converting frame by frame inline while every other rank waits at the
+# decode's barrier (the device sat idle ~45 ms a chunk there, 4-chip monolith system trace). Same bytes.
+EMIT_ASYNC = os.environ.get("LINGBOT_EMIT_ASYNC", "0") == "1"
+_EMITTER = None
+
+
+def emit_frames(video, emit):
+    """[C, T, H, W] in [-1, 1] -> T JPEG frames, each to emit(), in order."""
+    global _EMITTER
+    if not EMIT_ASYNC:
+        for t in range(video.shape[1]):
+            emit(b64_jpeg(to_pil(video[:, t])))
+        return
+    if _EMITTER is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _EMITTER = ThreadPoolExecutor(1)
+    host = video.detach().to("cpu")
+
+    def work():
+        for t in range(host.shape[1]):
+            emit(b64_jpeg(to_pil(host[:, t])))
+    _EMITTER.submit(work)
+
+
 def run_server(sched):
     import asyncio
     from fastapi import FastAPI, HTTPException, Request
@@ -565,8 +590,7 @@ def main():
             out = out.float().clamp_(-1, 1).squeeze(0)
             video = F.gather_video_2d(out) if F._TWO_D else gather_video_width(out)
             if rank == 0:
-                for t in range(video.shape[1]):
-                    emit(b64_jpeg(to_pil(video[:, t])))
+                emit_frames(video, emit)
         with F.vae_cc_scope():      # VAE compiler options for the decoder's graphs only, never the DiT's
             fdec.decode_chunk(local.unsqueeze(0), v.scale, chunk_id == 0, on_step=step)
         dist.barrier()
@@ -585,8 +609,7 @@ def main():
                 first=(chunk_id == 0)))
             if rank == 0:
                 video = video[..., :lat_w * cfg.vae_stride[2]]
-                for t in range(video.shape[1]):
-                    emit(b64_jpeg(to_pil(video[:, t])))
+                emit_frames(video, emit)
         dist.barrier()
 
     def run_session(prompt, img, seed, action_path, control):
