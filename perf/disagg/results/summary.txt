@@ -113,3 +113,12 @@ p15_dma_r1_480: fps 15.54 over 55 chunks, dit_ms 550.5, vae_ms 155.6
 p15_pe_r1_480: fps 14.90 over 55 chunks, dit_ms 577.8, vae_ms 125.8
 p15_dma_r2_480: fps 15.54 over 55 chunks, dit_ms 549.8, vae_ms 156.3
 p15_pe_r2_480: fps 14.91 over 55 chunks, dit_ms 577.9, vae_ms 125.1
+hs3_9x3_a: fps 10.01 over 55 chunks, dit_ms 747.3, vae_ms 698.5
+hs3_9x3_b: fps 10.02 over 55 chunks, dit_ms 751.7, vae_ms 485.8
+hs3_9x3_c: fps 10.01 over 55 chunks, dit_ms 753.5, vae_ms 485.5
+hs3_9x3_d: fps 9.99 over 55 chunks, dit_ms 749.0, vae_ms 491.9
+hs3_9x3_e: fps 10.04 over 55 chunks, dit_ms 748.2, vae_ms 486.5
+hs3_9x3_f: fps 10.02 over 55 chunks, dit_ms 750.7, vae_ms 485.0
+hs3_9x3_g: fps 10.07 over 55 chunks, dit_ms 748.1, vae_ms 698.0
+hs3_9x3_h: fps 10.07 over 55 chunks, dit_ms 744.4, vae_ms 485.8
+hs3_9x3_i: fps 10.09 over 55 chunks, dit_ms 745.3, vae_ms 486.8
