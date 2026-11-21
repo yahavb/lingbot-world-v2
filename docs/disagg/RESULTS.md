@@ -1,65 +1,94 @@
-# DiT/VAE disaggregation: measured results (KEEP-trn3-dev1, 2026-11-19/20)
+# DiT/VAE disaggregation: every measured number and where it comes from
 
-One live stream, scene 03, the scene's own camera path, 60 chunks (12 frames each), fps at the client
-(perf/disagg/run_cell.sh). trn3-dev1, LNC2 (4 ranks per chip), TP4 x CP(chips), MXFP8 DiT, bf16 VAE. The same
-DiT and VAE flags in the monolith and the split (perf/disagg/mk.py "mono" set; at 720p three attention
-options that only handle 480 shapes are off on both sides). Split: VAE on the OTHER node, latents over EFA
-with NIXL. Raw rows: perf/disagg/results/summary.txt and the per-cell CSVs.
+This file is the data index for paper_draft.md. All runs are on KEEP-trn3-dev1 (trn3-dev1, LNC2, Neuron SDK 2.33),
+2026-11-19 to 11-21.
 
-## The core comparison (monolith N chips vs split N/2 DiT + VAE)
+- LingBot rows are in perf/disagg/results/summary.txt, with per-chunk CSVs perf/disagg/results/<cell>.csv.
+- Stable Audio rows are on github yahavb/stable-audio-3-medium, branch disagg, bench/disagg/*.log.
+- Rows marked DISCARD, INVALID, FLAGLEAK or STALE in summary.txt are superseded; the reason is in the commit that
+  marked them.
 
-480 x 768:
+## LingBot-World v2, 480x768, fps per stream
 
-| Monolith | fps | Split (DiT + VAE chips) | fps |
-|---|---|---|---|
-| 4 chips | 14.3 | 2+1, 2+2 (common flags) | 10.1, 10.1 |
-| | | 2+1, 2+2 (tuned 2-chip flags) | 14.7, 14.6 |
-| 8 chips | 20.0 | 4+1, 4+2, 4+4 | 17.5, 17.5, 17.5 |
-| 16 chips | 23.4 | 8+1, 8+2, 8+4, 8+8 | 25.8, 26.0, 25.5, 25.6 |
-| (none) | | 16+1, 16+2, 16+4 | 32.1, 32.2, 32.2 |
+| Measurement | Value | Cells |
+|---|---|---|
+| DiT alone, 2/4/8/16 chips | 10.07 / 17.49 / 25.84 / 31.97 fps (period 1192 / 686 / 464 / 375 ms) | p1_dit{2,4,8,16}_480 |
+| Co-located, 4/8/16 chips | 14.33 / 20.03 / 23.37 fps | p6_monofix4, p6_monofix8, p6_monofix16u |
+| Co-located, true per-phase times (synced) | DiT 552 / 371 / 300 ms; VAE 151 / 133 / 143 ms | p6_monofix{4,8,16} [PHASE] |
+| VAE pod alone, 1/2/4/8 chips | 324 / 213 / 173 / 153 ms per chunk | vae-*c logs |
+| Split 2+1 / 2+2 (common flags) | 10.07 / 10.06 fps | p3_split_d2v{1,2}_480 |
+| Split 2+1 / 2+2 (tuned 2-chip flags) | 14.66 / 14.58 fps | p3_split_d2tv{1,2}_480 |
+| Split 4+1 / 4+2 / 4+4 | 17.54 / 17.52 / 17.47 fps | p3_split_d4v* |
+| Split 8+1 / 8+2 / 8+4 / 8+8 | 25.76 / 25.95 / 25.48 / 25.60 fps | p3_split_d8v* |
+| Split 16+1 / 16+2 / 16+4 | 32.14 / 32.21 / 32.17 fps | p3_split_d16v* |
+| Single pod, 4+1 / 8+1 | 17.51 / 25.74 fps | p11_combo4p1, p11_combo8p1 |
+| Placement, 4+1, same node / other node | 17.58 / 17.60 fps | pl_same_fps, pl_far_fps |
+| Async emit, co-located 4 | 14.21 → 15.54 fps, byte-identical | p9_emit{0,1}_r{1,2} |
+| MX transpose on tensor engine vs DMA | 14.90 vs 15.54 fps (refuted) | p15_* |
 
-720p (runs on the 704 x 1280 grid):
+## LingBot 720p (704x1280 grid)
 
-| Monolith | fps | Split | fps |
-|---|---|---|---|
-| 4 chips | does not fit (device memory) | 4+x | does not fit (device memory) |
-| 8 chips | does not fit (device memory once the inline VAE loads) | 8+1, 8+2, 8+4 | 8.5, 8.3, 8.4 |
-| 16 chips | 10.0 | 16+1, 16+2, 16+4 | 12.7, 12.7, 12.2 |
+| Measurement | Value | Cells |
+|---|---|---|
+| Co-located 16 | 9.96 fps | p7_mono16_720 |
+| Co-located 8 | does not fit (device memory once the VAE loads) | h8-inline logs |
+| Co-located 4 and split 4+x | do not fit | h4-inline, hs4-split logs |
+| Split 8+1 / 8+2 / 8+4 | 8.46 / 8.28 / 8.38 fps | p3_split_d8v*_720 |
+| Split 16+1 / 16+2 / 16+4 | 12.68 / 12.65 / 12.16 fps | p3_split_d16v*_720 |
 
-## Per-phase times (true device time, LINGBOT_PHASE_SYNC=1, 480 x 768)
+## LingBot denoising steps (4-chip DiT, 480)
 
-| Chips | DiT alone (ms/chunk) | DiT in the monolith | VAE inline (ms/chunk) | VAE share of DiT time |
+The model is distilled to 4 steps, so only fewer steps can be tested.
+
+| Steps | Co-located | 4+1 | 4+2 | Cells |
 |---|---|---|---|---|
-| 2 | 957 | - | - | - |
-| 4 | 552 | 552 | 151 | 27% |
-| 8 | 372 | 371 | 133 | 36% |
-| 16 | 299 | 300 | 143 | 48% |
+| 2 | 23.46 fps | 28.22 fps | 33.79 fps | p13_*_st2_480 |
 
-VAE pod alone, decode per chunk (480): 1 chip 324 ms, 2 chips 213, 4 chips 173, 8 chips 153.
+## LingBot N:M and scale-out
 
-## What it shows
-1. The monolith pays DiT + VAE for every chunk; the split pays max(DiT, VAE) because the VAE decodes chunk n
-   on its own chips while the DiT does chunk n+1. In every split cell the fps equals the DiT's own pace, and
-   the VAE size does not change it: a 1-chip VAE keeps up at both resolutions. Extra VAE chips buy latency
-   (frames ready sooner after the DiT), not fps.
-2. The DiT gets faster with chips; the VAE does not (flat at ~140 ms inline from 4 to 16 chips, 2.1x from 1 to
-   8 chips as a pod). So the VAE's share of each chunk grows with the chip count (27% -> 48% at 480), and the
-   monolith's returns diminish; the split's do not. That is where the split wins: at 16 chips (480: 8+1 on 9
-   chips beats the 16-chip monolith, 25.8 vs 23.4 fps; 16+1 gives 1.37x) and at 720p (16+1 1.27x).
-3. Below that, splitting the chip budget in half costs the DiT more than the VAE costs the monolith: at 8 chips
-   (480) the monolith wins (20.0 vs 17.5).
-4. Memory: at 720p the 8-chip DiT fits alone (split) but not with the VAE beside it (monolith).
-5. At 720p the DiT grows faster than the VAE (attention over 10560 tokens a chunk vs 4320), so the VAE's
-   share is smaller than at 480 (~33% at 16 chips); the win at 720p comes at the larger chip counts.
+| Measurement | Value | Cells |
+|---|---|---|
+| One 1-chip VAE, 2-chip DiT streams, 1/2/3 streams | 10.07 / 10.06 / 10.08 fps each; frames byte-identical | nm2_N*, nm_alone/nm_pair |
+| One 1-chip VAE, 4-chip DiT streams, 1/2 streams | 17.52 / 17.53 fps each | nm4_N* |
+| Per-session decoder cache | 427 MiB per rank; 4 sessions 1.7 GiB | nvae-1c [SESSIONS] |
+| 2 VAEs, 6 streams (3+3) | 10.01-10.05 fps | hs_6x2_* |
+| 3 VAEs, 9 streams (3+3+3) | 10.00-10.07 fps (5 of 9 recorded) | hs2_9x3_* |
+| Elasticity, second VAE added under load | 18 min to Ready; new streams 10.06-10.07 fps | el_d/e/f |
 
-## Corrections made along the way (each invalidated earlier numbers)
-- The probe computed image metrics on every frame (45 ms each), capping it at ~22 fps: now one frame a chunk.
-- A VAE label from the previous round stayed in a DiT's pool: rounds now clear every label first.
-- The monolith's first decode appended the VAE's compiler options (-O1 --model-type=unet-inference) to every
-  later compile in the process, so the 16-chip monolith's DiT ran 2.1x slower (619 vs 299 ms). That looked
-  like DiT/VAE interference; it was this bug. Fixed by vae_cc_scope (serve.py, vae2_1_fused.py). The earlier
-  2-chip "co-located 676 ms vs split 519 ms" result probably had the same cause and must not be cited.
+## LingBot latency (press-to-photon, median / p90)
 
-## Not yet measured
-DiT-alone at 720p; 16+8 and 8+8 at 720p; several streams per VAE (fan-in); press-to-frame latency; device
-profiles of each phase (engine utilization, memory traffic, collectives); same-node (NeuronLink) vs cross-node.
+| Setup | Value | Cells |
+|---|---|---|
+| Co-located 4 | 1114 / 1416 ms | p12_lat_mono4_480 |
+| 4+1 | 1221 / 1471 ms | p12_lat_split4p1_480 |
+| 4+1, single pod | 1230 / 1475 ms | p12_lat_combo4p1_480 |
+| 4+4 | 1114 / 1371 ms | p12_lat_split4p4_480 |
+| 4+1, VAE on the same node / other node | 1216 / 1485 ms, 1231 / 1482 ms | pl_*_lat |
+
+## Stable Audio 3, 1800 s of audio (branch disagg)
+
+| Measurement | Value | Log |
+|---|---|---|
+| Co-located 1 / 2 chips | 9.53 / 6.15 s | dit-1c.log, dit-2c.run1.log |
+| 1+1 / 1+2 / 1+4 / 1+8 split | 7.50 / 7.53 / 7.61 / 7.57 s | dit-1c.log |
+| 2+1 / 2+4 split | 5.48 / 5.29 s | dit-2c-b.log |
+| 190 s windows: co-located 2 chips, 2+1 split | 10.67 / 7.87 s | dit-2c.run1.log, dit-2c-b.log |
+| Steps 2/4/8/25/50, co-located 2 chips | 3.06 / 4.07 / 6.15 / 14.88 / 27.81 s | dit-2c-fewsteps, dit-2c-steps |
+| Steps 2/4/8/25/50, 2+1 | 3.75 / 3.89 / 5.48 / 14.39 / 27.02 s | same |
+| Steps 2/4/8/25/50, 2+2 | 2.51 / 3.32 / 5.37 / 14.16 / 26.80 s | same |
+| N:M at 25 steps, one VAE, 1/2/4/6 jobs | 14.13 / 14.16 / 14.44 / about 20.1 s per job | bench/disagg/nm/*.log |
+
+## Bounds and profiles (4-chip co-located, 480)
+
+| Measurement | Value | Source |
+|---|---|---|
+| Per-graph floors and class | DiT on-chip movement; VAE array utilization | perf/disagg/results/prof/p10_bounds.txt |
+| DiT block DMA time | 37% MXFP8 activation transposes; about 25% small collective transfers; about 5% cross-core | p14_devprof_dma_480, pairs DmaPacketAggregated |
+
+## Model
+
+| Measurement | Value | Source |
+|---|---|---|
+| Composition model, 15 cells | within 1.4% | perf/disagg/model_check.py |
+| Held-out 16-chip DiT | +2.5% | same |
+| Held-out 8-chip VAE | +10% | same |

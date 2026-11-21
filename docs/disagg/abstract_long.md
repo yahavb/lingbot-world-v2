@@ -1,6 +1,6 @@
 # Long abstract (for collaborators; draft)
 
-Every number below is measured on KEEP-trn3-dev1 unless marked [H] (a hypothesis still being measured). The OSDI
+Every number below is measured on KEEP-trn3-dev1. The OSDI
 submission text must be the authors' own; this draft is a pitch and an outline.
 
 ---
@@ -37,8 +37,9 @@ On LingBot-World v2 (14B, streaming video) and Stable Audio 3 Medium (long-form 
 - Rate matching works both ways: with a slow DiT one decoder feeds several, and with a fast, few-step DiT one DiT
   needs more decoder capacity (Stable Audio at 2 steps: 1.22x with a 2-chip decoder, a loss with a 1-chip one). Since
   steps, resolution and model are fixed per service, the sizing is a deploy-time decision.
-- [H] Streams per chip and cost per stream-hour at a 16 fps target, against co-located serving; press-to-photon
-  latency for closed-loop control.
+- At real time (at least 16 fps per stream) disaggregation needs 4.5 chips per stream (two 4-chip DiTs sharing one
+  1-chip decoder) against 8 co-located: 44% fewer chip-hours per stream-hour. With a 4-chip decoder, press-to-photon
+  latency matches co-located at the median (1114 ms) and beats it at p90 (1371 vs 1416 ms).
 
 We also report where disaggregation does not pay (splitting an 8-chip budget starves the DiT) and the operational
 lessons of running it on Trainium, EKS, DRA, EFA and NIXL.
