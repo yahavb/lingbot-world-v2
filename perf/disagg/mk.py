@@ -44,7 +44,7 @@ def claim(n):
     the per-device pairing constraints (one request per device) time out the scheduler at 16."""
     if n <= 2:
         return claim_paired(n)
-    group = f"devicegroup{n}_id"      # trn3-dev1 has devicegroup 1, 4, 8, 16
+    group = f"devicegroup{min(g for g in (4, 8, 16) if g >= n)}_id"   # trn3-dev1 has devicegroup 1, 4, 8, 16
     sel = [{"cel": {"expression": "device.attributes['neuron.aws.com'].instanceType == 'trn3-dev1.48xlarge'"}}]
     reqs = [{"name": "neurons", "exactly": {"allocationMode": "ExactCount", "count": n,
                                             "deviceClassName": "neuron.aws.com", "selectors": sel}},
@@ -153,6 +153,32 @@ def dit(a):
     return d
 
 
+def combo(a):
+    """Partitioned co-located baseline: ONE pod with a claim of n_d + n_v chips; the DiT container sees the first
+    n_d chips' cores, the VAE container the last n_v chips' (NEURON_RT_VISIBLE_CORES); latents over NIXL inside the pod."""
+    a.mode, a.vae_app, a.flags = "split", a.name, getattr(a, "flags", "mono")
+    d = dit(a)
+    nd, nv = a.chips, a.vae_chips
+    sp = d["spec"]["template"]["spec"]
+    sp["resourceClaims"][0]["resourceClaimTemplateName"] = f"x-lnc2-efa-{nd + nv}"
+    c = sp["containers"][0]
+    env_set(c, "NEURON_RT_VISIBLE_CORES", f"0-{RANKS_PER_CHIP * nd - 1}")
+    env_set(c, "VAE_SELECTOR", f"app={a.name}")
+    env_set(c, "VAE_PORT", "8001")
+    v = copy.deepcopy(json.load(open(os.path.join(HERE, "base", "lbw-vae-deploy.json"))))["spec"]["template"]["spec"]["containers"][0]
+    v["name"] = "vae"
+    lh, lw = LAT[a.size]
+    for k, val in (("NPROC", RANKS_PER_CHIP * nv), ("LAT_H", lh), ("LAT_W", lw), ("CACHE_VERSION", "5"),
+                   ("PORT", "8001"), ("NEURON_RT_VISIBLE_CORES", f"{RANKS_PER_CHIP * nd}-{RANKS_PER_CHIP * (nd + nv) - 1}")):
+        env_set(v, k, val)
+    v["ports"] = [{"containerPort": 8001}]
+    for pr in ("startupProbe", "readinessProbe", "livenessProbe"):
+        if pr in v and "httpGet" in v[pr]:
+            v[pr]["httpGet"]["port"] = 8001
+    sp["containers"].append(v)
+    return d
+
+
 def vae(a):
     d = copy.deepcopy(json.load(open(os.path.join(HERE, "base", "lbw-vae-deploy.json"))))
     rename(d, a.name)
@@ -184,6 +210,10 @@ def main():
     p.add_argument("--flags", choices=["mono", "t22"], default="mono")
     p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     p.add_argument("--sysprof", action="store_true", help="runtime system profile of rank 0")
+    p = sub.add_parser("combo"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("vae_chips", type=int)
+    p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="")
+    p.add_argument("--flags", choices=["mono", "t22"], default="mono"); p.add_argument("--sysprof", action="store_true")
+    p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
@@ -194,6 +224,8 @@ def main():
         d, name = claim(a.chips), f"x-lnc2-efa-{a.chips}"
     elif a.cmd == "dit":
         d, name = dit(a), a.name
+    elif a.cmd == "combo":
+        d, name = combo(a), a.name
     else:
         d, name = vae(a), a.name
     if a.cmd != "claim":
