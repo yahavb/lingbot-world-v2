@@ -133,6 +133,13 @@ We observe that:
   dynamic gathers (about half of DMA time), and transfers averaging 157 KB. The tensor engine reaches 28% of peak.
 - **The decoder's halo convolutions keep the tensor engine busy about 90% of the time,** but at 44-50% of the FLOPs
   it could deliver. The convolution shapes under-fill the systolic array. Their HBM floor is 0.1-0.3 ms.
+- **Where the DiT's DMA time goes** (main attention block, 114.6 ms of DMA time summed over its queues per call):
+  - 37% (42.1 ms, 737 MB): SBUF-to-SBUF transposes issued by the MXFP8 activation loader before every MXFP8 matrix
+    multiply;
+  - about 25%: small collective transfers (TP/CP synchronization) that move little data but wait long;
+  - about 5%: remote SBUF reads between the two physical cores of an LNC2 logical core.
+
+  The DiT re-lays out its own activations on the chip; it is not starved for HBM bandwidth.
 - **Per-chunk ceilings at bf16 peak:** about 155 ms for the DiT and about 58 ms for the decoder, against 552 and
   128 ms measured (4 chips).
 
