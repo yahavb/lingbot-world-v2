@@ -400,7 +400,7 @@ def fig_chiptime():
             if val * sc > 80:
                 s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{'#ffffff' if col != '#c9c7c0' else INK}'>{lab} {val}</text>")
             else:
-                s.append(f"<text x='{x:.1f}' y='{y + 48}' font-size='10' fill='{INK2}'>{lab} {val}</text>")
+                s.append(f"<text x='{x:.1f}' y='{y + (48 if lab == 'VAE' else 60)}' font-size='10' fill='{INK2}'>{lab} {val}</text>")
             x += val * sc
         s.append(f"<text x='{x + 14:.1f}' y='{y + 22}' font-size='11' fill='{INK}'>= {d + v + o}</text>")
     s.append(f"<text x='{L}' y='{H - 40}' font-size='11' fill='{INK2}'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>")

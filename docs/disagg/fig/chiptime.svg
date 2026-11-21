@@ -7,7 +7,7 @@
 <rect x='470.2' y='60' width='122.0' height='34' rx='4' fill='#eb6834'><title>VAE: 2288 chip-ms</title></rect>
 <text x='476.2' y='82' font-size='11' fill='#ffffff'>VAE 2288</text>
 <rect x='594.3' y='60' width='58.7' height='34' rx='4' fill='#c9c7c0'><title>waiting: 1120 chip-ms</title></rect>
-<text x='594.3' y='108' font-size='10' fill='#52514e'>waiting 1120</text>
+<text x='594.3' y='120' font-size='10' fill='#52514e'>waiting 1120</text>
 <text x='669.0' y='82' font-size='11' fill='#0b0b0b'>= 8208</text>
 <text x='200' y='146' font-size='12' text-anchor='end' fill='#0b0b0b'>split 8 + 1 (25.8 fps)</text>
 <rect x='210.0' y='124' width='159.3' height='34' rx='4' fill='#2a78d6'><title>DiT: 2976 chip-ms</title></rect>
@@ -15,7 +15,7 @@
 <rect x='371.3' y='124' width='15.6' height='34' rx='4' fill='#eb6834'><title>VAE: 324 chip-ms</title></rect>
 <text x='371.3' y='172' font-size='10' fill='#52514e'>VAE 324</text>
 <rect x='388.9' y='124' width='46.5' height='34' rx='4' fill='#c9c7c0'><title>waiting: 894 chip-ms</title></rect>
-<text x='388.9' y='172' font-size='10' fill='#52514e'>waiting 894</text>
+<text x='388.9' y='184' font-size='10' fill='#52514e'>waiting 894</text>
 <text x='451.4' y='146' font-size='11' fill='#0b0b0b'>= 4194</text>
 <text x='210' y='210' font-size='11' fill='#52514e'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>
 <text x='210' y='226' font-size='11' fill='#52514e'>2288 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>
