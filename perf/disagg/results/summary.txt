@@ -82,3 +82,8 @@ hs_9x3_f: fps 10.04 over 55 chunks, dit_ms 749.4, vae_ms 523.7
 hs_9x3_g: fps 10.10 over 55 chunks, dit_ms 742.8, vae_ms 487.4
 hs_9x3_h: fps 10.07 over 55 chunks, dit_ms 748.0, vae_ms 492.2
 hs_9x3_i: fps 10.07 over 55 chunks, dit_ms 744.0, vae_ms 488.8
+hs2_9x3_a: fps 10.04 over 55 chunks, dit_ms 748.5, vae_ms 486.4
+hs2_9x3_b: fps 10.00 over 55 chunks, dit_ms 747.9, vae_ms 718.5
+hs2_9x3_c: fps 10.04 over 55 chunks, dit_ms 748.7, vae_ms 485.3
+hs2_9x3_d: fps 10.07 over 55 chunks, dit_ms 747.0, vae_ms 491.6
+hs2_9x3_i: fps 10.07 over 55 chunks, dit_ms 744.7, vae_ms 484.9
