@@ -159,6 +159,14 @@ We observe that:
 - **On the DiT's chips the decoder is flat:** 151, 133 and 143 ms at 4, 8 and 16.
 - **Stable Audio's DiT stops sharding at 2 chips** (TP16 fails), while its decode scales 1.9x from 1 to 2 chips.
 
+**How the two figures fit together.**
+
+- **Figure bounds is the cause.** Each stage wastes time on a different thing: the DiT on moving data inside the
+  chip, the VAE on a half-empty math engine. So they scale differently with chips. It also shows a per-kernel
+  opportunity, but disaggregation does not take it: that is kernel work.
+- **Figure chiptime is the effect.** It shows what disaggregation saves: 49% of the chip time per chunk, mostly by not
+  spreading the VAE over the DiT's 16 chips.
+
 **3.3 What disaggregation changes, and what it does not (Figure chiptime).**
 
 Disaggregation does not make either stage's kernels faster: in the split, the DiT block still loses 4.5 ms of its

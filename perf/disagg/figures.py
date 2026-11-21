@@ -358,7 +358,7 @@ def fig_bounds2():
     """Where each stage's measured time goes: useful math (the compute floor) + the time lost, with its cause."""
     rows = [("DiT attention block", 6.38, 1.84, "lost: moving data inside the chip (DMA busy 82%)"),
             ("VAE convolution", 5.71, 2.53, "lost: math engine half empty (busy ~90%, ~45% of peak)")]
-    W, H, L = 760, 230, 160
+    W, H, L = 760, 250, 160
     sc = (W - L - 90) / 6.5
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
@@ -372,7 +372,8 @@ def fig_bounds2():
         s.append(f"<text x='{L + useful * sc + 6:.1f}' y='{y + 21}' font-size='11' fill='#ffffff'>lost {t - useful:.1f}</text>")
         s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 21}' font-size='11' fill='{INK}'>= {t} ms</text>")
         s.append(f"<text x='{L}' y='{y + 48}' font-size='11' fill='{INK2}'>{why}</text>")
-    s.append(f"<text x='24' y='{H - 12}' font-size='11' fill='{INK2}'>Both measured on the chip. Blue = the math at full speed; orange = the rest of the measured time.</text>")
+    s.append(f"<text x='24' y='{H - 28}' font-size='11' fill='{INK2}'>The cause: each stage wastes time on a different thing, so they scale differently with chips.</text>")
+    s.append(f"<text x='24' y='{H - 12}' font-size='11' fill='{INK2}'>Disaggregation does not remove this waste (kernel work); Figure chiptime shows what it saves.</text>")
     s.append("</svg>")
     return "\n".join(s)
 
@@ -386,7 +387,7 @@ def fig_chiptime():
     """Chip time per 12-frame chunk, co-located 16 chips vs the 8 + 1 split (measured: chips x stage time; the rest of
     chips x period is waiting / overhead)."""
     rows = [("co-located, 16 chips (23.4 fps)", 4800, 2288, 8208 - 4800 - 2288), ("split 8 + 1 (25.8 fps)", 2976, 324, 4194 - 2976 - 324)]
-    W, H, L = 780, 250, 210
+    W, H, L = 780, 266, 210
     sc = (W - L - 120) / 8300
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
@@ -405,6 +406,7 @@ def fig_chiptime():
         s.append(f"<text x='{x + 14:.1f}' y='{y + 22}' font-size='11' fill='{INK}'>= {d + v + o}</text>")
     s.append(f"<text x='{L}' y='{H - 40}' font-size='11' fill='{INK2}'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>")
     s.append(f"<text x='{L}' y='{H - 24}' font-size='11' fill='{INK2}'>2288 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>")
+    s.append(f"<text x='{L}' y='{H - 8}' font-size='11' fill='{INK2}'>The effect of disaggregation; Figure bounds shows the cause.</text>")
     s.append("</svg>")
     return "\n".join(s)
 
