@@ -108,3 +108,8 @@ pl_same_fps: fps 17.58 over 55 chunks, dit_ms 431.1, vae_ms 390.7
 pl_same_lat: LATENCY presses 60 median 1216 ms p90 1485 ms parts {'wait_ms': 466.7, 'dit_ms': 432.6, 'decode_ms': 313.8, 'delivery_ms': 0.8}
 pl_far_fps: fps 17.60 over 55 chunks, dit_ms 430.5, vae_ms 391.3
 pl_far_lat: LATENCY presses 60 median 1231 ms p90 1482 ms parts {'wait_ms': 488.9, 'dit_ms': 430.4, 'decode_ms': 311.2, 'delivery_ms': 0.7}
+p14_devprof_dma_480: fps 15.56 over 15 chunks, dit_ms 550.5, vae_ms 131.5
+p15_dma_r1_480: fps 15.54 over 55 chunks, dit_ms 550.5, vae_ms 155.6
+p15_pe_r1_480: fps 14.90 over 55 chunks, dit_ms 577.8, vae_ms 125.8
+p15_dma_r2_480: fps 15.54 over 55 chunks, dit_ms 549.8, vae_ms 156.3
+p15_pe_r2_480: fps 14.91 over 55 chunks, dit_ms 577.9, vae_ms 125.1
