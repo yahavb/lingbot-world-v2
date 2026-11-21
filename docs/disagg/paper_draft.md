@@ -266,7 +266,12 @@ stream.
 
 - With N:M sharing, the disaggregated points reach 0.43 streams per chip at 10 fps (3 streams per 1-chip decoder).
 - Co-located configurations reach at most 0.25 streams per chip at 14-15.5 fps.
-- [open: cost per stream-hour at a 16 fps target, using on-demand prices.]
+- **Cost at real time (at least 16 fps per stream), in chips per stream:**
+  - best co-located: 8 chips (20.0 fps);
+  - best disaggregated: two 4-chip DiTs sharing one 1-chip decoder, 9 chips for 2 streams, so 4.5 chips per stream
+    (17.5 fps each).
+  - That is 44% fewer chip-hours per real-time stream-hour. Cost is chip-hours times the price per chip-hour; no
+    dollar price is assumed.
 
 **7.4 Rate matching and horizontal scaling (Figure 8).** We observe that:
 
@@ -328,7 +333,13 @@ We observe that:
 - A decoder pod deleted, or its device tainted as faulty, in the middle of a stream: about 3 s to switch, 140 of 140
   chunks delivered, no pause over 1.5 s.
 - With no decoder available, the session is refused (503).
-- [open: adding decoder replicas under load; same-node vs cross-node placement.]
+- **Elasticity.** A second decoder replica added while 3 streams run takes 18 minutes from apply to Ready (setup and
+  loading the compile cache). The streams that arrive after it run at full speed (10.06-10.07 fps), and 2 of the 3
+  are placed on the new replica. Elastic decoders need a warm standby or a faster start; this is an operational
+  limit, not a model limit.
+- **Placement.** A 4 + 1 split with the decoder on the DiT's node (NeuronLink) vs on the other node (EFA): 17.58 vs
+  17.60 fps; press-to-photon median 1216 vs 1231 ms, p90 1485 vs 1482 ms. The 1.1 MB hand-off (0.17 ms) makes
+  placement free.
 
 ## 8 Related work
 
