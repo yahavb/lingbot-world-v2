@@ -296,7 +296,10 @@ We observe that:
   balanced.
 - **At 2 steps the decoder binds:** a 1-chip decoder loses and a 2-chip decoder wins 1.22x.
 - **Rate matching works in both directions.**
-- **LingBot at 2 steps: [open, running].** LingBot is distilled to 4 steps and cannot run more.
+- **LingBot at 2 steps (4-chip DiT, 480):** 23.5 fps co-located; 28.2 fps with 4 + 1 (1.20x, limited by the decoder,
+  about 390 ms per chunk); 33.8 fps with 4 + 2 (1.44x). Fewer steps raise the decoder's share, so the gain grows if the
+  decoder gets the chips. LingBot is distilled to 4 steps and cannot run more. The DiT-only mode (28.1 fps) syncs on
+  every chunk and understates the DiT's pace at 2 steps.
 
 **7.6 Latency decomposition (Figure 10).** Press-to-photon over 100 presses, median / p90:
 
