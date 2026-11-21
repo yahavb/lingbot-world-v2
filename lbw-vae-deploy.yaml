@@ -82,13 +82,14 @@ spec:
           resources:
             claims:
               - name: neuroncores
-            requests:
-              # node 137 is fully requested on paper; real use is far lower
-              cpu: "1"
-              memory: 8Gi
-              ephemeral-storage: 20Gi
+            requests:  # 11 CPUs and 120Gi per Neuron device share of the trn3-dev1 node (11 CPUs, 120Gi per device)
+              cpu: "11"
+              memory: 120Gi
+              ephemeral-storage: 100Gi
             limits:
-              memory: 300Gi
+              cpu: "11"
+              memory: 120Gi
+              ephemeral-storage: 600Gi
           volumeMounts:
             - name: node-cache
               mountPath: /node-cache

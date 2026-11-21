@@ -323,15 +323,15 @@ spec:
           periodSeconds: 10
         resources:
           claims:
-          - name: neuroncores
-          limits:
-            cpu: "95"
-            ephemeral-storage: 600Gi
-            memory: 950Gi
-          requests:
-            cpu: "4"
+            - name: neuroncores
+          requests:  # 44 CPUs and 480Gi per Neuron device share of the trn3-dev1 node (11 CPUs, 120Gi per device)
+            cpu: "44"
+            memory: 480Gi
             ephemeral-storage: 100Gi
-            memory: 8Gi
+          limits:
+            cpu: "44"
+            memory: 480Gi
+            ephemeral-storage: 600Gi
         startupProbe:
           failureThreshold: 240
           httpGet:
