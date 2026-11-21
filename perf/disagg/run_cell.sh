@@ -7,12 +7,12 @@ set -euo pipefail
 K="kubectl --context yahavb-Isengard@KEEP-trn3-dev1.us-east-2.eksctl.io"
 app=$1; cell=$2; chunks=${3:-60}; shift $(( $# < 3 ? $# : 3 ))
 cd "$(dirname "$0")/../.."
-until p=$($K get pods -l app=$app --no-headers 2>/dev/null | grep -v Terminating | awk '$2=="1/1"{print $1}' | head -1) && [ -n "$p" ]; do
+until p=$($K get pods -l app=$app --no-headers 2>/dev/null | grep -v Terminating | awk '{split($2,r,"/"); if (r[1]==r[2]) print $1}' | head -1) && [ -n "$p" ]; do
   q=$($K get pods -l app=$app --no-headers 2>/dev/null | awk '{print $1}' | head -1)
   [ -n "$q" ] && $K logs "$q" --tail=300 2>/dev/null | grep -aq "^Traceback" && { echo "FAILED $cell: $q"; $K logs "$q" --tail=400 | grep -aE "Error|error:" | tail -5; exit 1; }
   sleep 30
 done
-$K cp perf/drift_probe.py "$p:/tmp/drift_probe.py"
-$K exec "$p" -- bash -c "cd /tmp/lingbot && python3 /tmp/drift_probe.py --url http://127.0.0.1:8000 --chunks $chunks --no-steer --every 1000 --out /logs/$cell $*" > "perf/disagg/results/$cell.log" 2>&1
-$K cp "$p:/logs/$cell/drift.csv" "perf/disagg/results/$cell.csv"
+$K cp perf/drift_probe.py "$p:/tmp/drift_probe.py" -c inference
+$K exec "$p" -c inference -- bash -c "cd /tmp/lingbot && python3 /tmp/drift_probe.py --url http://127.0.0.1:8000 --chunks $chunks --no-steer --every 1000 --out /logs/$cell $*" > "perf/disagg/results/$cell.log" 2>&1
+$K cp -c inference "$p:/logs/$cell/drift.csv" "perf/disagg/results/$cell.csv"
 python3 perf/disagg/summarize.py "perf/disagg/results/$cell.csv" "$cell" | tee -a perf/disagg/results/summary.txt
