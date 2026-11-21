@@ -8,16 +8,8 @@ cd "$(dirname "$0")/../.."
 ready1() { # exactly one pod for the app, not terminating, all containers ready
   until [ "$($K get pods -l app=$1 --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && \
         $K get pods -l app=$1 --no-headers | awk '{split($2,r,"/"); exit !(r[1]==r[2] && $3=="Running")}'; do sleep 20; done; }
-# 1)
-for v in nvae-1c nvae2-1c nvae3-1c; do ready1 $v; $K label pod -l app=$v pool=nm --overwrite >/dev/null; done
-for x in a b c d e f g h i; do ready1 n2$x-split; done
-sleep 60
-for x in a b c d e f g h i; do perf/disagg/run_cell.sh n2$x-split hs2_9x3_$x 60 >/dev/null 2>&1 & sleep 10; done; wait
-grep "^hs2_9x3" perf/disagg/results/summary.txt
-for x in a b c d e f g h i; do echo "n2$x: $($K logs $($K get pods -l app=n2$x-split --no-headers | awk '{print $1}') --since=15m | grep -ao 'session VAE: [a-z0-9-]*' | tail -1)"; done
-git add -f perf/disagg/results/summary.txt perf/disagg/results/hs2_*.csv; git commit -qm "9 streams x 3 VAEs, per-session least-loaded placement" -q; git push -q fork main
 # 2) + 3)
-$K delete deploy n2b-split n2c-split n2d-split n2e-split n2f-split n2g-split n2h-split n2i-split nvae2-1c nvae3-1c --wait=true >/dev/null
+$K delete deploy c4p1 --wait=true >/dev/null 2>&1; $K apply -f perf/disagg/gen/c4p1.json >/dev/null
 python3 perf/disagg/mk.py dit m4e-inline 4 inline --env LINGBOT_EMIT_ASYNC=1 >/dev/null
 python3 perf/disagg/mk.py dit n4a-split 4 split --env VAE_SELECTOR=pool=nm --env LINGBOT_EMIT_ASYNC=1 >/dev/null
 $K apply -f perf/disagg/gen/m4e-inline.json >/dev/null; $K apply -f perf/disagg/gen/n4a-split.json >/dev/null

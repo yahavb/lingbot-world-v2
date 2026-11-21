@@ -13,6 +13,12 @@ until p=$($K get pods -l app=$app --no-headers 2>/dev/null | grep -v Terminating
   sleep 30
 done
 $K cp perf/drift_probe.py "$p:/tmp/drift_probe.py" -c inference
-$K exec "$p" -c inference -- bash -c "cd /tmp/lingbot && python3 /tmp/drift_probe.py --url http://127.0.0.1:8000 --chunks $chunks --no-steer --every 1000 --out /logs/$cell $*" > "perf/disagg/results/$cell.log" 2>&1
+# the probe runs detached inside the pod (a dropped kubectl connection must not lose the measurement); poll for it
+$K exec "$p" -c inference -- bash -c "rm -rf /logs/$cell; mkdir -p /logs/$cell; cd /tmp/lingbot && nohup python3 /tmp/drift_probe.py --url http://127.0.0.1:8000 --chunks $chunks --no-steer --every 1000 --out /logs/$cell $* > /logs/$cell.out 2>&1 &"
+until $K exec "$p" -c inference -- test -f "/logs/$cell/drift.csv" 2>/dev/null; do
+  sleep 20
+  $K get pod "$p" >/dev/null 2>&1 || { echo "FAILED $cell: pod gone"; exit 1; }
+done
+$K exec "$p" -c inference -- cat "/logs/$cell.out" > "perf/disagg/results/$cell.log" 2>&1
 $K cp -c inference "$p:/logs/$cell/drift.csv" "perf/disagg/results/$cell.csv"
 python3 perf/disagg/summarize.py "perf/disagg/results/$cell.csv" "$cell" | tee -a perf/disagg/results/summary.txt

@@ -83,6 +83,23 @@ def claim_paired(n):
                 "parameters": {"apiVersion": "neuron.aws.com/v1", "kind": "NeuronConfig", "logicalNeuronCore": 2}}}]}}}}
 
 
+def claim_combo(nd, nv):
+    """n_d DiT devices as one aligned device group (a valid TP x CP topology) + n_v VAE devices, + their EFAs.
+    Request order sets the device order in the container, so the DiT's devices come first (cores 0 .. 4 n_d - 1)."""
+    sel = [{"cel": {"expression": "device.attributes['neuron.aws.com'].instanceType == 'trn3-dev1.48xlarge'"}}]
+    g = f"devicegroup{min(x for x in (4, 8, 16) if x >= nd)}_id"
+    reqs = [{"name": "neurons-dit", "exactly": {"allocationMode": "ExactCount", "count": nd, "deviceClassName": "neuron.aws.com", "selectors": sel}},
+            {"name": "neurons-vae", "exactly": {"allocationMode": "ExactCount", "count": nv, "deviceClassName": "neuron.aws.com", "selectors": sel}},
+            {"name": "efas", "exactly": {"allocationMode": "ExactCount", "count": nd + nv, "deviceClassName": "efa.networking.k8s.aws"}}]
+    cons = [{"matchAttribute": f"resource.aws.com/{g}", "requests": ["neurons-dit"]},
+            {"matchAttribute": "resource.aws.com/devicegroup16_id", "requests": ["neurons-dit", "neurons-vae", "efas"]}]
+    return {"apiVersion": "resource.k8s.io/v1", "kind": "ResourceClaimTemplate",
+            "metadata": {"name": f"x-combo-{nd}p{nv}", "namespace": "default"},
+            "spec": {"spec": {"devices": {"requests": reqs, "constraints": cons, "config": [{
+                "requests": ["neurons-dit", "neurons-vae"], "opaque": {"driver": "neuron.aws.com",
+                "parameters": {"apiVersion": "neuron.aws.com/v1", "kind": "NeuronConfig", "logicalNeuronCore": 2}}}]}}}}
+
+
 def rename(d, name):
     d["metadata"] = {"name": name, "namespace": "default", "labels": {"exp": "disagg"}}
     d["spec"]["selector"]["matchLabels"] = {"app": name}
@@ -160,7 +177,9 @@ def combo(a):
     d = dit(a)
     nd, nv = a.chips, a.vae_chips
     sp = d["spec"]["template"]["spec"]
-    sp["resourceClaims"][0]["resourceClaimTemplateName"] = f"x-lnc2-efa-{nd + nv}"
+    sp["resourceClaims"][0]["resourceClaimTemplateName"] = f"x-combo-{nd}p{nv}"
+    os.makedirs(GEN, exist_ok=True)
+    json.dump(claim_combo(nd, nv), open(os.path.join(GEN, f"x-combo-{nd}p{nv}.json"), "w"), indent=1)
     c = sp["containers"][0]
     env_set(c, "NEURON_RT_VISIBLE_CORES", f"0-{RANKS_PER_CHIP * nd - 1}")
     env_set(c, "VAE_SELECTOR", f"app={a.name}")
