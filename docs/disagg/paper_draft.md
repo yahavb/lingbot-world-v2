@@ -159,7 +159,24 @@ We observe that:
 - **On the DiT's chips the decoder is flat:** 151, 133 and 143 ms at 4, 8 and 16.
 - **Stable Audio's DiT stops sharding at 2 chips** (TP16 fails), while its decode scales 1.9x from 1 to 2 chips.
 
-**3.3 The cost of co-location.** A co-located replica runs every chip through the DiT, then every chip through the
+**3.3 What disaggregation changes, and what it does not (Figure chiptime).**
+
+Disaggregation does not make either stage's kernels faster: in the split, the DiT block still loses 4.5 ms of its
+6.4 ms and the convolution 3.2 ms of its 5.7. What it cuts is chip time per chunk, the chips held busy or waiting for
+each 12 frames:
+
+| Chip time per chunk | Co-located, 16 chips | Split, 8 + 1 |
+|---|---|---|
+| DiT stage | 4800 chip-ms | 2976 chip-ms |
+| VAE stage | 2288 chip-ms | 324 chip-ms |
+| Waiting and overhead | 1120 chip-ms | 894 chip-ms |
+| Total | 8208 chip-ms (23.4 fps) | 4194 chip-ms (25.8 fps) |
+
+The split uses 49% less chip time per chunk and streams faster. Most of the saving is the VAE: co-location multiplies
+the VAE's waste by the DiT's chip count, and the split stops doing that. The per-kernel waste remains; it is
+separate kernel work.
+
+**3.4 The cost of co-location.** A co-located replica runs every chip through the DiT, then every chip through the
 decoder. At 16 chips the decoder takes 16 × 143 ms = 2.29 chip-seconds per chunk. On its own chip it takes 0.32.
 
 ## 4 The cost model and rate matching
@@ -376,6 +393,8 @@ as independently sized, replicated and placed roles, an operating-system respons
 NIXL, recovers the lost chip time. A cost model the operator computes at deploy time picks the sizing.
 
 **Figures:**
+
+0. chiptime.svg (section 3.3)
 
 1. timeline.svg
 2. scaling.svg
