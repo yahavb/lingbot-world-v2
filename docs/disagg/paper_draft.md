@@ -140,6 +140,15 @@ We observe that:
   - about 5%: remote SBUF reads between the two physical cores of an LNC2 logical core.
 
   The DiT re-lays out its own activations on the chip; it is not starved for HBM bandwidth.
+- **The transposes are the price of MXFP8's input layout on this kernel.** nkilib's matmul_mxfp8 takes the activation
+  token-major and converts it to its own layout on every call. Both cheaper variants we know of were measured and
+  lost:
+  - passing the activation K-major, so the kernel skips its transpose, was slower for every shape (e.g. QKV 237 vs
+    132 us);
+  - quantizing the shared Q/K/V input once and reusing it cost more than it saved (467 vs 358 us).
+
+  A cheaper path needs a different kernel design or a future SDK. It does not change our argument: the bound is real,
+  correctly attributed, and different from the decoder's.
 - **Per-chunk ceilings at bf16 peak:** about 155 ms for the DiT and about 58 ms for the decoder, against 552 and
   128 ms measured (4 chips).
 
