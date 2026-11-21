@@ -101,3 +101,6 @@ p13_split4p1_st2_480: fps 28.22 over 55 chunks, dit_ms 176.0, vae_ms 389.6
 p13_dit4_st2_480: fps 28.14 over 55 chunks, dit_ms 291.1, vae_ms 0.4
 p13_mono4_st2_480: fps 23.46 over 55 chunks, dit_ms 290.1, vae_ms 125.2
 p13_split4p2_st2_480: fps 33.79 over 55 chunks, dit_ms 169.7, vae_ms 272.6
+el_d: fps 10.06 over 55 chunks, dit_ms 743.8, vae_ms 488.7
+el_e: fps 10.07 over 55 chunks, dit_ms 745.6, vae_ms 483.8
+el_f: fps 10.07 over 55 chunks, dit_ms 743.4, vae_ms 484.4
