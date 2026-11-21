@@ -13,7 +13,8 @@ This file is the data index for paper_draft.md. All runs are on KEEP-trn3-dev1 (
 | Measurement | Value | Cells |
 |---|---|---|
 | DiT alone, 2/4/8/16 chips | 10.07 / 17.49 / 25.84 / 31.97 fps (period 1192 / 686 / 464 / 375 ms) | p1_dit{2,4,8,16}_480 |
-| Co-located, 4/8/16 chips | 14.33 / 20.03 / 23.37 fps | p6_monofix4, p6_monofix8, p6_monofix16u |
+| Co-located, 4/8/16 chips, with async emit | 15.54 / 22.63 / 26.70 fps | p9_emit1_r*, p16_mono8_fps, p16_mono16e_fps* |
+| Co-located, 4/8/16 chips, without async emit (superseded) | 14.33 / 20.03 / 23.37 fps | p6_monofix4, p6_monofix8, p6_monofix16u |
 | Co-located, true per-phase times (synced) | DiT 552 / 371 / 300 ms; VAE 151 / 133 / 143 ms | p6_monofix{4,8,16} [PHASE] |
 | VAE pod alone, 1/2/4/8 chips | 324 / 213 / 173 / 153 ms per chunk | vae-*c logs |
 | Split 2+1 / 2+2 (common flags) | 10.07 / 10.06 fps | p3_split_d2v{1,2}_480 |

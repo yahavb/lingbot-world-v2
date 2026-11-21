@@ -35,7 +35,7 @@ per-session decoder state.
 
 On LingBot-World v2 and Stable Audio 3, [SYSTEM]:
 
-- reaches 1.37x the frame rate of the best 16-chip co-located configuration;
+- reaches 1.20x the frame rate of the best 16-chip co-located configuration (32.1 vs 26.7 fps);
 - serves 720p where an 8-chip co-located replica does not fit;
 - runs 3 streams per 1-chip decoder with no slowdown, and 9 streams on 3 decoders;
 - matches co-located median press-to-photon latency and beats its p90.
@@ -58,7 +58,7 @@ co-located in each replica. These pipelines have two stages, and neither is negl
 
 **Motivation (Figure 1, Figure 2).**
 
-- **Co-located serving stops scaling.** 14.3, 20.0 and 23.4 fps at 4, 8 and 16 chips.
+- **Co-located serving scales slowly.** 15.5, 22.6 and 26.7 fps at 4, 8 and 16 chips.
 - **The cause is serialization.** Each chunk pays DiT plus decoder (Figure 1).
 - **The decoder doesn't get faster with chips.** About 140 ms at every chip count (Figure 2).
 - **Splitting the stages keeps scaling:** 25.8 fps on 9 chips, 32.2 fps on 17.
@@ -177,7 +177,7 @@ We observe that:
 - **Figure bounds is the cause.** Each stage wastes time on a different thing: the DiT on moving data inside the
   chip, the VAE on a half-empty math engine. So they scale differently with chips. It also shows a per-kernel
   opportunity, but disaggregation does not take it: that is kernel work.
-- **Figure chiptime is the effect.** It shows what disaggregation saves: 49% of the chip time per chunk, mostly by not
+- **Figure chiptime is the effect.** It shows what disaggregation saves: 42% of the chip time per chunk, mostly by not
   spreading the VAE over the DiT's 16 chips.
 
 **3.3 What disaggregation changes, and what it does not (Figure chiptime).**
@@ -188,12 +188,12 @@ each 12 frames:
 
 | Chip time per chunk | Co-located, 16 chips | Split, 8 + 1 |
 |---|---|---|
-| DiT stage | 4800 chip-ms | 2976 chip-ms |
-| VAE stage | 2288 chip-ms | 324 chip-ms |
-| Waiting and overhead | 1120 chip-ms | 894 chip-ms |
-| Total | 8208 chip-ms (23.4 fps) | 4194 chip-ms (25.8 fps) |
+| DiT stage | 4786 chip-ms | 2976 chip-ms |
+| VAE stage | 2032 chip-ms | 324 chip-ms |
+| Waiting and overhead | 368 chip-ms | 894 chip-ms |
+| Total | 7186 chip-ms (26.7 fps) | 4194 chip-ms (25.8 fps) |
 
-The split uses 49% less chip time per chunk and streams faster. Most of the saving is the VAE: co-location multiplies
+The split uses 42% less chip time per chunk at 96% of the frame rate. Most of the saving is the VAE: co-location multiplies
 the VAE's waste by the DiT's chip count, and the split stops doing that. The per-kernel waste remains; it is
 separate kernel work.
 
@@ -302,15 +302,15 @@ Table 2: LingBot 480x768, fps.
 
 | Co-located | fps | Disaggregated | fps |
 |---|---|---|---|
-| 4 chips | 14.3 | 2+1, 2+2 | 10.1 |
-| 8 chips | 20.0 | 4+1, 4+2, 4+4 | 17.5 |
-| 16 chips | 23.4 | 8+1 / 8+2 / 8+4 / 8+8 | 25.8 / 26.0 / 25.5 / 25.6 |
+| 4 chips | 15.5 | 2+1, 2+2 | 10.1 |
+| 8 chips | 22.6 | 4+1, 4+2, 4+4 | 17.5 |
+| 16 chips | 26.7 | 8+1 / 8+2 / 8+4 / 8+8 | 25.8 / 26.0 / 25.5 / 25.6 |
 | - | - | 16+1 / 16+2 / 16+4 | 32.1 / 32.2 / 32.2 |
 
 We observe that:
 
-- **At 16 chips the split wins.** 8+1 beats co-located 16 on 9 chips, and 16+1 is 1.37x faster.
-- **At 8 chips co-located wins,** because the split starves the DiT.
+- **At 16 chips the split wins.** 8+1 reaches 96% of co-located 16's frame rate on 9 chips instead of 16, and 16+1 is 1.20x faster.
+- **At 8 chips co-located wins** (22.6 vs 17.5 for 4+x), because the split starves the DiT; 8+1 on 9 chips gives 25.7.
 - **The decoder's size does not change fps:** a 1-chip decoder keeps up.
 - **At 720p,** co-located 8 chips does not fit in device memory while the 8-chip DiT alone runs (8.5 fps), and 16+1
   gives 1.27x (12.7 vs 10.0 fps).
@@ -360,9 +360,13 @@ We observe that:
   decoder gets the chips. LingBot is distilled to 4 steps and cannot run more. The DiT-only mode (28.1 fps) syncs on
   every chunk and understates the DiT's pace at 2 steps.
 
+**Fairness note.** All co-located numbers at 480 include the async frame emit (section 7.7); without it co-located
+4 / 8 / 16 chips ran 14.3 / 20.0 / 23.4 fps. The 720p co-located 16-chip number (10.0) is being re-measured with it.
+
 **7.6 Latency (Figures 10 carwash.svg, 11 latency.svg).** The statement: splitting never makes a key press show
 up sooner. With too few VAE chips it makes reactions about 0.1 s slower (4 + 1: 1221 vs 1114 ms). With enough VAE chips
-the reaction time is the same as co-located (4 + 4: 1114 ms) while frames per second rise (17.6 vs 15.5). Press-to-photon over 100 presses, median / p90:
+the reaction time is the same as co-located (4 + 4: 1114 ms) while frames per second rise (17.6 vs 15.5). At 8 chips:
+co-located 736 / 960 ms (22.6 fps) vs 8 + 1 881 / 1056 ms (25.7 fps): a 1-chip VAE again adds about 0.15 s. Press-to-photon over 100 presses, median / p90:
 
 | Setup | fps | Median / p90 | Wait | DiT | Decode |
 |---|---|---|---|---|---|

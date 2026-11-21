@@ -13,7 +13,7 @@ BLUE, ORANGE = "#2a78d6", "#eb6834"
 FONT = "font-family='Helvetica, Arial, sans-serif'"
 
 SERIES = [  # (name, color, dash, [(total chips, fps)])
-    ("Co-located, 480x768", BLUE, "", [(4, 14.33), (8, 20.03), (16, 23.37)]),
+    ("Co-located, 480x768", BLUE, "", [(4, 15.54), (8, 22.63), (16, 26.70)]),
     ("Split: DiT + 1-chip VAE, 480x768", ORANGE, "", [(3, 10.07), (5, 17.54), (9, 25.76), (17, 32.14)]),
     ("Co-located, 720p", BLUE, "6 4", [(16, 9.96)]),
     ("Split: DiT + 1-chip VAE, 720p", ORANGE, "6 4", [(9, 8.46), (17, 12.68)]),
@@ -46,7 +46,7 @@ def fps_chart(series=None, title='LingBot-World v2: frame rate vs chips, one str
                      f"stroke-width='2'><title>{name}: {c} chips, {f} fps</title></circle>")
     # direct labels at the line ends (text in ink, the mark carries the color)
     s.append(f"<text x='{X(17) + 10}' y='{Y(32.14) + 4}' font-size='12' fill='{INK}'>split 32.1</text>")
-    s.append(f"<text x='{X(16) + 10}' y='{Y(23.37) + 4}' font-size='12' fill='{INK}'>co-located 23.4</text>")
+    s.append(f"<text x='{X(16) + 10}' y='{Y(26.70) + 4}' font-size='12' fill='{INK}'>co-located 26.7</text>")
     if note720:
         s.append(f"<text x='{X(17) + 10}' y='{Y(12.68) + 4}' font-size='12' fill='{INK}'>split 720p 12.7</text>")
         s.append(f"<text x='{X(16) + 10}' y='{Y(9.96) + 14}' font-size='12' fill='{INK}'>co-located 720p 10.0</text>")
@@ -309,9 +309,9 @@ def fig_timeline():
     s.append(f"<text x='{L - 10}' y='{y + 17}' font-size='12' text-anchor='end' fill='{INK}'>co-located, 16 chips</text>")
     t = 0
     for k in range(3):
-        bar(t, y, 375, BLUE, f"DiT {k}"); t += 375
-        bar(t, y, 143, ORANGE, f"VAE {k}"); t += 143
-    s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 17}' font-size='11' fill='{INK2}'>518 ms / chunk = 23 fps</text>")
+        bar(t, y, 322, BLUE, f"DiT {k}"); t += 322
+        bar(t, y, 127, ORANGE, f"VAE {k}"); t += 127
+    s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 17}' font-size='11' fill='{INK2}'>449 ms / chunk = 26.7 fps</text>")
     y2 = 130
     s.append(f"<text x='{L - 10}' y='{y2 + 17}' font-size='12' text-anchor='end' fill='{INK}'>DiT pod, 16 chips</text>")
     s.append(f"<text x='{L - 10}' y='{y2 + 51}' font-size='12' text-anchor='end' fill='{INK}'>VAE pod, 1 chip</text>")
@@ -326,7 +326,7 @@ def fig_timeline():
 
 def fig_pareto():
     """Streams per chip vs fps per stream (LingBot 480): every measured configuration."""
-    co = [(4, 1, 14.33), (8, 1, 20.03), (16, 1, 23.37), (4, 1, 15.54)]                 # chips, streams, fps (last: async emit)
+    co = [(4, 1, 15.54), (8, 1, 22.63), (16, 1, 26.70)]                 # chips, streams, fps (last: async emit)
     sp = [(3, 1, 10.07), (5, 1, 17.54), (9, 1, 25.76), (17, 1, 32.14), (7, 3, 10.08), (9, 2, 17.53), (14, 6, 10.03), (21, 9, 10.04)]
     s, X, Y = _axes(720, 440, 64, 40, 48, 56, (0, 35), (0, 0.5), "fps per stream", "streams per chip",
                     "Throughput vs interactivity: every measured LingBot configuration (480x768)", range(0, 36, 5),
@@ -337,8 +337,8 @@ def fig_pareto():
         s.append(f"<circle cx='{X(f):.1f}' cy='{Y(n / c):.1f}' r='6' fill='{ORANGE}' stroke='{SURF}' stroke-width='2'><title>split {c} chips, {n} streams: {f} fps</title></circle>")
     for c, n, f, lab in ((21, 9, 10.04, "N:M, 3 streams per 1-chip VAE (3/7, 6/14, 9/21 chips)"), (3, 1, 10.07, "2+1"),
                          (9, 2, 17.53, "2 streams / 1 VAE"), (5, 1, 17.54, "4+1"), (17, 1, 32.14, "16+1"),
-                         (9, 1, 25.76, "8+1"), (16, 1, 23.37, "co-located 16"), (8, 1, 20.03, "co-located 8"),
-                         (4, 1, 14.33, "co-located 4 (and with async emit)")):
+                         (9, 1, 25.76, "8+1"), (16, 1, 26.70, "co-located 16"), (8, 1, 22.63, "co-located 8"),
+                         (4, 1, 15.54, "co-located 4")):
         dy = 16 if lab in ("4+1", "2+1") else -8
         s.append(f"<text x='{X(f) + 9:.1f}' y='{Y(n / c) + dy:.1f}' font-size='11' fill='{INK}'>{lab}</text>")
     _legend(s, X(1), Y(0.12), [("co-located", BLUE, ""), ("disaggregated (incl. N:M)", ORANGE, "")])
@@ -388,9 +388,9 @@ if __name__ == "__main__":
 def fig_chiptime():
     """Chip time per 12-frame chunk, co-located 16 chips vs the 8 + 1 split (measured: chips x stage time; the rest of
     chips x period is waiting / overhead)."""
-    rows = [("co-located, 16 chips (23.4 fps)", 4800, 2288, 8208 - 4800 - 2288), ("split 8 + 1 (25.8 fps)", 2976, 324, 4194 - 2976 - 324)]
+    rows = [("co-located, 16 chips (26.7 fps)", 4786, 2032, 7186 - 4786 - 2032), ("split 8 + 1 (25.8 fps)", 2976, 324, 4194 - 2976 - 324)]
     W, H, L = 780, 266, 210
-    sc = (W - L - 120) / 8300
+    sc = (W - L - 120) / 7300
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
          f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Chip time per 12-frame chunk (chip-ms), LingBot 480</text>"]
@@ -406,8 +406,8 @@ def fig_chiptime():
                 s.append(f"<text x='{x:.1f}' y='{y + (48 if lab == 'VAE' else 60)}' font-size='10' fill='{INK2}'>{lab} {val}</text>")
             x += val * sc
         s.append(f"<text x='{x + 14:.1f}' y='{y + 22}' font-size='11' fill='{INK}'>= {d + v + o}</text>")
-    s.append(f"<text x='{L}' y='{H - 40}' font-size='11' fill='{INK2}'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>")
-    s.append(f"<text x='{L}' y='{H - 24}' font-size='11' fill='{INK2}'>2288 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>")
+    s.append(f"<text x='{L}' y='{H - 40}' font-size='11' fill='{INK2}'>The split uses 42% less chip time per chunk at 96% of the frame rate. Most of it is the VAE:</text>")
+    s.append(f"<text x='{L}' y='{H - 24}' font-size='11' fill='{INK2}'>2032 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>")
     s.append(f"<text x='{L}' y='{H - 8}' font-size='11' fill='{INK2}'>The effect of disaggregation; Figure bounds shows the cause.</text>")
     s.append("</svg>")
     return "\n".join(s)

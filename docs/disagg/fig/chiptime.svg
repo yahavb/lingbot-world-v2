@@ -1,23 +1,23 @@
 <svg xmlns='http://www.w3.org/2000/svg' width='780' height='266' viewBox='0 0 780 266' font-family='Helvetica, Arial, sans-serif'>
 <rect width='780' height='266' fill='#fcfcfb'/>
 <text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>Chip time per 12-frame chunk (chip-ms), LingBot 480</text>
-<text x='200' y='82' font-size='12' text-anchor='end' fill='#0b0b0b'>co-located, 16 chips (23.4 fps)</text>
-<rect x='210.0' y='60' width='258.2' height='34' rx='4' fill='#2a78d6'><title>DiT: 4800 chip-ms</title></rect>
-<text x='216.0' y='82' font-size='11' fill='#ffffff'>DiT 4800</text>
-<rect x='470.2' y='60' width='122.0' height='34' rx='4' fill='#eb6834'><title>VAE: 2288 chip-ms</title></rect>
-<text x='476.2' y='82' font-size='11' fill='#ffffff'>VAE 2288</text>
-<rect x='594.3' y='60' width='58.7' height='34' rx='4' fill='#c9c7c0'><title>waiting: 1120 chip-ms</title></rect>
-<text x='594.3' y='120' font-size='10' fill='#52514e'>waiting 1120</text>
-<text x='669.0' y='82' font-size='11' fill='#0b0b0b'>= 8208</text>
+<text x='200' y='82' font-size='12' text-anchor='end' fill='#0b0b0b'>co-located, 16 chips (26.7 fps)</text>
+<rect x='210.0' y='60' width='293.0' height='34' rx='4' fill='#2a78d6'><title>DiT: 4786 chip-ms</title></rect>
+<text x='216.0' y='82' font-size='11' fill='#ffffff'>DiT 4786</text>
+<rect x='505.0' y='60' width='123.3' height='34' rx='4' fill='#eb6834'><title>VAE: 2032 chip-ms</title></rect>
+<text x='511.0' y='82' font-size='11' fill='#ffffff'>VAE 2032</text>
+<rect x='630.3' y='60' width='20.7' height='34' rx='4' fill='#c9c7c0'><title>waiting: 368 chip-ms</title></rect>
+<text x='630.3' y='120' font-size='10' fill='#52514e'>waiting 368</text>
+<text x='667.0' y='82' font-size='11' fill='#0b0b0b'>= 7186</text>
 <text x='200' y='146' font-size='12' text-anchor='end' fill='#0b0b0b'>split 8 + 1 (25.8 fps)</text>
-<rect x='210.0' y='124' width='159.3' height='34' rx='4' fill='#2a78d6'><title>DiT: 2976 chip-ms</title></rect>
+<rect x='210.0' y='124' width='181.5' height='34' rx='4' fill='#2a78d6'><title>DiT: 2976 chip-ms</title></rect>
 <text x='216.0' y='146' font-size='11' fill='#ffffff'>DiT 2976</text>
-<rect x='371.3' y='124' width='15.6' height='34' rx='4' fill='#eb6834'><title>VAE: 324 chip-ms</title></rect>
-<text x='371.3' y='172' font-size='10' fill='#52514e'>VAE 324</text>
-<rect x='388.9' y='124' width='46.5' height='34' rx='4' fill='#c9c7c0'><title>waiting: 894 chip-ms</title></rect>
-<text x='388.9' y='184' font-size='10' fill='#52514e'>waiting 894</text>
-<text x='451.4' y='146' font-size='11' fill='#0b0b0b'>= 4194</text>
-<text x='210' y='226' font-size='11' fill='#52514e'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>
-<text x='210' y='242' font-size='11' fill='#52514e'>2288 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>
+<rect x='393.5' y='124' width='18.0' height='34' rx='4' fill='#eb6834'><title>VAE: 324 chip-ms</title></rect>
+<text x='393.5' y='172' font-size='10' fill='#52514e'>VAE 324</text>
+<rect x='413.4' y='124' width='53.1' height='34' rx='4' fill='#c9c7c0'><title>waiting: 894 chip-ms</title></rect>
+<text x='413.4' y='184' font-size='10' fill='#52514e'>waiting 894</text>
+<text x='482.5' y='146' font-size='11' fill='#0b0b0b'>= 4194</text>
+<text x='210' y='226' font-size='11' fill='#52514e'>The split uses 42% less chip time per chunk at 96% of the frame rate. Most of it is the VAE:</text>
+<text x='210' y='242' font-size='11' fill='#52514e'>2032 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>
 <text x='210' y='258' font-size='11' fill='#52514e'>The effect of disaggregation; Figure bounds shows the cause.</text>
 </svg>

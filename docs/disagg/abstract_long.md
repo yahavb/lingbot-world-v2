@@ -28,8 +28,8 @@ from device memory to device memory in 0.17 ms; decoders keep per-session causal
 streams; sessions are placed on the least-loaded decoder; a failed decoder costs a ~3 s switch with no lost chunks.
 
 On LingBot-World v2 (14B, streaming video) and Stable Audio 3 Medium (long-form audio):
-- At 16 chips, a 16-chip DiT plus a 1-chip decoder runs 1.37x the frame rate of the best co-located configuration
-  (32.2 vs 23.4 fps); an 8-chip DiT plus a 1-chip decoder beats the 16-chip co-located replica on 9 chips.
+- At 16 chips, a 16-chip DiT plus a 1-chip decoder runs 1.20x the frame rate of the best co-located configuration
+  (32.1 vs 26.7 fps); an 8-chip DiT plus a 1-chip decoder reaches 96% of the 16-chip co-located replica's frame rate on 9 chips.
 - At 720p the co-located 8-chip replica does not fit in device memory; disaggregated, the same DiT runs; at 16 chips
   the split gains 1.27x.
 - One 1-chip decoder serves 3 streams with no per-stream slowdown (427 MiB of state per session), and decoder replicas

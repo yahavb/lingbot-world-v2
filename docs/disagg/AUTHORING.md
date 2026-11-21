@@ -26,7 +26,7 @@ over finished prose to submit. Coding-agent use is disclosed in the Implementati
 ## The claims and their evidence (all measured)
 
 1. **Coupling, not either stage, limits co-located serving.**
-   - Co-located: 14.3 / 20.0 / 23.4 fps at 4 / 8 / 16 chips.
+   - Co-located: 15.5 / 22.6 / 26.7 fps at 4 / 8 / 16 chips (with async emit).
    - Split: 25.8 fps on 9 chips, 32.1 fps on 17 chips.
 2. **The stages have different binding resources.**
    - DiT: on-chip data movement, with DMA busy 82% at 8.8x the HBM need. 37% of that DMA time is MXFP8 activation
@@ -51,7 +51,7 @@ over finished prose to submit. Coding-agent use is disclosed in the Implementati
    - Across pods: 17.54 / 25.76 fps.
    - Placement on the same node vs the other node: no difference.
 10. **Where it does not pay.**
-    - LingBot at 8 chips: 20.0 co-located vs 17.5 split.
+    - LingBot at 8 chips: 22.6 co-located vs 17.5 split (4+x).
     - Stable Audio at 25-50 steps: 3-5%.
     - Elastic VAE cold start: 18 min, so it needs a warm standby.
 
