@@ -220,11 +220,19 @@ def vae(a):
     return d
 
 
+def pin(d, node):
+    """--node HOST: pin the pod to one node (placement experiment)."""
+    if node:
+        d["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/hostname"] = node
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("claim"); p.add_argument("chips", type=int)
     p = sub.add_parser("dit"); p.add_argument("name"); p.add_argument("chips", type=int)
+    p.add_argument("--node", default="")
     p.add_argument("mode", choices=["split", "inline", "null"]); p.add_argument("--vae-app", default="")
     p.add_argument("--size", default="480*768"); p.add_argument("--cache", default="")
     p.add_argument("--flags", choices=["mono", "t22"], default="mono")
@@ -235,6 +243,7 @@ def main():
     p.add_argument("--flags", choices=["mono", "t22"], default="mono"); p.add_argument("--sysprof", action="store_true")
     p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     p = sub.add_parser("vae"); p.add_argument("name"); p.add_argument("chips", type=int); p.add_argument("app")
+    p.add_argument("--node", default="")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
     p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
@@ -243,11 +252,11 @@ def main():
     if a.cmd == "claim":
         d, name = claim(a.chips), f"x-lnc2-efa-{a.chips}"
     elif a.cmd == "dit":
-        d, name = dit(a), a.name
+        d, name = pin(dit(a), a.node), a.name
     elif a.cmd == "combo":
         d, name = combo(a), a.name
     else:
-        d, name = vae(a), a.name
+        d, name = pin(vae(a), a.node), a.name
     if a.cmd != "claim":
         # a Service per app, so the DiT reaches the VAE pods (and the runner reaches the DiT) by name
         app = a.app if a.cmd == "vae" else a.name
