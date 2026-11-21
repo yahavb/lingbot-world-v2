@@ -213,7 +213,13 @@ conservative, it overstates the decoder's cost [M] (perf/disagg/model_check.py).
 **6.6 Rate-matched replicas.** [H] N:M = 1:1, 2:1, 3:1 (and 1:2 for audio). Streams per chip at ≥ 16 fps, and cost
 per stream-hour: the Pareto frontier of co-located against disaggregated.
 
-**6.7 Latency.** [H] Press-to-photon latency (wait, DiT, hand-off, decoder, network, client buffer), as a CDF over
+**6.7 Latency.** [M, LingBot 480, press-to-photon over 100 presses, median / p90]: 4-chip monolith 1114 / 1416 ms
+(15.5 fps); 4 DiT + 1 VAE chip 1221 / 1471 (17.5 fps; decode of the chunk's first frame 314 vs 62 ms inline); 4 DiT +
+4 VAE chips 1114 / 1371 (17.6 fps; decode 209 ms). A decoder sized for latency matches the monolith's median, beats its
+p90 and keeps the throughput gain. **6.7b In-pod partitioned baseline** [M]: DiT and VAE containers on disjoint chips of
+ONE pod (NIXL inside the pod) give 17.51 fps at 4 + 1 and 25.74 at 8 + 1, the same as across pods (17.54, 25.76): the
+gain is the decoupling of the stages; separate pods cost nothing and add per-role scaling, sharing and placement.
+**Previous 6.7 text:** [H] Press-to-photon latency (wait, DiT, hand-off, decoder, network, client buffer), as a CDF over
 100 presses. Extra decoder chips lower the decode time per unit: 391 → 237 ms from 1 to 4 chips [M].
 
 **6.8 Resilience.** Decoder pod deletion and device-fault taint: ~3 s switch, 140/140 chunks [M]. Scaling the
