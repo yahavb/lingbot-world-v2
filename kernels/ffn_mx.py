@@ -29,12 +29,16 @@ def _quant(w):
 # (nkilib fast_dma_transpose / SwizzleMode.DGT_FAST) instead of vector offsets generated on GpSimd.
 # perf/mx_tile_sweep.py at the LNC2 TP4 x CP4 per-rank shapes (M=1088), us/call: qkv 137.1 -> 105.9.
 _FAST_DMA = os.environ.get("LINGBOT_MX_FAST_DMA", "0") == "1"
+# LINGBOT_MX_PE_SWIZZLE=1 (experiment): the activation's layout change runs on the tensor engine (nkilib
+# load_with_PE_swizzle) instead of the DMA queues. In the 4-chip DiT block the DMA queues are the binding resource
+# (82% busy, 37% of it these transposes) while the tensor engine has headroom (68%): slower alone, maybe faster in the block.
+_PE_SWIZZLE = os.environ.get("LINGBOT_MX_PE_SWIZZLE", "0") == "1"
+_MX_LOAD = ({"load_with_PE_swizzle": True} if _PE_SWIZZLE else {"fast_dma_transpose": True} if _FAST_DMA else {})
 @nki.jit
 def _mm_pq(lhs, w_data, w_scales):
     return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
                         output_dtype=nl.bfloat16, run_with_lnc2=(LNC == 2),
-                        use_scale_packing=True, lhs_is_swizzled=False,
-                        **({"fast_dma_transpose": True} if _FAST_DMA else {}))
+                        use_scale_packing=True, lhs_is_swizzled=False, **_MX_LOAD)
 
 
 def prequantize_weight(w):
@@ -65,8 +69,7 @@ for _k in os.environ.get("LINGBOT_MX_NSHARD", "").replace(":", ",").split(","):
 def _mm_pq_n(lhs, w_data, w_scales):
     return matmul_mxfp8(lhs, w_data, rhs_scales=w_scales, float8_dtype=FP8,
                         output_dtype=nl.bfloat16, run_with_lnc2=(LNC == 2), lnc_2_shard_rhs=True,
-                        use_scale_packing=True, lhs_is_swizzled=False,
-                        **({"fast_dma_transpose": True} if _FAST_DMA else {}))
+                        use_scale_packing=True, lhs_is_swizzled=False, **_MX_LOAD)
 _mm_nshard = wrap_nki(_mm_pq_n)
 
 
@@ -131,7 +134,10 @@ def _tuned_kernel(key, table=None):
               **({} if os.environ.get("LINGBOT_MX_TUNED_NOEXTRA", "0") == "1" else t["extra"]))
 
     # disable_dma_transpose (the 1x32 loader without a DMA transpose) excludes the DGT fast path
-    if _FAST_DMA and not kw.get("disable_dma_transpose") and not kw.get("load_with_PE_swizzle"):
+    if _PE_SWIZZLE and not kw.get("disable_dma_transpose"):
+        kw.pop("fast_dma_transpose", None)
+        kw["load_with_PE_swizzle"] = True         # LINGBOT_MX_PE_SWIZZLE: every MX Linear, tuned tiles too
+    elif _FAST_DMA and not kw.get("disable_dma_transpose") and not kw.get("load_with_PE_swizzle"):
         kw["fast_dma_transpose"] = True
     @nki.jit
     def k(lhs, w_data, w_scales):
