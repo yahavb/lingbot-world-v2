@@ -1,0 +1,12 @@
+series,total_chips,fps
+Co-located, 480x768,4,14.33
+Co-located, 480x768,8,20.03
+Co-located, 480x768,16,23.37
+Split: DiT + 1-chip VAE, 480x768,3,10.07
+Split: DiT + 1-chip VAE, 480x768,5,17.54
+Split: DiT + 1-chip VAE, 480x768,9,25.76
+Split: DiT + 1-chip VAE, 480x768,17,32.14
+Co-located, 720p,16,9.96
+Split: DiT + 1-chip VAE, 720p,9,8.46
+Split: DiT + 1-chip VAE, 720p,17,12.68
+Co-located, 720p,8,does not fit
