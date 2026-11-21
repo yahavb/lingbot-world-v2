@@ -284,8 +284,8 @@ def fig_bounds():
 
 def main2():
     os.makedirs(OUT, exist_ok=True)
-    for name, fn in (("scaling", fig_scaling), ("steps", fig_steps), ("nm", fig_nm), ("latency", fig_latency),
-                     ("model", fig_model), ("bounds", fig_bounds)):
+    for name, fn in (("scaling", fig_scaling), ("steps", fig_steps), ("nm", fig_nm),
+                     ("model", fig_model)):
         open(os.path.join(OUT, f"{name}.svg"), "w").write(fn())
     print("wrote 6 more figures")
 
@@ -443,8 +443,7 @@ def fig_latency2():
 
 
 if __name__ == "__main__":
-    open(os.path.join(OUT, "latency.svg"), "w").write(fig_latency2())
-    print("latency.svg redrawn")
+    pass   # latency.svg dropped: carwash.svg carries the latency point; the numbers are a table in the draft
 
 
 def fig_carwash():
