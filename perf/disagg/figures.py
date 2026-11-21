@@ -20,14 +20,15 @@ SERIES = [  # (name, color, dash, [(total chips, fps)])
 ]
 
 
-def fps_chart():
+def fps_chart(series=None, title='LingBot-World v2: frame rate vs chips, one stream', note720=True):
+    series = series or SERIES
     W, H, L, R, T, B = 760, 460, 64, 150, 48, 56
     xmax, ymax = 18, 35
     X = lambda c: L + (W - L - R) * c / xmax
     Y = lambda f: H - B - (H - T - B) * f / ymax
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
-         f"<text x='{L}' y='26' font-size='16' font-weight='600' fill='{INK}'>LingBot-World v2: frame rate vs chips, one stream</text>"]
+         f"<text x='{L}' y='26' font-size='16' font-weight='600' fill='{INK}'>{title}</text>"]
     for f in range(0, ymax + 1, 5):
         s.append(f"<line x1='{L}' x2='{W - R}' y1='{Y(f)}' y2='{Y(f)}' stroke='{GRID}' stroke-width='1'/>")
         s.append(f"<text x='{L - 8}' y='{Y(f) + 4}' font-size='11' text-anchor='end' fill='{INK2}'>{f}</text>")
@@ -36,7 +37,7 @@ def fps_chart():
     s.append(f"<line x1='{L}' x2='{W - R}' y1='{Y(0)}' y2='{Y(0)}' stroke='{INK2}' stroke-width='1'/>")
     s.append(f"<text x='{(L + W - R) / 2}' y='{H - 14}' font-size='12' text-anchor='middle' fill='{INK2}'>total chips (Trainium3)</text>")
     s.append(f"<text x='16' y='{(T + H - B) / 2}' font-size='12' fill='{INK2}' transform='rotate(-90 16 {(T + H - B) / 2})' text-anchor='middle'>frames per second</text>")
-    for name, col, dash, pts in SERIES:
+    for name, col, dash, pts in series:
         if len(pts) > 1:
             d = " ".join(f"{'M' if i == 0 else 'L'}{X(c):.1f},{Y(f):.1f}" for i, (c, f) in enumerate(pts))
             s.append(f"<path d='{d}' fill='none' stroke='{col}' stroke-width='2' stroke-dasharray='{dash}' stroke-linejoin='round'/>")
@@ -46,20 +47,21 @@ def fps_chart():
     # direct labels at the line ends (text in ink, the mark carries the color)
     s.append(f"<text x='{X(17) + 10}' y='{Y(32.14) + 4}' font-size='12' fill='{INK}'>split 32.1</text>")
     s.append(f"<text x='{X(16) + 10}' y='{Y(23.37) + 4}' font-size='12' fill='{INK}'>co-located 23.4</text>")
-    s.append(f"<text x='{X(17) + 10}' y='{Y(12.68) + 4}' font-size='12' fill='{INK}'>split 720p 12.7</text>")
-    s.append(f"<text x='{X(16) + 10}' y='{Y(9.96) + 14}' font-size='12' fill='{INK}'>co-located 720p 10.0</text>")
-    # co-located 8 chips at 720p: no point (does not fit)
-    s.append(f"<text x='{X(8)}' y='{Y(2.2)}' font-size='11' text-anchor='middle' fill='{INK2}'>720p co-located, 8 chips:</text>")
-    s.append(f"<text x='{X(8)}' y='{Y(0.6)}' font-size='11' text-anchor='middle' fill='{INK2}'>does not fit in device memory</text>")
+    if note720:
+        s.append(f"<text x='{X(17) + 10}' y='{Y(12.68) + 4}' font-size='12' fill='{INK}'>split 720p 12.7</text>")
+        s.append(f"<text x='{X(16) + 10}' y='{Y(9.96) + 14}' font-size='12' fill='{INK}'>co-located 720p 10.0</text>")
+        # co-located 8 chips at 720p: no point (does not fit)
+        s.append(f"<text x='{X(8)}' y='{Y(2.2)}' font-size='11' text-anchor='middle' fill='{INK2}'>720p co-located, 8 chips:</text>")
+        s.append(f"<text x='{X(8)}' y='{Y(0.6)}' font-size='11' text-anchor='middle' fill='{INK2}'>does not fit in device memory</text>")
     # legend (always present for >= 2 series)
     lx, ly = L + 14, T + 14
-    for i, (name, col, dash, _) in enumerate(SERIES):
+    for i, (name, col, dash, _) in enumerate(series):
         y = ly + i * 22
         s.append(f"<line x1='{lx}' x2='{lx + 22}' y1='{y}' y2='{y}' stroke='{col}' stroke-width='2' stroke-dasharray='{dash}'/>")
         s.append(f"<circle cx='{lx + 11}' cy='{y}' r='4' fill='{col if not dash else SURF}' stroke='{col}' stroke-width='2'/>")
         s.append(f"<text x='{lx + 30}' y='{y + 4}' font-size='11' fill='{INK}'>{name}</text>")
-    s.append(f"<text x='{lx}' y='{ly + 4 * 22 + 14}' font-size='10' fill='{INK2}'>Split = DiT on n chips + VAE on 1 chip</text>")
-    s.append(f"<text x='{lx}' y='{ly + 4 * 22 + 28}' font-size='10' fill='{INK2}'>(total n + 1). Same flags both sides.</text>")
+    s.append(f"<text x='{lx}' y='{ly + len(series) * 22 + 14}' font-size='10' fill='{INK2}'>Split = DiT on n chips + VAE on 1 chip</text>")
+    s.append(f"<text x='{lx}' y='{ly + len(series) * 22 + 28}' font-size='10' fill='{INK2}'>(total n + 1). Same flags both sides.</text>")
     s.append("</svg>")
     return "\n".join(s)
 
@@ -119,6 +121,8 @@ def architecture():
 def main():
     os.makedirs(OUT, exist_ok=True)
     open(os.path.join(OUT, "fps_vs_chips.svg"), "w").write(fps_chart())
+    open(os.path.join(OUT, "fps_vs_chips_480.svg"), "w").write(
+        fps_chart(SERIES[:2], "LingBot-World v2 at 480x768: frame rate vs chips, one stream", note720=False))
     open(os.path.join(OUT, "architecture.svg"), "w").write(architecture())
     with open(os.path.join(OUT, "fps_vs_chips.csv"), "w") as f:
         f.write("series,total_chips,fps\n")
