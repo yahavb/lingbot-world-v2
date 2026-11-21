@@ -1,0 +1,46 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='720' height='420' viewBox='0 0 720 420' font-family='Helvetica, Arial, sans-serif'>
+<rect width='720' height='420' fill='#fcfcfb'/>
+<text x='64' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>Per-stage scaling, LingBot 480x768</text>
+<line x1='64' x2='680' y1='364.0' y2='364.0' stroke='#e4e3df'/>
+<text x='56' y='368.0' font-size='11' text-anchor='end' fill='#52514e'>0</text>
+<line x1='64' x2='680' y1='315.38461538461536' y2='315.38461538461536' stroke='#e4e3df'/>
+<text x='56' y='319.38461538461536' font-size='11' text-anchor='end' fill='#52514e'>200</text>
+<line x1='64' x2='680' y1='266.7692307692308' y2='266.7692307692308' stroke='#e4e3df'/>
+<text x='56' y='270.7692307692308' font-size='11' text-anchor='end' fill='#52514e'>400</text>
+<line x1='64' x2='680' y1='218.15384615384616' y2='218.15384615384616' stroke='#e4e3df'/>
+<text x='56' y='222.15384615384616' font-size='11' text-anchor='end' fill='#52514e'>600</text>
+<line x1='64' x2='680' y1='169.53846153846155' y2='169.53846153846155' stroke='#e4e3df'/>
+<text x='56' y='173.53846153846155' font-size='11' text-anchor='end' fill='#52514e'>800</text>
+<line x1='64' x2='680' y1='120.92307692307693' y2='120.92307692307693' stroke='#e4e3df'/>
+<text x='56' y='124.92307692307693' font-size='11' text-anchor='end' fill='#52514e'>1000</text>
+<line x1='64' x2='680' y1='72.30769230769232' y2='72.30769230769232' stroke='#e4e3df'/>
+<text x='56' y='76.30769230769232' font-size='11' text-anchor='end' fill='#52514e'>1200</text>
+<text x='64.0' y='382' font-size='11' text-anchor='middle' fill='#52514e'>1</text>
+<text x='218.0' y='382' font-size='11' text-anchor='middle' fill='#52514e'>2</text>
+<text x='372.0' y='382' font-size='11' text-anchor='middle' fill='#52514e'>4</text>
+<text x='526.0' y='382' font-size='11' text-anchor='middle' fill='#52514e'>8</text>
+<text x='680.0' y='382' font-size='11' text-anchor='middle' fill='#52514e'>16</text>
+<line x1='64' x2='680' y1='364.0' y2='364.0' stroke='#52514e'/>
+<text x='372.0' y='408' font-size='12' text-anchor='middle' fill='#52514e'>chips (log scale)</text>
+<text x='16' y='206.0' font-size='12' fill='#52514e' transform='rotate(-90 16 206.0)' text-anchor='middle'>ms per 12-frame chunk</text>
+<path d='M218.0,74.3 L372.0,197.2 L526.0,251.2 L680.0,272.8' fill='none' stroke='#2a78d6' stroke-width='2' stroke-dasharray=''/>
+<circle cx='218.0' cy='74.3' r='4.5' fill='#2a78d6' stroke='#fcfcfb' stroke-width='2'><title>DiT alone (period): 2, 1192</title></circle>
+<circle cx='372.0' cy='197.2' r='4.5' fill='#2a78d6' stroke='#fcfcfb' stroke-width='2'><title>DiT alone (period): 4, 686</title></circle>
+<circle cx='526.0' cy='251.2' r='4.5' fill='#2a78d6' stroke='#fcfcfb' stroke-width='2'><title>DiT alone (period): 8, 464</title></circle>
+<circle cx='680.0' cy='272.8' r='4.5' fill='#2a78d6' stroke='#fcfcfb' stroke-width='2'><title>DiT alone (period): 16, 375</title></circle>
+<path d='M64.0,285.2 L218.0,312.2 L372.0,321.9 L526.0,326.8' fill='none' stroke='#eb6834' stroke-width='2' stroke-dasharray=''/>
+<circle cx='64.0' cy='285.2' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE pod: 1, 324</title></circle>
+<circle cx='218.0' cy='312.2' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE pod: 2, 213</title></circle>
+<circle cx='372.0' cy='321.9' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE pod: 4, 173</title></circle>
+<circle cx='526.0' cy='326.8' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE pod: 8, 153</title></circle>
+<path d='M372.0,327.3 L526.0,331.7 L680.0,329.2' fill='none' stroke='#eb6834' stroke-width='2' stroke-dasharray='6 4'/>
+<circle cx='372.0' cy='327.3' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE inline: 4, 151</title></circle>
+<circle cx='526.0' cy='331.7' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE inline: 8, 133</title></circle>
+<circle cx='680.0' cy='329.2' r='4.5' fill='#eb6834' stroke='#fcfcfb' stroke-width='2'><title>VAE inline: 16, 143</title></circle>
+<line x1='430' x2='452' y1='70' y2='70' stroke='#2a78d6' stroke-width='2' stroke-dasharray=''/>
+<text x='460' y='74' font-size='11' fill='#0b0b0b'>DiT alone: 3.2x from 2 to 16 chips</text>
+<line x1='430' x2='452' y1='90' y2='90' stroke='#eb6834' stroke-width='2' stroke-dasharray=''/>
+<text x='460' y='94' font-size='11' fill='#0b0b0b'>VAE pod: 2.1x from 1 to 8 chips</text>
+<line x1='430' x2='452' y1='110' y2='110' stroke='#eb6834' stroke-width='2' stroke-dasharray='6 4'/>
+<text x='460' y='114' font-size='11' fill='#0b0b0b'>VAE inline on the DiT's chips: flat</text>
+</svg>

@@ -135,3 +135,158 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------- more figures (all from measured cells, docs/disagg/RESULTS.md and perf/disagg/results/) -------------
+AQUA, YELLOW = "#1baf7a", "#eda100"   # dataviz slots 3-4
+
+
+def _axes(W, H, L, R, T, B, xs, ys, xlabel, ylabel, title, xticks, yticks, xfmt=str, yfmt=str, logx=False):
+    import math
+    X0, X1 = xs; Y0, Y1 = ys
+    def X(v):
+        if logx:
+            return L + (W - L - R) * (math.log2(v) - math.log2(X0)) / (math.log2(X1) - math.log2(X0))
+        return L + (W - L - R) * (v - X0) / (X1 - X0)
+    Y = lambda v: H - B - (H - T - B) * (v - Y0) / (Y1 - Y0)
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='{L}' y='26' font-size='15' font-weight='600' fill='{INK}'>{title}</text>"]
+    for v in yticks:
+        s.append(f"<line x1='{L}' x2='{W - R}' y1='{Y(v)}' y2='{Y(v)}' stroke='{GRID}'/>")
+        s.append(f"<text x='{L - 8}' y='{Y(v) + 4}' font-size='11' text-anchor='end' fill='{INK2}'>{yfmt(v)}</text>")
+    for v in xticks:
+        s.append(f"<text x='{X(v)}' y='{H - B + 18}' font-size='11' text-anchor='middle' fill='{INK2}'>{xfmt(v)}</text>")
+    s.append(f"<line x1='{L}' x2='{W - R}' y1='{Y(Y0)}' y2='{Y(Y0)}' stroke='{INK2}'/>")
+    s.append(f"<text x='{(L + W - R) / 2}' y='{H - 12}' font-size='12' text-anchor='middle' fill='{INK2}'>{xlabel}</text>")
+    s.append(f"<text x='16' y='{(T + H - B) / 2}' font-size='12' fill='{INK2}' transform='rotate(-90 16 {(T + H - B) / 2})' text-anchor='middle'>{ylabel}</text>")
+    return s, X, Y
+
+
+def _line(s, X, Y, pts, col, name, dash=""):
+    d = " ".join(f"{'M' if i == 0 else 'L'}{X(x):.1f},{Y(y):.1f}" for i, (x, y) in enumerate(pts))
+    s.append(f"<path d='{d}' fill='none' stroke='{col}' stroke-width='2' stroke-dasharray='{dash}'/>")
+    for x, y in pts:
+        s.append(f"<circle cx='{X(x):.1f}' cy='{Y(y):.1f}' r='4.5' fill='{col}' stroke='{SURF}' stroke-width='2'><title>{name}: {x}, {y}</title></circle>")
+
+
+def _legend(s, x, y, items):
+    for i, (name, col, dash) in enumerate(items):
+        yy = y + i * 20
+        s.append(f"<line x1='{x}' x2='{x + 22}' y1='{yy}' y2='{yy}' stroke='{col}' stroke-width='2' stroke-dasharray='{dash}'/>")
+        s.append(f"<text x='{x + 30}' y='{yy + 4}' font-size='11' fill='{INK}'>{name}</text>")
+
+
+def fig_scaling():
+    s, X, Y = _axes(720, 420, 64, 40, 48, 56, (1, 16), (0, 1300), "chips (log scale)", "ms per 12-frame chunk",
+                    "Per-stage scaling, LingBot 480x768", [1, 2, 4, 8, 16], range(0, 1301, 200), logx=True)
+    _line(s, X, Y, [(2, 1192), (4, 686), (8, 464), (16, 375)], BLUE, "DiT alone (period)")
+    _line(s, X, Y, [(1, 324), (2, 213), (4, 173), (8, 153)], ORANGE, "VAE pod")
+    _line(s, X, Y, [(4, 151), (8, 133), (16, 143)], ORANGE, "VAE inline", "6 4")
+    _legend(s, 430, 70, [("DiT alone: 3.2x from 2 to 16 chips", BLUE, ""), ("VAE pod: 2.1x from 1 to 8 chips", ORANGE, ""),
+                         ("VAE inline on the DiT's chips: flat", ORANGE, "6 4")])
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_steps():
+    # speedup of the split over co-located vs denoising steps (SA3, 2-chip DiT, 1800 s of audio)
+    mono = {2: 3.06, 4: 4.07, 8: 6.15, 25: 14.88, 50: 27.81}
+    v1 = {2: 3.75, 4: 3.89, 8: 5.48, 25: 14.39, 50: 27.02}
+    v2 = {2: 2.51, 4: 3.32, 8: 5.37, 25: 14.16, 50: 26.80}
+    s, X, Y = _axes(720, 420, 64, 40, 48, 56, (2, 50), (0.7, 1.3), "denoising steps (log scale)",
+                    "speedup over co-located (x)", "Stable Audio 3: the gain follows the stage ratio",
+                    [2, 4, 8, 25, 50], [0.8, 0.9, 1.0, 1.1, 1.2, 1.3], yfmt=lambda v: f"{v:.1f}", logx=True)
+    s.append(f"<line x1='{X(2)}' x2='{X(50)}' y1='{Y(1.0)}' y2='{Y(1.0)}' stroke='{INK2}' stroke-dasharray='2 3'/>")
+    _line(s, X, Y, [(k, round(mono[k] / v1[k], 3)) for k in mono], ORANGE, "2 DiT + 1 VAE chip")
+    _line(s, X, Y, [(k, round(mono[k] / v2[k], 3)) for k in mono], AQUA, "2 DiT + 2 VAE chips")
+    _legend(s, 420, 70, [("2 DiT + 1 VAE chip", ORANGE, ""), ("2 DiT + 2 VAE chips", AQUA, "")])
+    s.append(f"<text x='{X(2.3)}' y='{Y(0.76)}' font-size='11' fill='{INK2}'>2 steps: the 1-chip VAE binds (loses); 2 VAE chips win 1.22x</text>")
+    s.append(f"<text x='{X(12)}' y='{Y(1.17)}' font-size='11' fill='{INK2}'>many steps: the DiT dominates, gain -> 1</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_nm():
+    s, X, Y = _axes(720, 420, 64, 40, 48, 56, (0.5, 3.5), (0, 20), "streams sharing one 1-chip VAE",
+                    "fps per stream", "One VAE, several streams: no slowdown (LingBot 480)", [1, 2, 3], range(0, 21, 5))
+    _line(s, X, Y, [(1, 10.07), (2, 10.06), (3, 10.08)], BLUE, "2-chip DiT streams")
+    _line(s, X, Y, [(1, 17.52), (2, 17.53)], ORANGE, "4-chip DiT streams")
+    _legend(s, 420, 70, [("2-chip DiT streams (limit ~3.7)", BLUE, ""), ("4-chip DiT streams (limit ~2.1)", ORANGE, "")])
+    s.append(f"<text x='{X(0.6)}' y='{Y(2)}' font-size='11' fill='{INK2}'>3 decoders x 3 streams: 9 streams at 10.00-10.07 fps; 427 MiB per session</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_latency():
+    rows = [("co-located 4", 498, 552, 62), ("4 + 1 VAE chip", 476, 433, 314), ("4 + 4 VAE chips", 470, 433, 209)]
+    W, H, L = 720, 300, 150
+    sc = (W - L - 40) / 1300
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Press-to-photon latency, median of 100 presses (LingBot 480)</text>"]
+    for i, (name, w, d, v) in enumerate(rows):
+        y = 60 + i * 56
+        s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        x = L
+        for val, col, lab in ((w, GRID.replace('#e4e3df', '#c9c7c0'), "wait"), (d, BLUE, "DiT"), (v, ORANGE, "decode")):
+            s.append(f"<rect x='{x:.1f}' y='{y}' width='{val * sc - 2:.1f}' height='34' rx='4' fill='{col}'><title>{name} {lab}: {val} ms</title></rect>")
+            if val > 120:
+                s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{'#ffffff' if col != '#c9c7c0' else INK}'>{lab} {val}</text>")
+            x += val * sc
+        s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{INK2}'>= {w + d + v} ms</text>")
+    s.append(f"<text x='{L}' y='{H - 34}' font-size='11' fill='{INK2}'>A decoder sized for latency (4 chips) matches the co-located median (1114 ms)</text>")
+    s.append(f"<text x='{L}' y='{H - 18}' font-size='11' fill='{INK2}'>and beats its p90 (1371 vs 1416 ms) at 13% more fps (17.6 vs 15.5).</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_model():
+    import importlib.util, io, contextlib, os as _os
+    pts = [(14.33, 14.33), (20.09, 20.03), (23.17, 23.37), (10.07, 10.07), (10.07, 10.06), (17.49, 17.54), (17.49, 17.52),
+           (17.49, 17.47), (25.84, 25.76), (25.84, 25.95), (25.84, 25.48), (25.84, 25.60), (31.97, 32.14), (31.97, 32.21), (31.97, 32.17)]
+    s, X, Y = _axes(520, 480, 64, 30, 48, 56, (8, 34), (8, 34), "predicted fps (from per-stage times)", "measured fps",
+                    "Cost model vs measurement: 15 cells, within 1.4%", range(10, 35, 5), range(10, 35, 5))
+    s.append(f"<line x1='{X(8)}' y1='{Y(8)}' x2='{X(34)}' y2='{Y(34)}' stroke='{INK2}' stroke-dasharray='3 3'/>")
+    for i, (p, m) in enumerate(pts):
+        col = BLUE if i < 3 else ORANGE
+        s.append(f"<circle cx='{X(p):.1f}' cy='{Y(m):.1f}' r='5' fill='{col}' stroke='{SURF}' stroke-width='2'><title>predicted {p}, measured {m}</title></circle>")
+    _legend(s, 90, 70, [("co-located (3)", BLUE, ""), ("disaggregated (12)", ORANGE, "")])
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_bounds():
+    rows = [("DiT attention block", 6.38, 1.84, 0.60, 4.37, 5.25), ("DiT MXFP8 graph (/4)", 23.95 / 4, 3.81 / 4, 3.89 / 4, 12.99 / 4, 20.89 / 4),
+            ("VAE halo conv", 5.71, 2.53, 0.23, 5.02, 2.89), ("VAE halo conv", 5.47, 2.48, 0.33, 4.96, 3.27)]
+    W, H, L = 760, 380, 170
+    sc = (W - L - 40) / 7
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>What bounds each stage: floors vs measured time (ms per execution)</text>"]
+    keys = [("measured", INK2), ("compute floor", BLUE), ("HBM floor", AQUA), ("tensor busy", YELLOW), ("DMA busy", ORANGE)]
+    for i, r in enumerate(rows):
+        y = 56 + i * 70
+        s.append(f"<text x='{L - 10}' y='{y + 30}' font-size='12' text-anchor='end' fill='{INK}'>{r[0]}</text>")
+        for j, ((k, col), v) in enumerate(zip(keys, r[1:])):
+            s.append(f"<rect x='{L}' y='{y + j * 12}' width='{max(v * sc, 2):.1f}' height='10' rx='3' fill='{col}'><title>{r[0]} {k}: {v:.2f} ms</title></rect>")
+    lx = L
+    for j, (k, col) in enumerate(keys):
+        s.append(f"<rect x='{lx}' y='{H - 40}' width='12' height='10' rx='2' fill='{col}'/>")
+        s.append(f"<text x='{lx + 16}' y='{H - 31}' font-size='11' fill='{INK}'>{k}</text>")
+        lx += 110
+    s.append(f"<text x='24' y='{H - 8}' font-size='11' fill='{INK2}'>DiT: DMA busy far above its HBM floor (on-chip movement). VAE: tensor busy ~ measured, compute floor ~half (array under-filled).</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def main2():
+    os.makedirs(OUT, exist_ok=True)
+    for name, fn in (("scaling", fig_scaling), ("steps", fig_steps), ("nm", fig_nm), ("latency", fig_latency),
+                     ("model", fig_model), ("bounds", fig_bounds)):
+        open(os.path.join(OUT, f"{name}.svg"), "w").write(fn())
+    print("wrote 6 more figures")
+
+
+if __name__ == "__main__":
+    main2()
