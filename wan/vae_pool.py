@@ -95,8 +95,11 @@ class VaePool:
 
     def acquire(self, prefer=None):
         """Keep the current VAE if it is still listed; else link to an available one (`prefer` first)."""
-        if self.current is not None and not self.gone and self.current[0] in dict(self.available()):
+        # LINGBOT_VAE_LEAST_LOADED=1: a NEW session (new_session()) re-chooses by load instead of keeping the last VAE
+        if (self.current is not None and not self.gone and self.current[0] in dict(self.available())
+                and not getattr(self, "_rechoose", False)):
             return True
+        self._rechoose = False
         self.gone = False
         self.release()
         cands = self.available()
@@ -137,6 +140,12 @@ class VaePool:
                 log.warning(f"vae {name} {ip}: link failed: {type(e).__name__}: {e}")
                 self.fail(name)
         return False
+
+    def new_session(self):
+        """Called at a session's start: with LINGBOT_VAE_LEAST_LOADED=1 the next acquire() picks the least-loaded VAE."""
+        if os.environ.get("LINGBOT_VAE_LEAST_LOADED", "0") == "1" and self.current is not None:
+            self.release()
+            self._rechoose = True
 
     def fail(self, name=None):
         name = name or (self.current[0] if self.current else None)

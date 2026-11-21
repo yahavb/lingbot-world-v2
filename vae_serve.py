@@ -108,7 +108,7 @@ def run_server(jobs, state):
     @app.get("/load")
     def load():
         """Sessions linked or decoding in the last LOAD_WINDOW_S seconds (the DiT's least-loaded VAE choice)."""
-        now, win = time.time(), float(os.environ.get("LOAD_WINDOW_S", "30"))
+        now, win = time.time(), float(os.environ.get("LOAD_WINDOW_S", "10"))
         return {"sessions": sum(1 for t in state.get("seen", {}).values() if now - t < win)}
 
     @app.get("/health")

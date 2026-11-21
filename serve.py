@@ -623,6 +623,8 @@ def main():
         """
         embeds = encode_prompt(prompt)
         actions, starts = {}, {}
+        if rank == 0 and VAE_POOL.get("pool") is not None:
+            VAE_POOL["pool"].new_session()      # LINGBOT_VAE_LEAST_LOADED=1: place this session on the least-loaded VAE
 
         def on_chunk(chunk_id, x0):
             job_emit, action = state["emit"], actions.pop(chunk_id, None)
