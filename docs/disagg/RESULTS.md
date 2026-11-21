@@ -52,7 +52,7 @@ The model is distilled to 4 steps, so only fewer steps can be tested.
 | One 1-chip VAE, 4-chip DiT streams, 1/2 streams | 17.52 / 17.53 fps each | nm4_N* |
 | Per-session decoder cache | 427 MiB per rank; 4 sessions 1.7 GiB | nvae-1c [SESSIONS] |
 | 2 VAEs, 6 streams (3+3) | 10.01-10.05 fps | hs_6x2_* |
-| 3 VAEs, 9 streams (3+3+3) | 10.00-10.07 fps (5 of 9 recorded) | hs2_9x3_* |
+| 3 VAEs, 9 streams (3+3+3) | 9.99-10.09 fps, all 9 recorded | hs3_9x3_*, hs3_9x3_placement.txt |
 | Elasticity, second VAE added under load | 18 min to Ready; new streams 10.06-10.07 fps | el_d/e/f |
 
 ## LingBot latency (press-to-photon, median / p90)
