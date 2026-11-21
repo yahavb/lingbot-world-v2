@@ -313,7 +313,7 @@ We observe that:
 - **At 8 chips co-located wins** (22.6 vs 17.5 for 4+x), because the split starves the DiT; 8+1 on 9 chips gives 25.7.
 - **The decoder's size does not change fps:** a 1-chip decoder keeps up.
 - **At 720p,** co-located 8 chips does not fit in device memory while the 8-chip DiT alone runs (8.5 fps), and 16+1
-  gives 1.27x (12.7 vs 10.0 fps).
+  gives 1.11x (12.7 vs 11.4 fps).
 
 **7.3 Throughput vs interactivity (Figure 7).** Each configuration is plotted as streams per chip against fps per
 stream.
@@ -361,7 +361,7 @@ We observe that:
   every chunk and understates the DiT's pace at 2 steps.
 
 **Fairness note.** All co-located numbers at 480 include the async frame emit (section 7.7); without it co-located
-4 / 8 / 16 chips ran 14.3 / 20.0 / 23.4 fps. The 720p co-located 16-chip number (10.0) is being re-measured with it.
+4 / 8 / 16 chips ran 14.3 / 20.0 / 23.4 fps. The 720p co-located 16-chip number is 11.4 fps with it (10.0 without).
 
 **7.6 Latency (Figures 10 carwash.svg, 11 latency.svg).** The statement: splitting never makes a key press show
 up sooner. With too few VAE chips it makes reactions about 0.1 s slower (4 + 1: 1221 vs 1114 ms). With enough VAE chips

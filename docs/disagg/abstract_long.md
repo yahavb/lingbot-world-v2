@@ -31,7 +31,7 @@ On LingBot-World v2 (14B, streaming video) and Stable Audio 3 Medium (long-form 
 - At 16 chips, a 16-chip DiT plus a 1-chip decoder runs 1.20x the frame rate of the best co-located configuration
   (32.1 vs 26.7 fps); an 8-chip DiT plus a 1-chip decoder reaches 96% of the 16-chip co-located replica's frame rate on 9 chips.
 - At 720p the co-located 8-chip replica does not fit in device memory; disaggregated, the same DiT runs; at 16 chips
-  the split gains 1.27x.
+  the split gains 1.11x.
 - One 1-chip decoder serves 3 streams with no per-stream slowdown (427 MiB of state per session), and decoder replicas
   scale out: 3 decoders serve 9 streams on 21 chips at full speed.
 - Rate matching works both ways: with a slow DiT one decoder feeds several, and with a fast, few-step DiT one DiT

@@ -15,7 +15,7 @@ FONT = "font-family='Helvetica, Arial, sans-serif'"
 SERIES = [  # (name, color, dash, [(total chips, fps)])
     ("Co-located, 480x768", BLUE, "", [(4, 15.54), (8, 22.63), (16, 26.70)]),
     ("Split: DiT + 1-chip VAE, 480x768", ORANGE, "", [(3, 10.07), (5, 17.54), (9, 25.76), (17, 32.14)]),
-    ("Co-located, 720p", BLUE, "6 4", [(16, 9.96)]),
+    ("Co-located, 720p", BLUE, "6 4", [(16, 11.38)]),
     ("Split: DiT + 1-chip VAE, 720p", ORANGE, "6 4", [(9, 8.46), (17, 12.68)]),
 ]
 
@@ -49,7 +49,7 @@ def fps_chart(series=None, title='LingBot-World v2: frame rate vs chips, one str
     s.append(f"<text x='{X(16) + 10}' y='{Y(26.70) + 4}' font-size='12' fill='{INK}'>co-located 26.7</text>")
     if note720:
         s.append(f"<text x='{X(17) + 10}' y='{Y(12.68) + 4}' font-size='12' fill='{INK}'>split 720p 12.7</text>")
-        s.append(f"<text x='{X(16) + 10}' y='{Y(9.96) + 14}' font-size='12' fill='{INK}'>co-located 720p 10.0</text>")
+        s.append(f"<text x='{X(16) + 10}' y='{Y(11.38) + 14}' font-size='12' fill='{INK}'>co-located 720p 11.4</text>")
         # co-located 8 chips at 720p: no point (does not fit)
         s.append(f"<text x='{X(8)}' y='{Y(2.2)}' font-size='11' text-anchor='middle' fill='{INK2}'>720p co-located, 8 chips:</text>")
         s.append(f"<text x='{X(8)}' y='{Y(0.6)}' font-size='11' text-anchor='middle' fill='{INK2}'>does not fit in device memory</text>")

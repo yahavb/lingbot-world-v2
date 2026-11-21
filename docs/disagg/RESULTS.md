@@ -31,7 +31,8 @@ This file is the data index for paper_draft.md. All runs are on KEEP-trn3-dev1 (
 
 | Measurement | Value | Cells |
 |---|---|---|
-| Co-located 16 | 9.96 fps | p7_mono16_720 |
+| Co-located 16, with async emit | 11.38 fps | p16_mono16e_720 |
+| Co-located 16, without async emit (superseded) | 9.96 fps | p7_mono16_720 |
 | Co-located 8 | does not fit (device memory once the VAE loads) | h8-inline logs |
 | Co-located 4 and split 4+x | do not fit | h4-inline, hs4-split logs |
 | Split 8+1 / 8+2 / 8+4 | 8.46 / 8.28 / 8.38 fps | p3_split_d8v*_720 |

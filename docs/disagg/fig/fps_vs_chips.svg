@@ -38,14 +38,14 @@
 <circle cx='215.7' cy='225.6' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 5 chips, 17.54 fps</title></circle>
 <circle cx='337.0' cy='142.0' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 9 chips, 25.76 fps</title></circle>
 <circle cx='579.7' cy='77.1' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 17 chips, 32.14 fps</title></circle>
-<circle cx='549.3' cy='302.7' r='4.5' fill='#fcfcfb' stroke='#2a78d6' stroke-width='2'><title>Co-located, 720p: 16 chips, 9.96 fps</title></circle>
+<circle cx='549.3' cy='288.2' r='4.5' fill='#fcfcfb' stroke='#2a78d6' stroke-width='2'><title>Co-located, 720p: 16 chips, 11.38 fps</title></circle>
 <path d='M337.0,317.9 L579.7,275.0' fill='none' stroke='#eb6834' stroke-width='2' stroke-dasharray='6 4' stroke-linejoin='round'/>
 <circle cx='337.0' cy='317.9' r='4.5' fill='#fcfcfb' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 720p: 9 chips, 8.46 fps</title></circle>
 <circle cx='579.7' cy='275.0' r='4.5' fill='#fcfcfb' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 720p: 17 chips, 12.68 fps</title></circle>
 <text x='589.6666666666666' y='81.0902857142857' font-size='12' fill='#0b0b0b'>split 32.1</text>
 <text x='559.3333333333333' y='136.4228571428572' font-size='12' fill='#0b0b0b'>co-located 26.7</text>
 <text x='589.6666666666666' y='279.0262857142857' font-size='12' fill='#0b0b0b'>split 720p 12.7</text>
-<text x='559.3333333333333' y='316.69257142857145' font-size='12' fill='#0b0b0b'>co-located 720p 10.0</text>
+<text x='559.3333333333333' y='302.24914285714283' font-size='12' fill='#0b0b0b'>co-located 720p 11.4</text>
 <text x='306.66666666666663' y='381.62285714285713' font-size='11' text-anchor='middle' fill='#52514e'>720p co-located, 8 chips:</text>
 <text x='306.66666666666663' y='397.89714285714285' font-size='11' text-anchor='middle' fill='#52514e'>does not fit in device memory</text>
 <line x1='78' x2='100' y1='62' y2='62' stroke='#2a78d6' stroke-width='2' stroke-dasharray=''/>
