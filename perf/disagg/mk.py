@@ -177,20 +177,21 @@ def combo(a):
     d = dit(a)
     nd, nv = a.chips, a.vae_chips
     sp = d["spec"]["template"]["spec"]
-    sp["resourceClaims"][0]["resourceClaimTemplateName"] = f"x-combo-{nd}p{nv}"
-    os.makedirs(GEN, exist_ok=True)
-    json.dump(claim_combo(nd, nv), open(os.path.join(GEN, f"x-combo-{nd}p{nv}.json"), "w"), indent=1)
+    # two claims in the pod, one per container: each container sees only its own devices (one shared claim gave the
+    # containers device orders that did not match their NEURON_RT_VISIBLE_CORES ranges: "cores busy" at 8 + 1)
+    sp["resourceClaims"] = [{"name": "neuroncores", "resourceClaimTemplateName": f"x-lnc2-efa-{nd}"},
+                            {"name": "vaecores", "resourceClaimTemplateName": f"x-lnc2-efa-{nv}"}]
     c = sp["containers"][0]
-    env_set(c, "NEURON_RT_VISIBLE_CORES", f"0-{RANKS_PER_CHIP * nd - 1}")
     env_set(c, "VAE_SELECTOR", f"app={a.name}")
     env_set(c, "VAE_PORT", "8001")
     v = copy.deepcopy(json.load(open(os.path.join(HERE, "base", "lbw-vae-deploy.json"))))["spec"]["template"]["spec"]["containers"][0]
     v["name"] = "vae"
     lh, lw = LAT[a.size]
     for k, val in (("NPROC", RANKS_PER_CHIP * nv), ("LAT_H", lh), ("LAT_W", lw), ("CACHE_VERSION", "5"),
-                   ("PORT", "8001"), ("NEURON_RT_VISIBLE_CORES", f"{RANKS_PER_CHIP * nd}-{RANKS_PER_CHIP * (nd + nv) - 1}")):
+                   ("PORT", "8001")):
         env_set(v, k, val)
     v["ports"] = [{"containerPort": 8001}]
+    v["resources"]["claims"] = [{"name": "vaecores"}]
     for pr in ("startupProbe", "readinessProbe", "livenessProbe"):
         if pr in v and "httpGet" in v[pr]:
             v[pr]["httpGet"]["port"] = 8001
