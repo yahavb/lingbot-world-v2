@@ -126,6 +126,19 @@ chip count (section 3).
 **3.1 Binding resources (Figure 3).** From a system trace of a warm run, we take a device profile of every graph
 that carries the latency, and compute one floor per resource.
 
+**Coverage.** Share of chip-busy time in the profiled run (4 chips, 480x768, about 31.7 s of chip time), source
+perf/disagg/results/prof/p14_devprof_dma_480.devprof.txt:
+
+| Group | Share of chip time | Class |
+|---|---|---|
+| DiT attention blocks (2 programs) | 76% | on-chip movement |
+| Other DiT programs (4) | 11% | on-chip movement |
+| VAE convolutions (4) | 7% | array utilization |
+| 17 small programs, each under 1% | 6% | not profiled |
+
+The 10 profiled programs cover 94% of the chip time, and each one falls into one of the two classes. The figure shows
+the largest program of each stage.
+
 We observe that:
 
 - **The DiT's attention blocks are not compute-bound or HBM-bound.** Their DMA queues are busy 82% of the time
