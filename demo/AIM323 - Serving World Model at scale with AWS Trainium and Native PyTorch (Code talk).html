@@ -970,103 +970,16 @@
 <div class="nt">
 <p class="meta">Section 4 · ~10 minutes</p>
 <p><b>Step 2.</b> On Trainium the unit of work is a compiled graph, a NEFF. Bigger graphs mean fewer launches and more fusion, and one graph can serve every call of a repeated block. What you put inside one graph matters as much as compiling at all.</p>
+<p><b>The order is motivate, then instruct:</b> S4d shows eager against fusion with nothing to read, then S4a is the knob for what gets fused, S4b what everyone does with it, S4c what that buys, S4e the VAE.</p>
 </div></div>
 
-<!-- ═══════════════════════════ S4a · fuse the computation ═══════════════════════════ -->
-<div class="cell" data-ref="S4a"><section class="slide">
-  <p class="kicker">Give the compiler big, reusable graphs</p>
-  <h1>First attempt: fuse computation as one graph</h1>
-  <div class="body">
-<div class="stack" style="gap:28px">
-  <div class="code"><div class="cap"><span>Fuse the computation</span><span class="lnks"><a class="lnk" href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/tp_utils.py#L119-L128" target="_blank" rel="noopener">models/tp_utils.py</a></span></div><pre style="font-size:17px"><span class="ln">block.ffn = torch.compile(block.ffn, backend=<span class="tk-s">"neuron"</span>, dynamic=<span class="tk-k">False</span>)</span></pre></div>
-  <p class="dek" style="max-width:none" data-step="1">To control what is <b>not</b> fused, you set the boundary yourself: <code>@torch.compiler.disable</code> keeps everything it wraps outside the graph — here, every collective.</p>
-  <div class="code" data-step="1"><div class="cap"><span>Where the fusing stops</span></div><pre style="font-size:17px"><span class="ln hl"><span class="tk-d">@torch.compiler.disable</span></span><span class="ln"><span class="tk-k">def</span> <span class="tk-f">all_reduce_sum</span>(x): ...</span></pre></div>
-  <svg viewBox="0 0 1152 96" width="1152" height="96" data-step="2" role="img" aria-label="One block in the first attempt: compiled graphs and eager all-reduces, with a runtime launch between every piece">
-    <text class="lbl" x="0" y="12">ONE BLOCK</text>
-    <rect class="bx-a" x="0" y="24" width="118" height="44" rx="6"/>
-    <text class="t-s" x="59.0" y="51" text-anchor="middle">graph</text>
-    <rect class="bx-dash" x="122" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="149.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-w" x="180" y="24" width="96" height="44" rx="6"/>
-    <text class="t-s" x="228.0" y="51" text-anchor="middle">all-reduce</text>
-    <rect class="bx-dash" x="280" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="307.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-a" x="338" y="24" width="118" height="44" rx="6"/>
-    <text class="t-s" x="397.0" y="51" text-anchor="middle">graph</text>
-    <rect class="bx-dash" x="460" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="487.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-w" x="518" y="24" width="96" height="44" rx="6"/>
-    <text class="t-s" x="566.0" y="51" text-anchor="middle">all-reduce</text>
-    <rect class="bx-dash" x="618" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="645.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-a" x="676" y="24" width="118" height="44" rx="6"/>
-    <text class="t-s" x="735.0" y="51" text-anchor="middle">graph</text>
-    <rect class="bx-dash" x="798" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="825.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-w" x="856" y="24" width="96" height="44" rx="6"/>
-    <text class="t-s" x="904.0" y="51" text-anchor="middle">all-reduce</text>
-    <rect class="bx-dash" x="956" y="24" width="54" height="44" rx="6"/>
-    <text class="t-m" x="983.0" y="51" text-anchor="middle">launch</text>
-    <rect class="bx-a" x="1014" y="24" width="118" height="44" rx="6"/>
-    <text class="t-s" x="1073.0" y="51" text-anchor="middle">graph</text>
-    <text class="t-s" x="0" y="90">each gap is a launch overhead</text>
-  </svg>
-</div>
-  </div>
-</section>
-<div class="nt">
-<p class="meta">Section 4 · about 2 minutes · 2 clicks</p>
-<p>The prototype compiled small modules — here the FFN — and marked the all-reduce as something the compiler must not absorb. <code>@torch.compiler.disable</code> is the knob for that: it forces a graph break, so everything it wraps stays outside. Worth knowing in its own right, and it is why one block reaches the device as several pieces rather than one.</p>
-<p><b>Click 1</b> brings up the boundary: the sentence and <code>@torch.compiler.disable</code> together, since neither means much without the other. <b>Click 2</b> brings up what one block then becomes at run time — four graphs, three all-reduces, a launch between every pair. Hold it there; the gaps are the argument for the next slide.</p>
-<p><b>The gaps are not Python</b>, and the figure used to say they were. The host runs <i>ahead</i> of the device — a compiled graph and a collective are both enqueued asynchronously — so what sits between two pieces on the device is launch overhead in the Neuron runtime, not the interpreter executing. It matters because it says what the fix is: fewer, bigger pieces, not faster host code.</p>
-<p><b>If asked why you would split it this way:</b> it leaves one unknown instead of two. Compiling changes how the compute runs; tracing a collective changes how the ranks talk to each other. With the collectives left as the eager calls that already worked, anything that breaks is the compiler.</p>
-<p class="chk">CHECK: the figure draws four graphs and three all-reduces for one block. Confirm that is the prototype’s real count before quoting it.</p>
-</div></div>
-
-<!-- ═══════════════════════════ S4b · one graph per block ═══════════════════════════ -->
-<div class="cell" data-ref="S4b"><section class="slide">
-  <p class="kicker">Give the compiler big, reusable graphs</p>
-  <h1>One graph per transformer block</h1>
-  <div class="body">
-<div class="stack" style="gap:26px">
-  <div class="code"><div class="cap"><span>One graph per block</span><span class="lnks"><a class="lnk" href="https://github.com/yahavb/lingbot-world-v2/blob/main/wan/modules/model_fast.py#L2985" target="_blank" rel="noopener">wan/modules/model_fast.py</a></span></div><pre style="font-size:16px"><span class="ln">_scope = os.environ.get(&quot;COMPILE_SCOPE&quot;, &quot;blocks&quot;)</span><span class="ln">for _i in range(len(self.blocks)):</span><span class="ln hl">    self.blocks[_i] = torch.compile(</span><span class="ln">        self.blocks[_i], backend=&quot;neuron&quot;, fullgraph=True, dynamic=False)</span></pre></div>
-  <svg viewBox="0 0 1152 70" width="1152" height="70" role="img" aria-label="One block as one compiled graph, collectives inside">
-    <text class="lbl" x="0" y="12">ONE BLOCK</text>
-    <rect class="bx-ok" x="0" y="24" width="1152" height="44" rx="6"/>
-    <text class="t" x="576" y="51" text-anchor="middle">one graph, collectives inside</text>
-  </svg>
-</div>
-  </div>
-</section>
-<div class="nt"><p class="meta">Section 4 · about 2 minutes · live code</p><p><b>These numbers, and what they replaced:</b> code: Wan2.2 models/fast_dit.py → LingBot wan/modules/model_fast.py:2985 (COMPILE_SCOPE=blocks); notes: LingBot's FFN is 5120 → 13824 → 5120 (Wan2.2-5B: 3072 → 14336 → 3072).</p></div></div>
-<!-- ═══════════════════════════ S4c · what one graph per block buys ═══════════════════════════ -->
-<div class="cell" data-ref="S4c"><section class="slide">
-  <p class="kicker">Give the compiler big, reusable graphs</p>
-  <h1>What one graph per block buys</h1>
-  <div class="body">
-<div class="col2" style="grid-template-columns:1fr 420px;gap:48px">
-<ol class="pts lg">
-  <li><span class="n">1</span><p><b>The compiler schedules the whole block:</b> less data movement, and the rest overlapped with compute</p></li>
-  <li><span class="n">2</span><p><b>One launch</b> per block</p></li>
-  <li><span class="n">3</span><p><b>Collectives</b> scheduled by the compiler</p></li>
-  <li><span class="n">4</span><p><b>One NEFF</b> shared by all 40 DiT blocks</p></li>
-</ol>
-<div class="stack" data-step="1" style="gap:18px">
-  <div class="stat big g"><div class="v">0.54 → 0.173 <small>s/forward</small></div><div class="l">DiT</div></div>
-  <div class="stat big g"><div class="v">21.6 → 8.09 <small>s</small></div><div class="l">per video</div></div>
-</div>
-</div>
-  </div>
-  <p class="takeaway" data-step="2"><span class="k">Takeaway</span><span>Compile one graph per repeated block, with the collectives inside it.</span></p>
-</section>
-<div class="nt"><p class="meta">Section 4 · about 2 minutes · 2 clicks</p><p><b>These numbers, and what they replaced:</b> 30 → 40 DiT blocks; DiT 4.4 → 1.91 s/step → 0.54 → 0.173 s per forward (no CFG in LingBot); 76.6 → 36.8 s → 21.6 → 8.09 s per video (4x8_eager vs 4x8_compile).</p></div></div>
-<!-- ═══════════════════════════ S4d · eager vs. one compiled graph ═══════════════════════════ -->
+<!-- ═══════════════════════════ S4d · eager is correct, not fast ═══════════════════════════ -->
 <div class="cell" data-ref="S4d"><section class="slide">
   <p class="kicker">Give the compiler big, reusable graphs</p>
-  <h1>Eager vs. one compiled graph</h1>
+  <h1>Eager is correct, not fast</h1>
   <div class="body">
 <div class="stack" style="gap:10px">
-  <div class="anim" style="height:auto;width:100%;aspect-ratio:1600/300"><iframe title="Animation: eager, one launch per operation" aria-label="Eager: the six operations of a block fragment — norm, scale, shift, matmul, SiLU, add — run one after another. Each is launched on its own, drawn as a dashed outline because nothing computes during a launch, then reads its input from HBM, computes on one engine and writes its result back to HBM. The timeline underneath fills with launch and memory time for all six." tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
+  <div class="anim" style="height:auto;width:100%;aspect-ratio:1600/300"><iframe title="Animation: eager, one launch per operation" aria-label="Eager, what we have: the six operations of a block fragment — norm, scale, shift, matmul, SiLU, add — run one after another. Each is launched on its own, drawn as a dashed outline because nothing computes during a launch, then reads its input from HBM, computes on one engine and writes its result back to HBM. The timeline underneath fills with launch and memory time for all six." tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
 &lt;html lang=&quot;en&quot;&gt;
 &lt;head&gt;
 &lt;meta charset=&quot;utf-8&quot;&gt;
@@ -1080,7 +993,7 @@
 &lt;/head&gt;
 &lt;body&gt;
 &lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 300&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
-     aria-label=&quot;Eager: the six operations of a block fragment — norm, scale, shift, matmul, SiLU, add — run one after another. Each is launched on its own, drawn as a dashed outline because nothing computes during a launch, then reads its input from HBM, computes on one engine and writes its result back to HBM. The timeline underneath fills with launch and memory time for all six.&quot;&gt;
+     aria-label=&quot;Eager, what we have: the six operations of a block fragment — norm, scale, shift, matmul, SiLU, add — run one after another. Each is launched on its own, drawn as a dashed outline because nothing computes during a launch, then reads its input from HBM, computes on one engine and writes its result back to HBM. The timeline underneath fills with launch and memory time for all six.&quot;&gt;
   &lt;defs&gt;
     &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
       &lt;feGaussianBlur stdDeviation=&quot;8&quot; result=&quot;b&quot;/&gt;
@@ -1147,13 +1060,13 @@
 
   function render(t){
     var s = T(50,48,34,&#x27;Eager&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;)
-          + T(190,48,22,&#x27;one launch per operation, HBM in and out of each&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
+          + T(190,48,22,&#x27;what we have: a launch and two HBM trips per operation&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
     // the legend, once, for both animations
-    s += dashBox(900,33,24,16,8,LAUNCH) + T(934,47,18,&#x27;launch&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
-       + R(1030,33,22,16,3,HBMC)        + T(1060,47,18,&#x27;HBM read / write&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
-       + R(1245,33,22,16,3,SBUFC)       + T(1275,47,18,&#x27;SBUF&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
-       + R(1360,33,22,16,3,TEN) + R(1384,33,22,16,3,VEC) + R(1408,33,22,16,3,SCA)
-       + T(1438,47,18,&#x27;compute&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
+    s += dashBox(1020,33,24,16,8,LAUNCH) + T(1054,47,18,&#x27;launch&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
+       + R(1139,33,22,16,3,HBMC)         + T(1169,47,18,&#x27;HBM read / write&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
+       + R(1346,33,22,16,3,SBUFC)        + T(1376,47,18,&#x27;SBUF&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;)
+       + R(1443,33,22,16,3,TEN) + R(1467,33,22,16,3,VEC) + R(1491,33,22,16,3,SCA)
+       + T(1521,47,18,&#x27;compute&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
     s += R(OX0,HBMY,SPAN,HBMH,10,hexA(HBMC,.18),HBMC,4) + T(OX0-24,HBMY+23,26,&#x27;HBM&#x27;,HBMC,null,&#x27;end&#x27;);
     for (i=0;i&lt;OPS.length;i++){
       var ev = EV[i], x = ox(i), on = t&gt;=ev.c &amp;&amp; t&lt;ev.w;
@@ -1187,7 +1100,7 @@
 &lt;/body&gt;
 &lt;/html&gt;
 "></iframe></div>
-  <div class="anim" style="height:auto;width:100%;aspect-ratio:1600/300"><iframe title="Animation: fused, one graph and one launch" aria-label="Fused with torch.compile: the same six operations are one graph with one launch. The data is read from HBM once into on-chip SBUF, hops from operation to operation along SBUF while the engines overlap, and is written back to HBM once. Drawn at the same scale as the eager animation above, its timeline is about a third as long." tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
+  <div class="anim" data-step="1" style="height:auto;width:100%;aspect-ratio:1600/300"><iframe title="Animation: fused, one graph and one launch" aria-label="Fused with torch.compile, what we want: the same six operations are one graph with one launch. The data is read from HBM once into on-chip SBUF, hops from operation to operation along SBUF while the engines overlap, and is written back to HBM once. Drawn at the same scale as the eager animation above, its timeline is about a third as long." tabindex="-1" srcdoc="&lt;!DOCTYPE html&gt;
 &lt;html lang=&quot;en&quot;&gt;
 &lt;head&gt;
 &lt;meta charset=&quot;utf-8&quot;&gt;
@@ -1201,7 +1114,7 @@
 &lt;/head&gt;
 &lt;body&gt;
 &lt;svg id=&quot;s&quot; viewBox=&quot;0 0 1600 300&quot; preserveAspectRatio=&quot;xMidYMid meet&quot; role=&quot;img&quot;
-     aria-label=&quot;Fused with torch.compile: the same six operations are one graph with one launch. The data is read from HBM once into on-chip SBUF, hops from operation to operation along SBUF while the engines overlap, and is written back to HBM once. Drawn at the same scale as the eager animation above, its timeline is about a third as long.&quot;&gt;
+     aria-label=&quot;Fused with torch.compile, what we want: the same six operations are one graph with one launch. The data is read from HBM once into on-chip SBUF, hops from operation to operation along SBUF while the engines overlap, and is written back to HBM once. Drawn at the same scale as the eager animation above, its timeline is about a third as long.&quot;&gt;
   &lt;defs&gt;
     &lt;filter id=&quot;glow&quot; x=&quot;-30%&quot; y=&quot;-30%&quot; width=&quot;160%&quot; height=&quot;160%&quot;&gt;
       &lt;feGaussianBlur stdDeviation=&quot;8&quot; result=&quot;b&quot;/&gt;
@@ -1273,7 +1186,7 @@
 
   function render(t){
     var s = T(50,48,34,&#x27;Fused&#x27;,&#x27;#ffffff&#x27;,null,&#x27;start&#x27;)
-          + T(190,48,22,&#x27;torch.compile: one graph, one launch, and the data stays on chip&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
+          + T(190,48,22,&#x27;what we want: one launch, one read from HBM, the engines overlapping&#x27;,&#x27;#aab3c5&#x27;,null,&#x27;start&#x27;);
     s += R(OX0-20,OPY-6,SPAN+40,SBY+SBH+6-(OPY-6),18,hexA(&#x27;#ffffff&#x27;,.04),&#x27;#ffffff&#x27;,3,&#x27; stroke-dasharray=&quot;16 10&quot;&#x27;);
     s += R(OX0,SBY,SPAN,SBH,6,hexA(SBUFC,.22),SBUFC,3) + T(OX0-24,SBMID+8,24,&#x27;SBUF&#x27;,SBUFC,null,&#x27;end&#x27;);
     s += R(OX0,HBMY,SPAN,HBMH,10,hexA(HBMC,.18),HBMC,4) + T(OX0-24,HBMY+23,26,&#x27;HBM&#x27;,HBMC,null,&#x27;end&#x27;);
@@ -1318,17 +1231,107 @@
 "></iframe></div>
 </div>
   </div>
-  <p class="takeaway" data-step="1"><span class="k">Takeaway</span><span>Fusion keeps data on chip: one read from HBM, one write back.</span></p>
+  <p class="takeaway" data-step="2"><span class="k">Takeaway</span><span>Fusion keeps data on chip: one read from HBM, one write back.</span></p>
 </section>
 <div class="nt">
-<p class="meta">Section 4 · about 1 minute · both animations play when the slide opens (R restarts them) · 1 click</p>
-<p><b>The two run side by side, and that is the point.</b> Top: six operations — norm, scale, shift, matmul, SiLU, add — each launched on its own, each reading its input from HBM and writing its result back. Bottom: the same six as one graph with one launch, read from HBM once, passed from operation to operation in on-chip SBUF while the engines overlap, written back once.</p>
+<p class="meta">Section 4 · about 2 minutes · the eager run plays when the slide opens · 2 clicks</p>
+<p><b>This is the slide that motivates the section</b>, so it comes before any code. Let the eager run play on its own first — six launches, six round trips to HBM, a timeline filling up with neither — and only then click.</p>
+<p><b>Click 1 reveals the fused run and restarts both</b>, so the two race from the same instant rather than the second one starting wherever the first happens to be. The two animations label themselves — <i>what we have</i> above, <i>what we want</i> below — which is the same pairing S5m uses for the schedule two sections later. Top: six operations — norm, scale, shift, matmul, SiLU, add — each launched on its own, each reading its input from HBM and writing its result back. Bottom: the same six as one graph with one launch, read from HBM once, passed from operation to operation in on-chip SBUF while the engines overlap, written back once.</p>
 <p><b>What to point at:</b> the two timelines are drawn at the same scale and advance together, so when the fused one stops the eager one above it is only a third of the way along — and the eager one keeps going for twice as long again, on its third operation of six. Wait for that before clicking the takeaway. Both loop, and R restarts them together.</p>
+<p><b>Then the section can get specific:</b> S4a is the knob for choosing what gets fused, S4b is what everyone ends up doing with it, S4c is what that buys.</p>
 <p><b>Reading the colours:</b> a launch is a dashed outline with nothing in it, because nothing computes while one happens; solid blue-grey is HBM traffic, purple is SBUF, and the three engine colours are compute. The legend is on the eager animation and covers both.</p>
 <p><b>Demo idea:</b> the same block, eager vs compiled, in the Neuron Explorer system trace. Many short executions with gaps become one long execution.</p>
 <p><b>Click 1, the takeaway:</b> Fusion keeps data on chip: one read from HBM, one write back.</p>
 </div></div>
 
+<!-- ═══════════════════════════ S4a · control what gets fused ═══════════════════════════ -->
+<div class="cell" data-ref="S4a"><section class="slide">
+  <p class="kicker">Give the compiler big, reusable graphs</p>
+  <h1>torch.compile: control what you want to fuse</h1>
+  <div class="body">
+<div class="stack" style="gap:28px">
+  <div class="code"><div class="cap"><span>Fuse the computation</span><span class="lnks"><a class="lnk" href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/tp_utils.py#L119-L128" target="_blank" rel="noopener">models/tp_utils.py</a></span></div><pre style="font-size:17px"><span class="ln">block.ffn = torch.compile(block.ffn, backend=<span class="tk-s">"neuron"</span>, dynamic=<span class="tk-k">False</span>)</span></pre></div>
+  <p class="dek" style="max-width:none" data-step="1">To control what is <b>not</b> fused, you set the boundary yourself: <code>@torch.compiler.disable</code> keeps everything it wraps outside the graph — here, every collective.</p>
+  <div class="code" data-step="1"><div class="cap"><span>Where the fusing stops</span></div><pre style="font-size:17px"><span class="ln hl"><span class="tk-d">@torch.compiler.disable</span></span><span class="ln"><span class="tk-k">def</span> <span class="tk-f">all_reduce_sum</span>(x): ...</span></pre></div>
+  <svg viewBox="0 0 1152 96" width="1152" height="96" data-step="2" role="img" aria-label="One block with the computation compiled and the collectives left outside: compiled graphs and eager all-reduces, with a runtime launch between every piece">
+    <text class="lbl" x="0" y="12">ONE BLOCK</text>
+    <rect class="bx-a" x="0" y="24" width="118" height="44" rx="6"/>
+    <text class="t-s" x="59.0" y="51" text-anchor="middle">graph</text>
+    <rect class="bx-dash" x="122" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="149.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-w" x="180" y="24" width="96" height="44" rx="6"/>
+    <text class="t-s" x="228.0" y="51" text-anchor="middle">all-reduce</text>
+    <rect class="bx-dash" x="280" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="307.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-a" x="338" y="24" width="118" height="44" rx="6"/>
+    <text class="t-s" x="397.0" y="51" text-anchor="middle">graph</text>
+    <rect class="bx-dash" x="460" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="487.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-w" x="518" y="24" width="96" height="44" rx="6"/>
+    <text class="t-s" x="566.0" y="51" text-anchor="middle">all-reduce</text>
+    <rect class="bx-dash" x="618" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="645.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-a" x="676" y="24" width="118" height="44" rx="6"/>
+    <text class="t-s" x="735.0" y="51" text-anchor="middle">graph</text>
+    <rect class="bx-dash" x="798" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="825.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-w" x="856" y="24" width="96" height="44" rx="6"/>
+    <text class="t-s" x="904.0" y="51" text-anchor="middle">all-reduce</text>
+    <rect class="bx-dash" x="956" y="24" width="54" height="44" rx="6"/>
+    <text class="t-m" x="983.0" y="51" text-anchor="middle">launch</text>
+    <rect class="bx-a" x="1014" y="24" width="118" height="44" rx="6"/>
+    <text class="t-s" x="1073.0" y="51" text-anchor="middle">graph</text>
+    <text class="t-s" x="0" y="90">each gap is a launch overhead</text>
+  </svg>
+</div>
+  </div>
+</section>
+<div class="nt">
+<p class="meta">Section 4 · about 2 minutes · 2 clicks</p>
+<p><b>The title is the point:</b> <code>torch.compile</code> is not all-or-nothing — you choose the boundary. The prototype compiled small modules — here the FFN — and marked the all-reduce as something the compiler must not absorb. <code>@torch.compiler.disable</code> is the knob for that: it forces a graph break, so everything it wraps stays outside. Worth knowing in its own right, and it is why one block reaches the device as several pieces rather than one.</p>
+<p><b>Click 1</b> brings up the boundary: the sentence and <code>@torch.compiler.disable</code> together, since neither means much without the other. <b>Click 2</b> brings up what one block then becomes at run time — four graphs, three all-reduces, a launch between every pair. Hold it there; the gaps are the argument for the next slide.</p>
+<p><b>The gaps are not Python</b>, and the figure used to say they were. The host runs <i>ahead</i> of the device — a compiled graph and a collective are both enqueued asynchronously — so what sits between two pieces on the device is launch overhead in the Neuron runtime, not the interpreter executing. It matters because it says what the fix is: fewer, bigger pieces, not faster host code.</p>
+<p><b>If asked why you would split it this way:</b> it leaves one unknown instead of two. Compiling changes how the compute runs; tracing a collective changes how the ranks talk to each other. With the collectives left as the eager calls that already worked, anything that breaks is the compiler.</p>
+<p class="chk">CHECK: the figure draws four graphs and three all-reduces for one block. Confirm that is the prototype’s real count before quoting it.</p>
+</div></div>
+
+<!-- ═══════════════════════════ S4b · one fused graph per DiT block ═══════════════════════════ -->
+<div class="cell" data-ref="S4b"><section class="slide">
+  <p class="kicker">Give the compiler big, reusable graphs</p>
+  <h1>Common practice: one fused graph per DiT block</h1>
+  <div class="body">
+<div class="stack" style="gap:26px">
+  <div class="code"><div class="cap"><span>One graph per block</span><span class="lnks"><a class="lnk" href="https://github.com/yahavb/lingbot-world-v2/blob/main/wan/modules/model_fast.py#L2985" target="_blank" rel="noopener">wan/modules/model_fast.py</a></span></div><pre style="font-size:16px"><span class="ln">_scope = os.environ.get(&quot;COMPILE_SCOPE&quot;, &quot;blocks&quot;)</span><span class="ln">for _i in range(len(self.blocks)):</span><span class="ln hl">    self.blocks[_i] = torch.compile(</span><span class="ln">        self.blocks[_i], backend=&quot;neuron&quot;, fullgraph=True, dynamic=False)</span></pre></div>
+  <svg viewBox="0 0 1152 70" width="1152" height="70" role="img" aria-label="One block as one compiled graph, collectives inside">
+    <text class="lbl" x="0" y="12">ONE BLOCK</text>
+    <rect class="bx-ok" x="0" y="24" width="1152" height="44" rx="6"/>
+    <text class="t" x="576" y="51" text-anchor="middle">one graph, collectives inside</text>
+  </svg>
+</div>
+  </div>
+</section>
+<div class="nt"><p class="meta">Section 4 · about 2 minutes · live code</p><p><b>These numbers, and what they replaced:</b> code: Wan2.2 models/fast_dit.py → LingBot wan/modules/model_fast.py:2985 (COMPILE_SCOPE=blocks); notes: LingBot's FFN is 5120 → 13824 → 5120 (Wan2.2-5B: 3072 → 14336 → 3072).</p></div></div>
+<!-- ═══════════════════════════ S4c · what one graph per block buys ═══════════════════════════ -->
+<div class="cell" data-ref="S4c"><section class="slide">
+  <p class="kicker">Give the compiler big, reusable graphs</p>
+  <h1>What one graph per block buys</h1>
+  <div class="body">
+<div class="col2" style="grid-template-columns:1fr 420px;gap:48px">
+<ol class="pts lg">
+  <li><span class="n">1</span><p><b>The compiler schedules the whole block:</b> less data movement, and the rest overlapped with compute</p></li>
+  <li><span class="n">2</span><p><b>One launch</b> per block</p></li>
+  <li><span class="n">3</span><p><b>Collectives</b> scheduled by the compiler</p></li>
+  <li><span class="n">4</span><p><b>One NEFF</b> shared by all 40 DiT blocks</p></li>
+</ol>
+<div class="stack" data-step="1" style="gap:18px">
+  <div class="stat big g"><div class="v">0.54 → 0.173 <small>s/forward</small></div><div class="l">DiT</div></div>
+  <div class="stat big g"><div class="v">21.6 → 8.09 <small>s</small></div><div class="l">per video</div></div>
+</div>
+</div>
+  </div>
+  <p class="takeaway" data-step="2"><span class="k">Takeaway</span><span>Compile one graph per repeated block, with the collectives inside it.</span></p>
+</section>
+<div class="nt"><p class="meta">Section 4 · about 2 minutes · 2 clicks</p><p><b>These numbers, and what they replaced:</b> 30 → 40 DiT blocks; DiT 4.4 → 1.91 s/step → 0.54 → 0.173 s per forward (no CFG in LingBot); 76.6 → 36.8 s → 21.6 → 8.09 s per video (4x8_eager vs 4x8_compile).</p></div></div>
 <!-- ═══════════════════════════ S4e · the VAE ═══════════════════════════ -->
 <div class="cell" data-ref="S4e"><section class="slide">
   <p class="kicker">Give the compiler big, reusable graphs</p>
@@ -3680,6 +3683,17 @@ requestAnimationFrame(tick);
   cells.forEach(c => c.querySelectorAll('iframe').forEach(f => f.addEventListener('load', () => {
     if (c === shown) restartIn(c);
   })));
+  // S4d reveals its second animation on a click: run both from the top then, so
+  // the two timelines can be compared rather than one starting mid-loop
+  const s4d = document.querySelector('.cell[data-ref="S4d"] .anim[data-step]');
+  if (s4d){
+    let off = s4d.classList.contains('off');
+    new MutationObserver(() => {
+      const now = s4d.classList.contains('off');
+      if (off && !now) restartIn(s4d.closest('.cell'));
+      off = now;
+    }).observe(s4d, {attributes: true, attributeFilter: ['class']});
+  }
   check();
 })();
 </script>
