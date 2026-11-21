@@ -380,3 +380,35 @@ def fig_bounds2():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds2())
     print("bounds.svg redrawn")
+
+
+def fig_chiptime():
+    """Chip time per 12-frame chunk, co-located 16 chips vs the 8 + 1 split (measured: chips x stage time; the rest of
+    chips x period is waiting / overhead)."""
+    rows = [("co-located, 16 chips (23.4 fps)", 4800, 2288, 8208 - 4800 - 2288), ("split 8 + 1 (25.8 fps)", 2976, 324, 4194 - 2976 - 324)]
+    W, H, L = 780, 250, 210
+    sc = (W - L - 120) / 8300
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Chip time per 12-frame chunk (chip-ms), LingBot 480</text>"]
+    for i, (name, d, v, o) in enumerate(rows):
+        y = 60 + i * 64
+        s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        x = L
+        for val, col, lab in ((d, BLUE, "DiT"), (v, ORANGE, "VAE"), (o, "#c9c7c0", "waiting")):
+            s.append(f"<rect x='{x:.1f}' y='{y}' width='{max(val * sc - 2, 2):.1f}' height='34' rx='4' fill='{col}'><title>{lab}: {val} chip-ms</title></rect>")
+            if val * sc > 80:
+                s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{'#ffffff' if col != '#c9c7c0' else INK}'>{lab} {val}</text>")
+            else:
+                s.append(f"<text x='{x:.1f}' y='{y + 48}' font-size='10' fill='{INK2}'>{lab} {val}</text>")
+            x += val * sc
+        s.append(f"<text x='{x + 14:.1f}' y='{y + 22}' font-size='11' fill='{INK}'>= {d + v + o}</text>")
+    s.append(f"<text x='{L}' y='{H - 40}' font-size='11' fill='{INK2}'>The split uses 49% less chip time per chunk and streams faster. Most of it is the VAE:</text>")
+    s.append(f"<text x='{L}' y='{H - 24}' font-size='11' fill='{INK2}'>2288 -> 324 chip-ms, because it no longer occupies all 16 chips. The kernels are unchanged.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "chiptime.svg"), "w").write(fig_chiptime())
+    print("chiptime.svg")
