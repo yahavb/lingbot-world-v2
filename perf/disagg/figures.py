@@ -290,3 +290,65 @@ def main2():
 
 if __name__ == "__main__":
     main2()
+
+
+def fig_timeline():
+    """Schematic (measured durations, LingBot 480, 16 chips): co-located DiT then VAE per chunk vs disaggregated overlap."""
+    W, H, L = 820, 260, 150
+    sc = (W - L - 30) / 1500      # ms -> px
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>One stream, three chunks: co-located vs disaggregated (16-chip DiT, measured times)</text>"]
+    def bar(x0, y, ms, col, lab):
+        s.append(f"<rect x='{L + x0 * sc:.1f}' y='{y}' width='{ms * sc - 2:.1f}' height='26' rx='4' fill='{col}'><title>{lab}: {ms} ms</title></rect>")
+        if ms * sc > 40:
+            s.append(f"<text x='{L + x0 * sc + 5:.1f}' y='{y + 17}' font-size='10' fill='#ffffff'>{lab}</text>")
+    y = 60
+    s.append(f"<text x='{L - 10}' y='{y + 17}' font-size='12' text-anchor='end' fill='{INK}'>co-located, 16 chips</text>")
+    t = 0
+    for k in range(3):
+        bar(t, y, 375, BLUE, f"DiT {k}"); t += 375
+        bar(t, y, 143, ORANGE, f"VAE {k}"); t += 143
+    s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 17}' font-size='11' fill='{INK2}'>518 ms / chunk = 23 fps</text>")
+    y2 = 130
+    s.append(f"<text x='{L - 10}' y='{y2 + 17}' font-size='12' text-anchor='end' fill='{INK}'>DiT pod, 16 chips</text>")
+    s.append(f"<text x='{L - 10}' y='{y2 + 51}' font-size='12' text-anchor='end' fill='{INK}'>VAE pod, 1 chip</text>")
+    for k in range(3):
+        bar(375 * k, y2, 375, BLUE, f"DiT {k}")
+        bar(375 * (k + 1), y2 + 34, 324, ORANGE, f"VAE {k}")
+    s.append(f"<text x='{L}' y='{y2 + 90}' font-size='11' fill='{INK2}'>375 ms / chunk = 32 fps: the VAE of chunk n overlaps the DiT of chunk n + 1</text>")
+    s.append(f"<text x='24' y='{H - 14}' font-size='11' fill='{INK2}'>Co-located: P = T_d(N) + T_v(N). Disaggregated: P = max(T_d(n_d), T_v(n_v)); the 1.1 MB latent moves over NIXL/EFA in 0.17 ms.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def fig_pareto():
+    """Streams per chip vs fps per stream (LingBot 480): every measured configuration."""
+    co = [(4, 1, 14.33), (8, 1, 20.03), (16, 1, 23.37), (4, 1, 15.54)]                 # chips, streams, fps (last: async emit)
+    sp = [(3, 1, 10.07), (5, 1, 17.54), (9, 1, 25.76), (17, 1, 32.14), (7, 3, 10.08), (9, 2, 17.53), (14, 6, 10.03), (21, 9, 10.04)]
+    s, X, Y = _axes(720, 440, 64, 40, 48, 56, (0, 35), (0, 0.5), "fps per stream", "streams per chip",
+                    "Throughput vs interactivity: every measured LingBot configuration (480x768)", range(0, 36, 5),
+                    [0, 0.1, 0.2, 0.3, 0.4, 0.5], yfmt=lambda v: f"{v:.1f}")
+    for c, n, f in co:
+        s.append(f"<circle cx='{X(f):.1f}' cy='{Y(n / c):.1f}' r='6' fill='{BLUE}' stroke='{SURF}' stroke-width='2'><title>co-located {c} chips: {f} fps</title></circle>")
+    for c, n, f in sp:
+        s.append(f"<circle cx='{X(f):.1f}' cy='{Y(n / c):.1f}' r='6' fill='{ORANGE}' stroke='{SURF}' stroke-width='2'><title>split {c} chips, {n} streams: {f} fps</title></circle>")
+    for c, n, f, lab in ((21, 9, 10.04, "N:M, 3 streams per 1-chip VAE (3/7, 6/14, 9/21 chips)"), (3, 1, 10.07, "2+1"),
+                         (9, 2, 17.53, "2 streams / 1 VAE"), (5, 1, 17.54, "4+1"), (17, 1, 32.14, "16+1"),
+                         (9, 1, 25.76, "8+1"), (16, 1, 23.37, "co-located 16"), (8, 1, 20.03, "co-located 8"),
+                         (4, 1, 14.33, "co-located 4 (and with async emit)")):
+        dy = 16 if lab in ("4+1", "2+1") else -8
+        s.append(f"<text x='{X(f) + 9:.1f}' y='{Y(n / c) + dy:.1f}' font-size='11' fill='{INK}'>{lab}</text>")
+    _legend(s, X(1), Y(0.12), [("co-located", BLUE, ""), ("disaggregated (incl. N:M)", ORANGE, "")])
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+def main3():
+    for name, fn in (("timeline", fig_timeline), ("pareto", fig_pareto)):
+        open(os.path.join(OUT, f"{name}.svg"), "w").write(fn())
+    print("wrote timeline, pareto")
+
+
+if __name__ == "__main__":
+    main3()
