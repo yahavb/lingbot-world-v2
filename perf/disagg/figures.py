@@ -219,13 +219,14 @@ def fig_nm():
 
 
 def fig_latency():
-    rows = [("co-located 4", 498, 552, 62), ("4 + 1 VAE chip", 476, 433, 314), ("4 + 4 VAE chips", 470, 433, 209)]
-    W, H, L = 720, 300, 150
-    sc = (W - L - 40) / 1300
+    rows = [("co-located 4", 498, 552, 62, "15.5 fps, p90 1416"), ("4 + 1 VAE chip", 476, 433, 314, "17.5 fps, p90 1471"),
+            ("4 + 4 VAE chips", 470, 433, 209, "17.6 fps, p90 1371")]
+    W, H, L = 760, 300, 150
+    sc = (W - L - 130) / 1300
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
-         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Press-to-photon latency, median of 100 presses (LingBot 480)</text>"]
-    for i, (name, w, d, v) in enumerate(rows):
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Press-to-photon latency (median, 100 presses): a 1-chip VAE adds 107 ms; a 4-chip VAE removes it</text>"]
+    for i, (name, w, d, v, note) in enumerate(rows):
         y = 60 + i * 56
         s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
         x = L
@@ -234,7 +235,8 @@ def fig_latency():
             if val > 120:
                 s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{'#ffffff' if col != '#c9c7c0' else INK}'>{lab} {val}</text>")
             x += val * sc
-        s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='11' fill='{INK2}'>= {w + d + v} ms</text>")
+        s.append(f"<text x='{x + 6:.1f}' y='{y + 16}' font-size='11' fill='{INK}'>= {w + d + v} ms</text>")
+        s.append(f"<text x='{x + 6:.1f}' y='{y + 30}' font-size='10' fill='{INK2}'>{note}</text>")
     s.append(f"<text x='{L}' y='{H - 34}' font-size='11' fill='{INK2}'>A decoder sized for latency (4 chips) matches the co-located median (1114 ms)</text>")
     s.append(f"<text x='{L}' y='{H - 18}' font-size='11' fill='{INK2}'>and beats its p90 (1371 vs 1416 ms) at 13% more fps (17.6 vs 15.5).</text>")
     s.append("</svg>")

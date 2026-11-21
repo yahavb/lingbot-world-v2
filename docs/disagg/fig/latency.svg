@@ -1,29 +1,32 @@
-<svg xmlns='http://www.w3.org/2000/svg' width='720' height='300' viewBox='0 0 720 300' font-family='Helvetica, Arial, sans-serif'>
-<rect width='720' height='300' fill='#fcfcfb'/>
-<text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>Press-to-photon latency, median of 100 presses (LingBot 480)</text>
+<svg xmlns='http://www.w3.org/2000/svg' width='760' height='300' viewBox='0 0 760 300' font-family='Helvetica, Arial, sans-serif'>
+<rect width='760' height='300' fill='#fcfcfb'/>
+<text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>Press-to-photon latency (median, 100 presses): a 1-chip VAE adds 107 ms; a 4-chip VAE removes it</text>
 <text x='140' y='82' font-size='12' text-anchor='end' fill='#0b0b0b'>co-located 4</text>
-<rect x='150.0' y='60' width='201.0' height='34' rx='4' fill='#c9c7c0'><title>co-located 4 wait: 498 ms</title></rect>
+<rect x='150.0' y='60' width='181.9' height='34' rx='4' fill='#c9c7c0'><title>co-located 4 wait: 498 ms</title></rect>
 <text x='156.0' y='82' font-size='11' fill='#0b0b0b'>wait 498</text>
-<rect x='353.0' y='60' width='223.0' height='34' rx='4' fill='#2a78d6'><title>co-located 4 DiT: 552 ms</title></rect>
-<text x='359.0' y='82' font-size='11' fill='#ffffff'>DiT 552</text>
-<rect x='578.1' y='60' width='23.3' height='34' rx='4' fill='#eb6834'><title>co-located 4 decode: 62 ms</title></rect>
-<text x='609.4' y='82' font-size='11' fill='#52514e'>= 1112 ms</text>
+<rect x='333.9' y='60' width='201.8' height='34' rx='4' fill='#2a78d6'><title>co-located 4 DiT: 552 ms</title></rect>
+<text x='339.9' y='82' font-size='11' fill='#ffffff'>DiT 552</text>
+<rect x='537.7' y='60' width='20.9' height='34' rx='4' fill='#eb6834'><title>co-located 4 decode: 62 ms</title></rect>
+<text x='566.6' y='76' font-size='11' fill='#0b0b0b'>= 1112 ms</text>
+<text x='566.6' y='90' font-size='10' fill='#52514e'>15.5 fps, p90 1416</text>
 <text x='140' y='138' font-size='12' text-anchor='end' fill='#0b0b0b'>4 + 1 VAE chip</text>
-<rect x='150.0' y='116' width='192.1' height='34' rx='4' fill='#c9c7c0'><title>4 + 1 VAE chip wait: 476 ms</title></rect>
+<rect x='150.0' y='116' width='173.8' height='34' rx='4' fill='#c9c7c0'><title>4 + 1 VAE chip wait: 476 ms</title></rect>
 <text x='156.0' y='138' font-size='11' fill='#0b0b0b'>wait 476</text>
-<rect x='344.1' y='116' width='174.5' height='34' rx='4' fill='#2a78d6'><title>4 + 1 VAE chip DiT: 433 ms</title></rect>
-<text x='350.1' y='138' font-size='11' fill='#ffffff'>DiT 433</text>
-<rect x='520.6' y='116' width='126.0' height='34' rx='4' fill='#eb6834'><title>4 + 1 VAE chip decode: 314 ms</title></rect>
-<text x='526.6' y='138' font-size='11' fill='#ffffff'>decode 314</text>
-<text x='654.6' y='138' font-size='11' fill='#52514e'>= 1223 ms</text>
+<rect x='325.8' y='116' width='157.9' height='34' rx='4' fill='#2a78d6'><title>4 + 1 VAE chip DiT: 433 ms</title></rect>
+<text x='331.8' y='138' font-size='11' fill='#ffffff'>DiT 433</text>
+<rect x='485.6' y='116' width='113.9' height='34' rx='4' fill='#eb6834'><title>4 + 1 VAE chip decode: 314 ms</title></rect>
+<text x='491.6' y='138' font-size='11' fill='#ffffff'>decode 314</text>
+<text x='607.6' y='132' font-size='11' fill='#0b0b0b'>= 1223 ms</text>
+<text x='607.6' y='146' font-size='10' fill='#52514e'>17.5 fps, p90 1471</text>
 <text x='140' y='194' font-size='12' text-anchor='end' fill='#0b0b0b'>4 + 4 VAE chips</text>
-<rect x='150.0' y='172' width='189.6' height='34' rx='4' fill='#c9c7c0'><title>4 + 4 VAE chips wait: 470 ms</title></rect>
+<rect x='150.0' y='172' width='171.5' height='34' rx='4' fill='#c9c7c0'><title>4 + 4 VAE chips wait: 470 ms</title></rect>
 <text x='156.0' y='194' font-size='11' fill='#0b0b0b'>wait 470</text>
-<rect x='341.6' y='172' width='174.5' height='34' rx='4' fill='#2a78d6'><title>4 + 4 VAE chips DiT: 433 ms</title></rect>
-<text x='347.6' y='194' font-size='11' fill='#ffffff'>DiT 433</text>
-<rect x='518.1' y='172' width='83.2' height='34' rx='4' fill='#eb6834'><title>4 + 4 VAE chips decode: 209 ms</title></rect>
-<text x='524.1' y='194' font-size='11' fill='#ffffff'>decode 209</text>
-<text x='609.4' y='194' font-size='11' fill='#52514e'>= 1112 ms</text>
+<rect x='323.5' y='172' width='157.9' height='34' rx='4' fill='#2a78d6'><title>4 + 4 VAE chips DiT: 433 ms</title></rect>
+<text x='329.5' y='194' font-size='11' fill='#ffffff'>DiT 433</text>
+<rect x='483.4' y='172' width='75.2' height='34' rx='4' fill='#eb6834'><title>4 + 4 VAE chips decode: 209 ms</title></rect>
+<text x='489.4' y='194' font-size='11' fill='#ffffff'>decode 209</text>
+<text x='566.6' y='188' font-size='11' fill='#0b0b0b'>= 1112 ms</text>
+<text x='566.6' y='202' font-size='10' fill='#52514e'>17.6 fps, p90 1371</text>
 <text x='150' y='266' font-size='11' fill='#52514e'>A decoder sized for latency (4 chips) matches the co-located median (1114 ms)</text>
 <text x='150' y='282' font-size='11' fill='#52514e'>and beats its p90 (1371 vs 1416 ms) at 13% more fps (17.6 vs 15.5).</text>
 </svg>
