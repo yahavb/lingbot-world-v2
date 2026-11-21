@@ -97,3 +97,7 @@ p12_lat_split4p4_480: LATENCY presses 99 median 1114 ms p90 1371 ms parts {'wait
 DISCARD-steps-capped-at-4 p13_split4p1_st8_480: fps 17.58 over 55 chunks, dit_ms 430.8, vae_ms 396.2
 DISCARD-steps-capped-at-4 p13_dit4_st8_480: fps 17.51 over 55 chunks, dit_ms 551.3, vae_ms 0.3
 DISCARD-steps-capped-at-4 p13_mono4_st8_480: fps 15.55 over 55 chunks, dit_ms 550.8, vae_ms 165.0
+p13_split4p1_st2_480: fps 28.22 over 55 chunks, dit_ms 176.0, vae_ms 389.6
+p13_dit4_st2_480: fps 28.14 over 55 chunks, dit_ms 291.1, vae_ms 0.4
+p13_mono4_st2_480: fps 23.46 over 55 chunks, dit_ms 290.1, vae_ms 125.2
+p13_split4p2_st2_480: fps 33.79 over 55 chunks, dit_ms 169.7, vae_ms 272.6
