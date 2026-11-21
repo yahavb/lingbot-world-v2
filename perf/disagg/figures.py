@@ -445,3 +445,33 @@ def fig_latency2():
 if __name__ == "__main__":
     open(os.path.join(OUT, "latency.svg"), "w").write(fig_latency2())
     print("latency.svg redrawn")
+
+
+def fig_carwash():
+    """The car-wash picture with measured LingBot numbers (4-chip DiT, 480): chunk out every 774 ms co-located
+    (15.5 fps) vs every 682 ms split 4 + 4 (17.6 fps); each press still takes ~1.11 s to show."""
+    W, H, L = 860, 300, 170
+    sc = (W - L - 30) / 6200
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>More chunks per minute, same time for each press (LingBot 480, 4-chip DiT)</text>"]
+    def row(y, name, period, col, perminute):
+        s.append(f"<text x='{L - 10}' y='{y + 18}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        t, k = 0, 0
+        while t + period <= 6200:
+            s.append(f"<rect x='{L + t * sc:.1f}' y='{y}' width='{period * sc - 3:.1f}' height='28' rx='4' fill='{col}'><title>chunk {k + 1} out at {t + period:.0f} ms</title></rect>")
+            s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 18}' font-size='10' fill='#ffffff'>{k + 1}</text>")
+            t += period; k += 1
+        s.append(f"<text x='{L}' y='{y + 46}' font-size='11' fill='{INK2}'>{k} chunks in 6.2 s: a chunk (12 frames) every {period} ms = {perminute} frames per minute</text>")
+    row(60, "co-located, one worker", 774, BLUE, 930)
+    row(140, "split, two workers", 682, ORANGE, 1056)
+    s.append(f"<text x='24' y='{H - 44}' font-size='12' fill='{INK}'>Each key press still takes about 1.1 s to show up in both (1114 ms median).</text>")
+    s.append(f"<text x='24' y='{H - 26}' font-size='11' fill='{INK2}'>Two workers: one washes the next car while the other dries this one. More cars per hour; each car takes as long.</text>")
+    s.append(f"<text x='24' y='{H - 10}' font-size='11' fill='{INK2}'>Split = 4 DiT chips + 4 VAE chips (17.6 fps); co-located = 4 chips (15.5 fps).</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "carwash.svg"), "w").write(fig_carwash())
+    print("carwash.svg")
