@@ -352,3 +352,31 @@ def main3():
 
 if __name__ == "__main__":
     main3()
+
+
+def fig_bounds2():
+    """Where each stage's measured time goes: useful math (the compute floor) + the time lost, with its cause."""
+    rows = [("DiT attention block", 6.38, 1.84, "lost: moving data inside the chip (DMA busy 82%)"),
+            ("VAE convolution", 5.71, 2.53, "lost: math engine half empty (busy ~90%, ~45% of peak)")]
+    W, H, L = 760, 230, 160
+    sc = (W - L - 90) / 6.5
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>Where the measured time goes (ms per call, 4-chip, 480x768)</text>"]
+    for i, (name, t, useful, why) in enumerate(rows):
+        y = 56 + i * 70
+        s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        s.append(f"<rect x='{L}' y='{y}' width='{useful * sc - 2:.1f}' height='32' rx='4' fill='{BLUE}'><title>useful math {useful} ms</title></rect>")
+        s.append(f"<text x='{L + 6}' y='{y + 21}' font-size='11' fill='#ffffff'>math {useful}</text>")
+        s.append(f"<rect x='{L + useful * sc:.1f}' y='{y}' width='{(t - useful) * sc - 2:.1f}' height='32' rx='4' fill='{ORANGE}'><title>lost {t - useful:.2f} ms</title></rect>")
+        s.append(f"<text x='{L + useful * sc + 6:.1f}' y='{y + 21}' font-size='11' fill='#ffffff'>lost {t - useful:.1f}</text>")
+        s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 21}' font-size='11' fill='{INK}'>= {t} ms</text>")
+        s.append(f"<text x='{L}' y='{y + 48}' font-size='11' fill='{INK2}'>{why}</text>")
+    s.append(f"<text x='24' y='{H - 12}' font-size='11' fill='{INK2}'>Both measured on the chip. Blue = the math at full speed; orange = the rest of the measured time.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds2())
+    print("bounds.svg redrawn")

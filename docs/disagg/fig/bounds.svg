@@ -1,39 +1,19 @@
-<svg xmlns='http://www.w3.org/2000/svg' width='760' height='380' viewBox='0 0 760 380' font-family='Helvetica, Arial, sans-serif'>
-<rect width='760' height='380' fill='#fcfcfb'/>
-<text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>What bounds each stage: floors vs measured time (ms per execution)</text>
-<text x='160' y='86' font-size='12' text-anchor='end' fill='#0b0b0b'>DiT attention block</text>
-<rect x='170' y='56' width='501.3' height='10' rx='3' fill='#52514e'><title>DiT attention block measured: 6.38 ms</title></rect>
-<rect x='170' y='68' width='144.6' height='10' rx='3' fill='#2a78d6'><title>DiT attention block compute floor: 1.84 ms</title></rect>
-<rect x='170' y='80' width='47.1' height='10' rx='3' fill='#1baf7a'><title>DiT attention block HBM floor: 0.60 ms</title></rect>
-<rect x='170' y='92' width='343.4' height='10' rx='3' fill='#eda100'><title>DiT attention block tensor busy: 4.37 ms</title></rect>
-<rect x='170' y='104' width='412.5' height='10' rx='3' fill='#eb6834'><title>DiT attention block DMA busy: 5.25 ms</title></rect>
-<text x='160' y='156' font-size='12' text-anchor='end' fill='#0b0b0b'>DiT MXFP8 graph (/4)</text>
-<rect x='170' y='126' width='470.4' height='10' rx='3' fill='#52514e'><title>DiT MXFP8 graph (/4) measured: 5.99 ms</title></rect>
-<rect x='170' y='138' width='74.8' height='10' rx='3' fill='#2a78d6'><title>DiT MXFP8 graph (/4) compute floor: 0.95 ms</title></rect>
-<rect x='170' y='150' width='76.4' height='10' rx='3' fill='#1baf7a'><title>DiT MXFP8 graph (/4) HBM floor: 0.97 ms</title></rect>
-<rect x='170' y='162' width='255.2' height='10' rx='3' fill='#eda100'><title>DiT MXFP8 graph (/4) tensor busy: 3.25 ms</title></rect>
-<rect x='170' y='174' width='410.3' height='10' rx='3' fill='#eb6834'><title>DiT MXFP8 graph (/4) DMA busy: 5.22 ms</title></rect>
-<text x='160' y='226' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE halo conv</text>
-<rect x='170' y='196' width='448.6' height='10' rx='3' fill='#52514e'><title>VAE halo conv measured: 5.71 ms</title></rect>
-<rect x='170' y='208' width='198.8' height='10' rx='3' fill='#2a78d6'><title>VAE halo conv compute floor: 2.53 ms</title></rect>
-<rect x='170' y='220' width='18.1' height='10' rx='3' fill='#1baf7a'><title>VAE halo conv HBM floor: 0.23 ms</title></rect>
-<rect x='170' y='232' width='394.4' height='10' rx='3' fill='#eda100'><title>VAE halo conv tensor busy: 5.02 ms</title></rect>
-<rect x='170' y='244' width='227.1' height='10' rx='3' fill='#eb6834'><title>VAE halo conv DMA busy: 2.89 ms</title></rect>
-<text x='160' y='296' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE halo conv</text>
-<rect x='170' y='266' width='429.8' height='10' rx='3' fill='#52514e'><title>VAE halo conv measured: 5.47 ms</title></rect>
-<rect x='170' y='278' width='194.9' height='10' rx='3' fill='#2a78d6'><title>VAE halo conv compute floor: 2.48 ms</title></rect>
-<rect x='170' y='290' width='25.9' height='10' rx='3' fill='#1baf7a'><title>VAE halo conv HBM floor: 0.33 ms</title></rect>
-<rect x='170' y='302' width='389.7' height='10' rx='3' fill='#eda100'><title>VAE halo conv tensor busy: 4.96 ms</title></rect>
-<rect x='170' y='314' width='256.9' height='10' rx='3' fill='#eb6834'><title>VAE halo conv DMA busy: 3.27 ms</title></rect>
-<rect x='170' y='340' width='12' height='10' rx='2' fill='#52514e'/>
-<text x='186' y='349' font-size='11' fill='#0b0b0b'>measured</text>
-<rect x='280' y='340' width='12' height='10' rx='2' fill='#2a78d6'/>
-<text x='296' y='349' font-size='11' fill='#0b0b0b'>compute floor</text>
-<rect x='390' y='340' width='12' height='10' rx='2' fill='#1baf7a'/>
-<text x='406' y='349' font-size='11' fill='#0b0b0b'>HBM floor</text>
-<rect x='500' y='340' width='12' height='10' rx='2' fill='#eda100'/>
-<text x='516' y='349' font-size='11' fill='#0b0b0b'>tensor busy</text>
-<rect x='610' y='340' width='12' height='10' rx='2' fill='#eb6834'/>
-<text x='626' y='349' font-size='11' fill='#0b0b0b'>DMA busy</text>
-<text x='24' y='372' font-size='11' fill='#52514e'>DiT: DMA busy far above its HBM floor (on-chip movement). VAE: tensor busy ~ measured, compute floor ~half (array under-filled).</text>
+<svg xmlns='http://www.w3.org/2000/svg' width='760' height='230' viewBox='0 0 760 230' font-family='Helvetica, Arial, sans-serif'>
+<rect width='760' height='230' fill='#fcfcfb'/>
+<text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>Where the measured time goes (ms per call, 4-chip, 480x768)</text>
+<text x='150' y='78' font-size='12' text-anchor='end' fill='#0b0b0b'>DiT attention block</text>
+<rect x='160' y='56' width='142.4' height='32' rx='4' fill='#2a78d6'><title>useful math 1.84 ms</title></rect>
+<text x='166' y='77' font-size='11' fill='#ffffff'>math 1.84</text>
+<rect x='304.4' y='56' width='354.2' height='32' rx='4' fill='#eb6834'><title>lost 4.54 ms</title></rect>
+<text x='310.4' y='77' font-size='11' fill='#ffffff'>lost 4.5</text>
+<text x='666.6' y='77' font-size='11' fill='#0b0b0b'>= 6.38 ms</text>
+<text x='160' y='104' font-size='11' fill='#52514e'>lost: moving data inside the chip (DMA busy 82%)</text>
+<text x='150' y='148' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE convolution</text>
+<rect x='160' y='126' width='196.5' height='32' rx='4' fill='#2a78d6'><title>useful math 2.53 ms</title></rect>
+<text x='166' y='147' font-size='11' fill='#ffffff'>math 2.53</text>
+<rect x='358.5' y='126' width='247.5' height='32' rx='4' fill='#eb6834'><title>lost 3.18 ms</title></rect>
+<text x='364.5' y='147' font-size='11' fill='#ffffff'>lost 3.2</text>
+<text x='614.0' y='147' font-size='11' fill='#0b0b0b'>= 5.71 ms</text>
+<text x='160' y='174' font-size='11' fill='#52514e'>lost: math engine half empty (busy ~90%, ~45% of peak)</text>
+<text x='24' y='218' font-size='11' fill='#52514e'>Both measured on the chip. Blue = the math at full speed; orange = the rest of the measured time.</text>
 </svg>
