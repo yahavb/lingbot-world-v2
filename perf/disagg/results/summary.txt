@@ -87,3 +87,7 @@ hs2_9x3_b: fps 10.00 over 55 chunks, dit_ms 747.9, vae_ms 718.5
 hs2_9x3_c: fps 10.04 over 55 chunks, dit_ms 748.7, vae_ms 485.3
 hs2_9x3_d: fps 10.07 over 55 chunks, dit_ms 747.0, vae_ms 491.6
 hs2_9x3_i: fps 10.07 over 55 chunks, dit_ms 744.7, vae_ms 484.9
+p11_combo4p1_480: fps 17.51 over 55 chunks, dit_ms 433.1, vae_ms 395.6
+p12_lat_mono4_480: LATENCY presses 100 median 1114 ms p90 1416 ms parts {'wait_ms': 498.2, 'dit_ms': 552.3, 'decode_ms': 61.7, 'delivery_ms': 0.9}
+p12_lat_split4p1_480: LATENCY presses 100 median 1221 ms p90 1471 ms parts {'wait_ms': 475.9, 'dit_ms': 433.0, 'decode_ms': 314.4, 'delivery_ms': 0.7}
+p12_lat_combo4p1_480: LATENCY presses 100 median 1230 ms p90 1475 ms parts {'wait_ms': 476.2, 'dit_ms': 434.9, 'decode_ms': 315.9, 'delivery_ms': 0.7}
