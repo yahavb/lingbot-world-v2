@@ -360,7 +360,9 @@ We observe that:
   decoder gets the chips. LingBot is distilled to 4 steps and cannot run more. The DiT-only mode (28.1 fps) syncs on
   every chunk and understates the DiT's pace at 2 steps.
 
-**7.6 Latency (Figure 10, carwash.svg).** Press-to-photon over 100 presses, median / p90:
+**7.6 Latency (Figures 10 carwash.svg, 11 latency.svg).** The statement: splitting never makes a key press show
+up sooner. With too few VAE chips it makes reactions about 0.1 s slower (4 + 1: 1221 vs 1114 ms). With enough VAE chips
+the reaction time is the same as co-located (4 + 4: 1114 ms) while frames per second rise (17.6 vs 15.5). Press-to-photon over 100 presses, median / p90:
 
 | Setup | fps | Median / p90 | Wait | DiT | Decode |
 |---|---|---|---|---|---|
@@ -427,3 +429,4 @@ NIXL, recovers the lost chip time. A cost model the operator computes at deploy 
 8. nm.svg
 9. steps.svg
 10. carwash.svg
+11. latency.svg

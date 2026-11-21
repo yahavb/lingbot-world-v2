@@ -474,3 +474,30 @@ def fig_carwash():
 if __name__ == "__main__":
     open(os.path.join(OUT, "carwash.svg"), "w").write(fig_carwash())
     print("carwash.svg")
+
+
+def fig_latency3():
+    """Reaction time (press-to-photon median): give the VAE enough chips, or reactions get ~0.1 s slower."""
+    rows = [("co-located, 4 chips", 1114, BLUE, "baseline (15.5 fps)"),
+            ("split, 4 DiT + 1 VAE chip", 1221, ORANGE, "VAE too small: 107 ms slower (17.5 fps)"),
+            ("split, 4 DiT + 4 VAE chips", 1114, ORANGE, "VAE sized right: same as co-located (17.6 fps)")]
+    W, H, L = 820, 260, 210
+    sc = 380 / 1300
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>Give the VAE enough chips, or reactions get 0.1 s slower</text>",
+         f"<text x='24' y='48' font-size='12' fill='{INK2}'>Time from a key press until the frame shows it (median of 100 presses, LingBot 480)</text>"]
+    for i, (name, v, col, note) in enumerate(rows):
+        y = 70 + i * 52
+        s.append(f"<text x='{L - 10}' y='{y + 18}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        s.append(f"<rect x='{L}' y='{y}' width='{v * sc:.1f}' height='28' rx='4' fill='{col}'><title>{name}: {v} ms</title></rect>")
+        s.append(f"<text x='{L + v * sc + 8:.1f}' y='{y + 13}' font-size='12' fill='{INK}'>{v} ms</text>")
+        s.append(f"<text x='{L + v * sc + 8:.1f}' y='{y + 27}' font-size='11' fill='{INK2}'>{note}</text>")
+    s.append(f"<text x='24' y='{H - 14}' font-size='11' fill='{INK2}'>Splitting never makes a press show up sooner; sized right, it keeps the reaction time and adds frames per second.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "latency.svg"), "w").write(fig_latency3())
+    print("latency.svg")

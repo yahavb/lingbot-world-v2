@@ -1,0 +1,18 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='820' height='260' viewBox='0 0 820 260' font-family='Helvetica, Arial, sans-serif'>
+<rect width='820' height='260' fill='#fcfcfb'/>
+<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>Give the VAE enough chips, or reactions get 0.1 s slower</text>
+<text x='24' y='48' font-size='12' fill='#52514e'>Time from a key press until the frame shows it (median of 100 presses, LingBot 480)</text>
+<text x='200' y='88' font-size='12' text-anchor='end' fill='#0b0b0b'>co-located, 4 chips</text>
+<rect x='210' y='70' width='325.6' height='28' rx='4' fill='#2a78d6'><title>co-located, 4 chips: 1114 ms</title></rect>
+<text x='543.6' y='83' font-size='12' fill='#0b0b0b'>1114 ms</text>
+<text x='543.6' y='97' font-size='11' fill='#52514e'>baseline (15.5 fps)</text>
+<text x='200' y='140' font-size='12' text-anchor='end' fill='#0b0b0b'>split, 4 DiT + 1 VAE chip</text>
+<rect x='210' y='122' width='356.9' height='28' rx='4' fill='#eb6834'><title>split, 4 DiT + 1 VAE chip: 1221 ms</title></rect>
+<text x='574.9' y='135' font-size='12' fill='#0b0b0b'>1221 ms</text>
+<text x='574.9' y='149' font-size='11' fill='#52514e'>VAE too small: 107 ms slower (17.5 fps)</text>
+<text x='200' y='192' font-size='12' text-anchor='end' fill='#0b0b0b'>split, 4 DiT + 4 VAE chips</text>
+<rect x='210' y='174' width='325.6' height='28' rx='4' fill='#eb6834'><title>split, 4 DiT + 4 VAE chips: 1114 ms</title></rect>
+<text x='543.6' y='187' font-size='12' fill='#0b0b0b'>1114 ms</text>
+<text x='543.6' y='201' font-size='11' fill='#52514e'>VAE sized right: same as co-located (17.6 fps)</text>
+<text x='24' y='246' font-size='11' fill='#52514e'>Splitting never makes a press show up sooner; sized right, it keeps the reaction time and adds frames per second.</text>
+</svg>
