@@ -91,3 +91,6 @@ p11_combo4p1_480: fps 17.51 over 55 chunks, dit_ms 433.1, vae_ms 395.6
 p12_lat_mono4_480: LATENCY presses 100 median 1114 ms p90 1416 ms parts {'wait_ms': 498.2, 'dit_ms': 552.3, 'decode_ms': 61.7, 'delivery_ms': 0.9}
 p12_lat_split4p1_480: LATENCY presses 100 median 1221 ms p90 1471 ms parts {'wait_ms': 475.9, 'dit_ms': 433.0, 'decode_ms': 314.4, 'delivery_ms': 0.7}
 p12_lat_combo4p1_480: LATENCY presses 100 median 1230 ms p90 1475 ms parts {'wait_ms': 476.2, 'dit_ms': 434.9, 'decode_ms': 315.9, 'delivery_ms': 0.7}
+p11_combo8p1_480: fps 25.74 over 55 chunks, dit_ms 304.0, vae_ms 343.6
+p11_split4p4_480: fps 17.56 over 55 chunks, dit_ms 432.5, vae_ms 239.1
+p12_lat_split4p4_480: LATENCY presses 99 median 1114 ms p90 1371 ms parts {'wait_ms': 470.3, 'dit_ms': 433.3, 'decode_ms': 208.8, 'delivery_ms': 0.7}
