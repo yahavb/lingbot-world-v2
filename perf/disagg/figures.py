@@ -416,3 +416,32 @@ def fig_chiptime():
 if __name__ == "__main__":
     open(os.path.join(OUT, "chiptime.svg"), "w").write(fig_chiptime())
     print("chiptime.svg")
+
+
+def fig_latency2():
+    """Two panels: reaction time (press-to-photon median) and frames per second, same three setups."""
+    rows = [("co-located 4 chips", 1114, 15.5, BLUE), ("split 4 + 1 chips", 1221, 17.5, ORANGE), ("split 4 + 4 chips", 1114, 17.6, ORANGE)]
+    W, H = 820, 300
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>Same reaction time, more frames per second (LingBot 480)</text>"]
+    def panel(x0, title, key, vmax, unit):
+        s.append(f"<text x='{x0}' y='62' font-size='13' font-weight='600' fill='{INK}'>{title}</text>")
+        for i, r in enumerate(rows):
+            y = 80 + i * 56
+            v = r[key]
+            w = 230 * v / vmax
+            s.append(f"<text x='{x0}' y='{y + 14}' font-size='11' fill='{INK}'>{r[0]}</text>")
+            s.append(f"<rect x='{x0}' y='{y + 20}' width='{w:.1f}' height='22' rx='4' fill='{r[3]}'><title>{r[0]}: {v} {unit}</title></rect>")
+            s.append(f"<text x='{x0 + w + 8:.1f}' y='{y + 36}' font-size='12' fill='{INK}'>{v} {unit}</text>")
+    panel(24, "Time for a key press to show up (median)", 1, 1300, "ms")
+    panel(430, "Frames per second", 2, 20, "fps")
+    s.append(f"<text x='24' y='{H - 30}' font-size='11' fill='{INK2}'>Like a car wash with two workers: a car comes out more often (more fps), but each car still</text>")
+    s.append(f"<text x='24' y='{H - 14}' font-size='11' fill='{INK2}'>takes as long to get through (same reaction time). A 1-chip VAE is slow enough to add 107 ms; 4 VAE chips do not.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "latency.svg"), "w").write(fig_latency2())
+    print("latency.svg redrawn")
