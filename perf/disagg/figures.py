@@ -807,3 +807,42 @@ def fig_bounds7():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds7())
     print("bounds.svg (per engine)")
+
+
+def fig_bounds8():
+    """Each stage's wall time split three ways (sums to 100%): the matmul engine busy (computing), the matmul engine
+    idle while other engines work (moving data, softmax, casts), and every engine idle (waiting). From engine_overlap.py
+    of each stage's hottest graph, 720p split run (DiT: Tensor 57.2%, all idle 18.8%; VAE: Tensor 94.0%, all idle 1.8%)."""
+    rows = [("DiT (16 chips)", 57.2, 24.0, 18.8), ("VAE (2 chips)", 94.0, 4.2, 1.8)]
+    W, H, L = 860, 250, 130
+    sc = (W - L - 160) / 100
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>What each stage's chips are doing, % of the time (sums to 100%)</text>",
+         f"<text x='24' y='46' font-size='12' fill='{INK2}'>LingBot 720p split run, hottest graph of each stage</text>"]
+    parts = (("computing (matmul busy)", BLUE), ("moving data / softmax, matmul idle", AQUA), ("waiting (all idle)", "#c9c7c0"))
+    for i, (name, *vals) in enumerate(rows):
+        y = 70 + i * 62
+        s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        x = L
+        for (lab, col), v in zip(parts, vals):
+            s.append(f"<rect x='{x:.1f}' y='{y}' width='{max(v * sc - 2, 2):.1f}' height='34' rx='4' fill='{col}'><title>{name} {lab}: {v:.0f}%</title></rect>")
+            if v * sc > 40:
+                s.append(f"<text x='{x + 6:.1f}' y='{y + 22}' font-size='12' fill='{'#ffffff' if col == BLUE else INK}'>{v:.0f}%</text>")
+            else:
+                s.append(f"<text x='{x + (0 if lab.startswith('moving') else 26):.1f}' y='{y + 48}' font-size='11' fill='{INK2}'>{v:.0f}%</text>")
+            x += v * sc
+    lx = L
+    for lab, col in parts:
+        s.append(f"<rect x='{lx}' y='{H - 62}' width='12' height='10' rx='2' fill='{col}'/>")
+        s.append(f"<text x='{lx + 16}' y='{H - 53}' font-size='11' fill='{INK}'>{lab}</text>")
+        lx += 16 + 7 * len(lab) + 20
+    s.append(f"<text x='24' y='{H - 26}' font-size='12' fill='{INK}'>VAE: compute-bound, computing 94% of the time.</text>")
+    s.append(f"<text x='24' y='{H - 10}' font-size='12' fill='{INK}'>DiT: computing only 57%; 24% moving data with the matmul engine idle, 19% waiting.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds8())
+    print("bounds.svg (sums to 100%)")
