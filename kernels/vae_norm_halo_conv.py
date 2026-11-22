@@ -80,16 +80,16 @@ def _norm_tiles(xts, yts, n, cs, ones, gts, sq16):
 
 
 @nki.jit
-def _norm_halo_conv(x, left, right, up, down, cache, g, wt, bias, rows=12, la=0, sq16=0, edge=0):
-    return _body(x, left, right, up, down, cache, g, wt, bias, None, rows, la, sq16, edge)
+def _norm_halo_conv(x, left, right, up, down, cache, g, wt, bias, rows=12, la=0, sq16=0, edge=0, wg=1):
+    return _body(x, left, right, up, down, cache, g, wt, bias, None, rows, la, sq16, edge, wg)
 
 
 @nki.jit
-def _norm_halo_conv_res(x, left, right, up, down, cache, g, wt, bias, res, rows=12, la=0, sq16=0, edge=0):
-    return _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edge)
+def _norm_halo_conv_res(x, left, right, up, down, cache, g, wt, bias, res, rows=12, la=0, sq16=0, edge=0, wg=1):
+    return _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edge, wg)
 
 
-def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edge):
+def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edge, wg=1):
     C, T, H, W = x.shape
     Hp, Wp = H + 2, W + 2
     CO = bias.shape[0]
@@ -166,11 +166,11 @@ def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edg
             m0, ms = m * _P, cos[m]
             ot = nl.ndarray((_P, R, Wp), dtype=x.dtype, buffer=nl.sbuf)
             otf = ot.reshape((_P, R * Wp))
-            for g0 in range(0, nq, _WG):
+            for g0 in range(0, nq, wg):
                 # LINGBOT_VAE_CONV_WG=G (opt-in, default 1 = one block at a time): G output blocks of 512 at once,
                 # each in its own PSUM bank, so one stationary weight tile serves G matmuls before the next
                 # LDWEIGHTS. Exact: every PSUM tile accumulates the same taps in the same order.
-                blk = list(range(g0, min(nq, g0 + _WG)))
+                blk = list(range(g0, min(nq, g0 + wg)))
                 pss = [nl.ndarray((_P, _B), dtype=nl.float32, buffer=nl.psum) for _ in blk]
                 i = 0
                 for tap in range(27):
@@ -233,6 +233,8 @@ def norm_halo_conv(x, left, right, up, down, cache, g, wt, bias, res=None):
     shortcut add, LINGBOT_VAE_NKI_CONV_RES). The variant settings go in as constant kernel arguments (part of the
     kernel's cache key; module globals read inside the kernel are not)."""
     kw = dict(rows=_R, la=_LA, sq16=int(_SQ16), edge=int(_EDGE))
+    if _WG > 1:
+        kw["wg"] = _WG   # a kernel argument, so the compiled kernel (and its cache key) changes with it
     if res is not None:
         return _kernel_res(x, left, right, up, down, cache, g, wt, bias, res, **kw)
     return _kernel(x, left, right, up, down, cache, g, wt, bias, **kw)

@@ -132,3 +132,5 @@ p16_mono16e_720: fps 11.38 over 55 chunks, dit_ms 758.0, vae_ms 234.6
 demo_4p1_check: fps 17.53 over 35 chunks, dit_ms 434.4, vae_ms 394.5
 p20_split_d16v2_720: fps 12.67 over 55 chunks, dit_ms 594.9, vae_ms 539.8
 p20_devprof_dit16_720: fps 12.75 over 15 chunks, dit_ms 592.0, vae_ms 534.1
+p20_split_d8v1_480: fps 25.56 over 55 chunks, dit_ms 305.7, vae_ms 345.3
+p20_devprof_dit8_480: fps 25.30 over 15 chunks, dit_ms 314.0, vae_ms 346.8
