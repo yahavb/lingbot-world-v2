@@ -454,7 +454,7 @@ def fig_carwash():
     sc = (W - L - 30) / 6200
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
-         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>More chunks per minute, same time for each press (LingBot 480, 4-chip DiT)</text>"]
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>Overlapping the stages: more chunks per minute, same time per key press (LingBot 480, 4-chip DiT)</text>"]
     def row(y, name, period, col, perminute):
         s.append(f"<text x='{L - 10}' y='{y + 18}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
         t, k = 0, 0
@@ -463,18 +463,18 @@ def fig_carwash():
             s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 18}' font-size='10' fill='#ffffff'>{k + 1}</text>")
             t += period; k += 1
         s.append(f"<text x='{L}' y='{y + 46}' font-size='11' fill='{INK2}'>{k} chunks in 6.2 s: a chunk (12 frames) every {period} ms = {perminute} frames per minute</text>")
-    row(60, "co-located, one worker", 774, BLUE, 930)
-    row(140, "split, two workers", 682, ORANGE, 1056)
+    row(60, "co-located", 774, BLUE, 930)
+    row(140, "split", 682, ORANGE, 1056)
     s.append(f"<text x='24' y='{H - 44}' font-size='12' fill='{INK}'>Each key press still takes about 1.1 s to show up in both (1114 ms median).</text>")
-    s.append(f"<text x='24' y='{H - 26}' font-size='11' fill='{INK2}'>Two workers: one washes the next car while the other dries this one. More cars per hour; each car takes as long.</text>")
+    s.append(f"<text x='24' y='{H - 26}' font-size='11' fill='{INK2}'>Co-located: each chunk is denoised, then decoded, on the same chips. Split: the VAE decodes chunk n while the DiT denoises chunk n + 1.</text>")
     s.append(f"<text x='24' y='{H - 10}' font-size='11' fill='{INK2}'>Split = 4 DiT chips + 4 VAE chips (17.6 fps); co-located = 4 chips (15.5 fps).</text>")
     s.append("</svg>")
     return "\n".join(s)
 
 
 if __name__ == "__main__":
-    open(os.path.join(OUT, "carwash.svg"), "w").write(fig_carwash())
-    print("carwash.svg")
+    open(os.path.join(OUT, "pipeline.svg"), "w").write(fig_carwash())
+    print("pipeline.svg")
 
 
 def fig_latency3():
