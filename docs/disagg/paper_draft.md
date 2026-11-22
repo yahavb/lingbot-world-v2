@@ -182,8 +182,8 @@ We observe that:
 
 **3.3 What disaggregation changes, and what it does not (Figure chiptime).**
 
-Disaggregation does not make either stage's kernels faster: in the split, the DiT block still loses 4.5 ms of its
-6.4 ms and the convolution 3.2 ms of its 5.7. What it cuts is chip time per chunk, the chips held busy or waiting for
+Disaggregation does not make either stage's kernels faster: in the split, the DiT block still has 4.5 ms of headroom in its
+6.4 ms and the convolution 3.2 ms in its 5.7. What it cuts is chip time per chunk, the chips held busy or waiting for
 each 12 frames:
 
 | Chip time per chunk | Co-located, 16 chips | Split, 8 + 1 |
