@@ -1,41 +1,40 @@
-<svg xmlns='http://www.w3.org/2000/svg' width='820' height='330' viewBox='0 0 820 330' font-family='Helvetica, Arial, sans-serif'>
-<rect width='820' height='330' fill='#fcfcfb'/>
-<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>Two stages, two usage profiles (LingBot 720p, 16-chip DiT + 2-chip VAE, measured)</text>
-<text x='20' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Matmul engine busy</text>
-<text x='20' y='80' font-size='10' fill='#52514e'>% of time</text>
-<rect x='44' y='178.8' width='52' height='91.2' rx='4' fill='#2a78d6'><title>DiT Matmul engine busy: 57%</title></rect>
-<text x='70' y='172.8' font-size='12' text-anchor='middle' fill='#0b0b0b'>57%</text>
-<text x='70' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
-<rect x='116' y='119.6' width='52' height='150.4' rx='4' fill='#eb6834'><title>VAE Matmul engine busy: 94%</title></rect>
-<text x='142' y='113.6' font-size='12' text-anchor='middle' fill='#0b0b0b'>94%</text>
-<text x='142' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
-<line x1='34' x2='192' y1='270' y2='270' stroke='#52514e'/>
-<text x='214' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Data movement busy</text>
-<text x='214' y='80' font-size='10' fill='#52514e'>% of time, overlaps compute</text>
-<rect x='238' y='142.0' width='52' height='128.0' rx='4' fill='#2a78d6'><title>DiT Data movement busy: 80%</title></rect>
-<text x='264' y='136.0' font-size='12' text-anchor='middle' fill='#0b0b0b'>80%</text>
-<text x='264' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
-<rect x='310' y='204.4' width='52' height='65.6' rx='4' fill='#eb6834'><title>VAE Data movement busy: 41%</title></rect>
-<text x='336' y='198.4' font-size='12' text-anchor='middle' fill='#0b0b0b'>41%</text>
-<text x='336' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
-<line x1='228' x2='386' y1='270' y2='270' stroke='#52514e'/>
-<text x='408' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>All engines idle</text>
-<text x='408' y='80' font-size='10' fill='#52514e'>% of time (waiting)</text>
-<rect x='432' y='239.6' width='52' height='30.4' rx='4' fill='#2a78d6'><title>DiT All engines idle: 19%</title></rect>
-<text x='458' y='233.6' font-size='12' text-anchor='middle' fill='#0b0b0b'>19%</text>
-<text x='458' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
-<rect x='504' y='266.8' width='52' height='3.2' rx='4' fill='#eb6834'><title>VAE All engines idle: 2%</title></rect>
-<text x='530' y='260.8' font-size='12' text-anchor='middle' fill='#0b0b0b'>2%</text>
-<text x='530' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
-<line x1='422' x2='580' y1='270' y2='270' stroke='#52514e'/>
-<text x='602' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Device memory per rank</text>
-<text x='602' y='80' font-size='10' fill='#52514e'>GiB (DiT: weights + KV)</text>
-<rect x='626' y='133.6' width='52' height='136.4' rx='4' fill='#2a78d6'><title>DiT Device memory per rank: 17.1</title></rect>
-<text x='652' y='127.6' font-size='12' text-anchor='middle' fill='#0b0b0b'>17.1</text>
-<text x='652' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
-<rect x='698' y='246.0' width='52' height='24.0' rx='4' fill='#eb6834'><title>VAE Device memory per rank: 3.0</title></rect>
-<text x='724' y='240.0' font-size='12' text-anchor='middle' fill='#0b0b0b'>3.0</text>
-<text x='724' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
-<line x1='616' x2='774' y1='270' y2='270' stroke='#52514e'/>
-<text x='24' y='312' font-size='11' fill='#52514e'>The DiT moves data and waits (idle 19%); the VAE keeps its matmul engine busy (94%). Different needs, so they get different chips.</text>
+<svg xmlns='http://www.w3.org/2000/svg' width='860' height='420' viewBox='0 0 860 420' font-family='Helvetica, Arial, sans-serif'>
+<rect width='860' height='420' fill='#fcfcfb'/>
+<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>What bounds each stage: % of time each engine is busy</text>
+<text x='24' y='46' font-size='12' fill='#52514e'>LingBot 720p split run, hottest graph of each stage (DiT: two transformer blocks; VAE: a fused conv)</text>
+<text x='200' y='87' font-size='12' text-anchor='end' fill='#0b0b0b'>Tensor (matmul)</text>
+<rect x='210' y='70' width='239.4' height='13' rx='3' fill='#2a78d6'><title>DiT Tensor (matmul): 57%</title></rect>
+<text x='455.4' y='81' font-size='11' fill='#0b0b0b'>DiT 57%</text>
+<rect x='210' y='85' width='394.8' height='13' rx='3' fill='#eb6834'><title>VAE Tensor (matmul): 94%</title></rect>
+<text x='610.8' y='96' font-size='11' fill='#0b0b0b'>VAE 94%</text>
+<text x='200' y='137' font-size='12' text-anchor='end' fill='#0b0b0b'>Scalar (exp, activations)</text>
+<rect x='210' y='120' width='226.8' height='13' rx='3' fill='#2a78d6'><title>DiT Scalar (exp, activations): 54%</title></rect>
+<text x='442.8' y='131' font-size='11' fill='#0b0b0b'>DiT 54%</text>
+<rect x='210' y='135' width='205.8' height='13' rx='3' fill='#eb6834'><title>VAE Scalar (exp, activations): 49%</title></rect>
+<text x='421.8' y='146' font-size='11' fill='#0b0b0b'>VAE 49%</text>
+<text x='200' y='187' font-size='12' text-anchor='end' fill='#0b0b0b'>Vector (max, sums, casts)</text>
+<rect x='210' y='170' width='147.0' height='13' rx='3' fill='#2a78d6'><title>DiT Vector (max, sums, casts): 35%</title></rect>
+<text x='363.0' y='181' font-size='11' fill='#0b0b0b'>DiT 35%</text>
+<rect x='210' y='185' width='105.0' height='13' rx='3' fill='#eb6834'><title>VAE Vector (max, sums, casts): 25%</title></rect>
+<text x='321.0' y='196' font-size='11' fill='#0b0b0b'>VAE 25%</text>
+<text x='200' y='237' font-size='12' text-anchor='end' fill='#0b0b0b'>GpSimd (DMA setup, misc)</text>
+<rect x='210' y='220' width='100.8' height='13' rx='3' fill='#2a78d6'><title>DiT GpSimd (DMA setup, misc): 24%</title></rect>
+<text x='316.8' y='231' font-size='11' fill='#0b0b0b'>DiT 24%</text>
+<rect x='210' y='235' width='79.8' height='13' rx='3' fill='#eb6834'><title>VAE GpSimd (DMA setup, misc): 19%</title></rect>
+<text x='295.8' y='246' font-size='11' fill='#0b0b0b'>VAE 19%</text>
+<text x='200' y='287' font-size='12' text-anchor='end' fill='#0b0b0b'>DMA (data movement)</text>
+<rect x='210' y='270' width='336.0' height='13' rx='3' fill='#2a78d6'><title>DiT DMA (data movement): 80%</title></rect>
+<text x='552.0' y='281' font-size='11' fill='#0b0b0b'>DiT 80%</text>
+<rect x='210' y='285' width='172.2' height='13' rx='3' fill='#eb6834'><title>VAE DMA (data movement): 41%</title></rect>
+<text x='388.2' y='296' font-size='11' fill='#0b0b0b'>VAE 41%</text>
+<line x1='24' x2='836' y1='312' y2='312' stroke='#e4e3df'/>
+<text x='200' y='337' font-size='12' text-anchor='end' fill='#0b0b0b'>all engines idle</text>
+<rect x='210' y='320' width='79.8' height='13' rx='3' fill='#2a78d6'><title>DiT all engines idle: 19%</title></rect>
+<text x='295.8' y='331' font-size='11' fill='#0b0b0b'>DiT 19%</text>
+<rect x='210' y='335' width='8.4' height='13' rx='3' fill='#eb6834'><title>VAE all engines idle: 2%</title></rect>
+<text x='224.4' y='346' font-size='11' fill='#0b0b0b'>VAE 2%</text>
+<line x1='630.0' x2='630.0' y1='62' y2='356' stroke='#52514e' stroke-dasharray='3 3'/>
+<text x='626.0' y='60' font-size='10' text-anchor='end' fill='#52514e'>100%</text>
+<text x='24' y='390' font-size='12' fill='#0b0b0b'>VAE: compute-bound. The matmul engine is busy 94% of the time; nothing waits.</text>
+<text x='24' y='408' font-size='12' fill='#0b0b0b'>DiT: no engine is saturated. DMA is the closest (80%), the matmul engine 57%, and everything waits 19%: data movement, not math.</text>
 </svg>

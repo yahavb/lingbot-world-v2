@@ -774,3 +774,36 @@ def fig_bounds6():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds6())
     print("bounds.svg (usage profiles, 720p split run)")
+
+
+def fig_bounds7():
+    """Per-engine busy time of each stage's hottest graph, from one split run (LingBot 720p, 16-chip DiT + 2-chip VAE,
+    2026-11-22 device profiles, engine_overlap.py): which engine bounds each stage."""
+    rows = [("Tensor (matmul)", 57, 94), ("Scalar (exp, activations)", 54, 49), ("Vector (max, sums, casts)", 35, 25),
+            ("GpSimd (DMA setup, misc)", 24, 19), ("DMA (data movement)", 80, 41), ("all engines idle", 19, 2)]
+    W, H, L = 860, 420, 210
+    sc = 4.2
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>What bounds each stage: % of time each engine is busy</text>",
+         f"<text x='24' y='46' font-size='12' fill='{INK2}'>LingBot 720p split run, hottest graph of each stage (DiT: two transformer blocks; VAE: a fused conv)</text>"]
+    for i, (name, d, v) in enumerate(rows):
+        y = 70 + i * 50
+        if name == "all engines idle":
+            s.append(f"<line x1='24' x2='{W - 24}' y1='{y - 8}' y2='{y - 8}' stroke='{GRID}'/>")
+        s.append(f"<text x='{L - 10}' y='{y + 17}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        for j, (val, col, who) in enumerate(((d, BLUE, "DiT"), (v, ORANGE, "VAE"))):
+            yy = y + j * 15
+            s.append(f"<rect x='{L}' y='{yy}' width='{max(val * sc, 2):.1f}' height='13' rx='3' fill='{col}'><title>{who} {name}: {val}%</title></rect>")
+            s.append(f"<text x='{L + val * sc + 6:.1f}' y='{yy + 11}' font-size='11' fill='{INK}'>{who} {val}%</text>")
+    s.append(f"<line x1='{L + 100 * sc}' x2='{L + 100 * sc}' y1='62' y2='{70 + 6 * 50 - 14}' stroke='{INK2}' stroke-dasharray='3 3'/>")
+    s.append(f"<text x='{L + 100 * sc - 4}' y='60' font-size='10' text-anchor='end' fill='{INK2}'>100%</text>")
+    s.append(f"<text x='24' y='{H - 30}' font-size='12' fill='{INK}'>VAE: compute-bound. The matmul engine is busy 94% of the time; nothing waits.</text>")
+    s.append(f"<text x='24' y='{H - 12}' font-size='12' fill='{INK}'>DiT: no engine is saturated. DMA is the closest (80%), the matmul engine 57%, and everything waits 19%: data movement, not math.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds7())
+    print("bounds.svg (per engine)")
