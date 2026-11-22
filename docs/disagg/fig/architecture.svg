@@ -29,6 +29,9 @@
 <text x='394' y='428' font-size='11' text-anchor='start' fill='#2a78d6'>= more concurrent sessions</text>
 <line x1='340' y1='260' x2='380' y2='260' stroke='#52514e' stroke-width='1.8' stroke-dasharray='' marker-end='url(#a)'/>
 <text x='360' y='248' font-size='11' text-anchor='middle' fill='#52514e'>2</text>
+<text x='358' y='284' font-size='9' text-anchor='middle' fill='#2a78d6'>bound</text>
+<text x='358' y='295' font-size='9' text-anchor='middle' fill='#2a78d6'>(KV</text>
+<text x='358' y='306' font-size='9' text-anchor='middle' fill='#2a78d6'>cache)</text>
 <rect x='690' y='60' width='280' height='420' rx='12' fill='none' stroke='#eb6834' stroke-width='2' stroke-dasharray='6 4'/>
 <text x='704' y='82' font-size='13' font-weight='600' fill='#0b0b0b'>VAE pool</text>
 <text x='704' y='98' font-size='10' text-anchor='start' fill='#52514e'>any Ready pod with an open slot</text>
@@ -61,11 +64,14 @@
 <circle cx='660' cy='260' r='20' fill='#fcfcfb' stroke='#eb6834' stroke-width='2'/>
 <path d='M 650 252 A 10 10 0 1 1 650 268' fill='none' stroke='#eb6834' stroke-width='2' marker-end='url(#a)'/>
 <text x='660' y='232' font-size='11' text-anchor='middle' fill='#52514e'>3</text>
-<text x='660' y='300' font-size='10' text-anchor='middle' fill='#eb6834'>least-loaded</text>
-<text x='660' y='312' font-size='10' text-anchor='middle' fill='#eb6834'>free slot</text>
+<text x='660' y='300' font-size='9' text-anchor='middle' fill='#eb6834'>any VAE</text>
+<text x='660' y='311' font-size='9' text-anchor='middle' fill='#eb6834'>least-</text>
+<text x='660' y='322' font-size='9' text-anchor='middle' fill='#eb6834'>loaded</text>
+<text x='660' y='333' font-size='9' text-anchor='middle' fill='#eb6834'>failover</text>
+<text x='660' y='344' font-size='9' text-anchor='middle' fill='#eb6834'>~3 s</text>
 <path d='M 830 480 L 830 500 L 265 500 L 265 300' fill='none' stroke='#52514e' stroke-width='1.6' stroke-dasharray='5 4' marker-end='url(#a)'/>
 <text x='560' y='516' font-size='11' text-anchor='middle' fill='#52514e'>4 frames back through the session manager to the client</text>
-<text x='24' y='556' font-size='11' fill='#52514e'>1 the client opens a session. 2 any Ready DiT pod takes it; the session stays on that pod.</text>
-<text x='24' y='572' font-size='11' fill='#52514e'>3 the DiT streams its latents to the least-loaded VAE pod with a free slot (NIXL over EFA, 1.1 MB per chunk). 4 frames back.</text>
+<text x='24' y='556' font-size='11' fill='#52514e'>1 the client opens a session. 2 any Ready DiT pod takes it; the session is bound to that pod (it holds the KV cache).</text>
+<text x='24' y='572' font-size='11' fill='#52514e'>3 the DiT streams its latents to any VAE pod with a free slot (least loaded); if that VAE fails, another takes over in ~3 s. 4 frames back.</text>
 <text x='24' y='588' font-size='11' fill='#52514e'>Each role scales on its own: DiT pods for more sessions, VAE pods for more open slots. Kubernetes DRA gives each pod its Neuron devices + EFAs.</text>
 </svg>

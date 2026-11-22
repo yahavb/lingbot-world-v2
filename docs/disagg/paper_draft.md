@@ -228,9 +228,12 @@ role's pool resizes on its own. A co-located replica cannot change its ratio.
 **5.1 Overview (Figure 5).** How a session is served:
 
 1. The browser opens a session with lbw-web, the session manager.
-2. lbw-web sends it through the DiT Service, so any Ready DiT pod takes it. The session stays bound to that DiT pod,
-   which serves one session at a time.
-3. That DiT streams each chunk's latent to any Ready VAE pod with a free slot.
+2. lbw-web sends it through the DiT Service, so any Ready DiT pod takes it. The session is bound to that DiT pod
+   (it holds the session's KV cache, which cannot be rebuilt mid-stream); a DiT pod serves one session at a time.
+3. That DiT streams each chunk's latent to any Ready VAE pod with a free slot. The link is effectively sessionless:
+   normally a session stays on its VAE, whose decoder cache keeps consecutive chunks smooth, but any VAE can take over
+   at any chunk. When a VAE dies the session moves within about 3 s with no lost chunks; the new VAE starts a fresh
+   decoder cache, at worst a small visual blip.
 4. The frames go back through lbw-web to the browser.
 
 Each VAE pod has K open slots, so it serves up to K sessions; their chunks are decoded one after another, each with its
