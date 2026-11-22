@@ -159,45 +159,42 @@ def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edg
                 nisa.dma_copy(dst=nc[c0:c0 + cs[k], f - T, h0:h0 + rr, 0:Wp], src=nfs[k][0:cs[k], 0:rr, 0:Wp])
         nts[f] = [v.reshape((_P, FL)) for v in nfs]
 
-    def conv(j, t, nts):
-        """Output frame t of band j from frames t, t + 1, t + 2."""
+    def conv(j, ts, nts):
+        """Output frames ts of band j (frame t from frames t, t + 1, t + 2). LINGBOT_VAE_CONV_WG=G (opt-in, default 1):
+        up to G output frames of one band in one call, each in its own PSUM tile, so one stationary weight tile
+        (LDWEIGHTS) serves G matmuls. Exact: every PSUM tile accumulates the same taps in the same order."""
         h0 = j * R
         for m in range(ncot):
             m0, ms = m * _P, cos[m]
-            ot = nl.ndarray((_P, R, Wp), dtype=x.dtype, buffer=nl.sbuf)
-            otf = ot.reshape((_P, R * Wp))
-            for g0 in range(0, nq, wg):
-                # LINGBOT_VAE_CONV_WG=G (opt-in, default 1 = one block at a time): G output blocks of 512 at once,
-                # each in its own PSUM bank, so one stationary weight tile serves G matmuls before the next
-                # LDWEIGHTS. Exact: every PSUM tile accumulates the same taps in the same order.
-                blk = list(range(g0, min(nq, g0 + wg)))
-                pss = [nl.ndarray((_P, _B), dtype=nl.float32, buffer=nl.psum) for _ in blk]
+            ots = [nl.ndarray((_P, R, Wp), dtype=x.dtype, buffer=nl.sbuf) for _ in ts]
+            for b in range(nq):
+                q0 = b * _B
+                n = min(_B, NQ - q0)
+                pss = [nl.ndarray((_P, _B), dtype=nl.float32, buffer=nl.psum) for _ in ts]
                 i = 0
                 for tap in range(27):
                     kt, kh, kw = tap // 9, (tap // 3) % 3, tap % 3
+                    s = q0 + kh * Wp + kw
                     for k in range(nct):
-                        for bi, b in enumerate(blk):
-                            q0 = b * _B
-                            n = min(_B, NQ - q0)
-                            s = q0 + kh * Wp + kw
-                            nisa.nc_matmul(dst=pss[bi][0:ms, 0:n],
+                        for ti, t in enumerate(ts):
+                            nisa.nc_matmul(dst=pss[ti][0:ms, 0:n],
                                            stationary=wss[k][0:cs[k], tap * CO + m0:tap * CO + m0 + ms],
                                            moving=nts[t + kt][k][0:cs[k], s:s + n], accumulate=(i > 0))
                         i += 1
-                for bi, b in enumerate(blk):
-                    q0 = b * _B
-                    n = min(_B, NQ - q0)
-                    nisa.activation(dst=otf[0:ms, q0:q0 + n], op=nl.copy, data=pss[bi][0:ms, 0:n],
-                                    bias=bss[m][0:ms, 0:1], scale=1.0)
-            if res is not None:                            # + the residual, rounded like torch's bf16 y + h
-                rt = nl.ndarray((_P, R, W), dtype=x.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(dst=rt[0:ms, 0:R, 0:W], src=res[m0:m0 + ms, t, h0:h0 + R, 0:W])
-                o2 = nl.ndarray((_P, R, W), dtype=x.dtype, buffer=nl.sbuf)
-                nisa.tensor_tensor(dst=o2[0:ms, 0:R, 0:W], data1=ot[0:ms, 0:R, 0:W], data2=rt[0:ms, 0:R, 0:W],
-                                   op=nl.add)
-                nisa.dma_copy(dst=y[m0:m0 + ms, t, h0:h0 + R, 0:W], src=o2[0:ms, 0:R, 0:W])
-            else:
-                nisa.dma_copy(dst=y[m0:m0 + ms, t, h0:h0 + R, 0:W], src=ot[0:ms, 0:R, 0:W])
+                for ti in range(len(ts)):
+                    nisa.activation(dst=ots[ti].reshape((_P, R * Wp))[0:ms, q0:q0 + n], op=nl.copy,
+                                    data=pss[ti][0:ms, 0:n], bias=bss[m][0:ms, 0:1], scale=1.0)
+            for ti, t in enumerate(ts):
+                ot = ots[ti]
+                if res is not None:                        # + the residual, rounded like torch's bf16 y + h
+                    rt = nl.ndarray((_P, R, W), dtype=x.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=rt[0:ms, 0:R, 0:W], src=res[m0:m0 + ms, t, h0:h0 + R, 0:W])
+                    o2 = nl.ndarray((_P, R, W), dtype=x.dtype, buffer=nl.sbuf)
+                    nisa.tensor_tensor(dst=o2[0:ms, 0:R, 0:W], data1=ot[0:ms, 0:R, 0:W], data2=rt[0:ms, 0:R, 0:W],
+                                       op=nl.add)
+                    nisa.dma_copy(dst=y[m0:m0 + ms, t, h0:h0 + R, 0:W], src=o2[0:ms, 0:R, 0:W])
+                else:
+                    nisa.dma_copy(dst=y[m0:m0 + ms, t, h0:h0 + R, 0:W], src=ot[0:ms, 0:R, 0:W])
 
     # Program order: natural (band, frame) order, but each output frame's matmuls are issued la frames later, so
     # with la >= 1 the Tensor queue holds the next frame's norm ones-matmuls before this conv and the norm's
@@ -217,10 +214,19 @@ def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edg
             frame(j, f, nts)
             seen += 1
         while pending and seen - pending[0][3] >= la:
-            pj, pt, pn, _ = pending.pop(0)
-            conv(pj, pt, pn)
-    for pj, pt, pn, _ in pending:
-        conv(pj, pt, pn)
+            # wg > 1: wait until wg frames of this band are ready (or the band's last frame), then one call
+            pj, pn = pending[0][0], pending[0][2]
+            same = [q for q in pending if q[0] == pj]
+            if wg > 1 and len(same) < wg and same[-1][1] < T - 1:
+                break
+            grp = same[:wg]
+            del pending[:len(grp)]
+            conv(pj, [q[1] for q in grp], pn)
+    while pending:
+        pj, pn = pending[0][0], pending[0][2]
+        grp = [q for q in pending if q[0] == pj][:wg]
+        del pending[:len(grp)]
+        conv(pj, [q[1] for q in grp], pn)
     return y, nc
 
 
