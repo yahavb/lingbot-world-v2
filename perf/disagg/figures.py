@@ -45,8 +45,8 @@ def fps_chart(series=None, title='LingBot-World v2: frame rate vs chips, one str
             s.append(f"<circle cx='{X(c):.1f}' cy='{Y(f):.1f}' r='4.5' fill='{col if not dash else SURF}' stroke='{col}' "
                      f"stroke-width='2'><title>{name}: {c} chips, {f} fps</title></circle>")
     # direct labels at the line ends (text in ink, the mark carries the color)
-    s.append(f"<text x='{X(17) + 10}' y='{Y(32.14) + 4}' font-size='12' fill='{INK}'>split 32.1</text>")
-    s.append(f"<text x='{X(16) + 10}' y='{Y(26.70) + 4}' font-size='12' fill='{INK}'>co-located 26.7</text>")
+    s.append(f"<text x='{X(17) + 10}' y='{Y(32.14) + 4}' font-size='12' fill='{INK}'>split 480p 32.1</text>")
+    s.append(f"<text x='{X(16) + 10}' y='{Y(26.70) + 4}' font-size='12' fill='{INK}'>co-located 480p 26.7</text>")
     if note720:
         s.append(f"<text x='{X(17) + 10}' y='{Y(12.68) + 4}' font-size='12' fill='{INK}'>split 720p 12.7</text>")
         s.append(f"<text x='{X(16) + 10}' y='{Y(11.38) + 14}' font-size='12' fill='{INK}'>co-located 720p 11.4</text>")

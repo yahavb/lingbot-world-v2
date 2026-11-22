@@ -38,8 +38,8 @@
 <circle cx='215.7' cy='225.6' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 5 chips, 17.54 fps</title></circle>
 <circle cx='337.0' cy='142.0' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 9 chips, 25.76 fps</title></circle>
 <circle cx='579.7' cy='77.1' r='4.5' fill='#eb6834' stroke='#eb6834' stroke-width='2'><title>Split: DiT + 1-chip VAE, 480x768: 17 chips, 32.14 fps</title></circle>
-<text x='589.6666666666666' y='81.0902857142857' font-size='12' fill='#0b0b0b'>split 32.1</text>
-<text x='559.3333333333333' y='136.4228571428572' font-size='12' fill='#0b0b0b'>co-located 26.7</text>
+<text x='589.6666666666666' y='81.0902857142857' font-size='12' fill='#0b0b0b'>split 480p 32.1</text>
+<text x='559.3333333333333' y='136.4228571428572' font-size='12' fill='#0b0b0b'>co-located 480p 26.7</text>
 <line x1='78' x2='100' y1='62' y2='62' stroke='#2a78d6' stroke-width='2' stroke-dasharray=''/>
 <circle cx='89' cy='62' r='4' fill='#2a78d6' stroke='#2a78d6' stroke-width='2'/>
 <text x='108' y='66' font-size='11' fill='#0b0b0b'>Co-located, 480x768</text>
