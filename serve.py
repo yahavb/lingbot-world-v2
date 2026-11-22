@@ -65,6 +65,19 @@ SESSION_IDLE_S = int(os.environ.get("SESSION_IDLE_S", "300"))
 SAVE_LATENTS = os.environ.get("LINGBOT_SERVE_SAVE_LATENTS")
 NULL_DECODE = os.environ.get("LINGBOT_NULL_DECODE", "0") == "1"
 PHASE_SYNC = os.environ.get("LINGBOT_PHASE_SYNC", "0") == "1"
+NIXL_ASYNC = os.environ.get("LINGBOT_NIXL_ASYNC", "0") == "1"
+import queue as _queue
+_NIXL_Q = _queue.Queue()
+
+
+def _nixl_worker(rdma):
+    """LINGBOT_NIXL_ASYNC: send queued chunks in order."""
+    while True:
+        remote, chunk_id, xf, emit = _NIXL_Q.get()
+        try:
+            rdma.send(remote, chunk_id == 0, xf, emit)
+        except Exception as e:      # VaeUnavailable included: the chunk's frames are dropped, the stream goes on
+            logging.warning(f"chunk {chunk_id}: no VAE, frames dropped ({type(e).__name__}: {e})")
 NULL_FRAMES = lambda c: 4 * int(os.environ.get("CHUNK_SIZE", "3")) - (3 if c == 0 else 0)   # 9, then 12 per chunk
 
 
@@ -562,6 +575,9 @@ def main():
         from wan.vae_pool import VaePool, VaeUnavailable
         rdma = VaePool()
         VAE_POOL["pool"] = rdma
+        if NIXL_ASYNC:
+            import threading
+            threading.Thread(target=_nixl_worker, args=(rdma,), daemon=True, name="nixl-send").start()
 
     # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
     # the same path vae_serve.py serve_fused streams with (2-D tiles with LINGBOT_VAE_2D=1). The plain
@@ -662,10 +678,17 @@ def main():
             elif VAE_URL is None:
                 decode_local(chunk_id, x0, emit)
             elif remote is not None and rdma is not None:
-                try:
-                    rdma.send(remote, chunk_id == 0, x0_dev.float().contiguous(), emit)
-                except VaeUnavailable as e:
-                    logging.warning(f"chunk {chunk_id}: no VAE, frames dropped ({e})")
+                xf = x0_dev.float().contiguous()
+                if NIXL_ASYNC:
+                    # LINGBOT_NIXL_ASYNC=1: the hand-off (copy into the send buffer, device sync, one-sided write) on
+                    # one worker thread, in chunk order, so rank 0 keeps issuing the commit pass and the next chunk
+                    # instead of waiting ~165 ms in the sync. Same bytes to the VAE; frames arrive one pass later.
+                    _NIXL_Q.put((remote, chunk_id, xf, emit))
+                else:
+                    try:
+                        rdma.send(remote, chunk_id == 0, xf, emit)
+                    except VaeUnavailable as e:
+                        logging.warning(f"chunk {chunk_id}: no VAE, frames dropped ({e})")
             elif remote is not None:
                 remote.submit(chunk_id == 0, x0, emit)
 
