@@ -154,19 +154,14 @@ chip count (section 3).
 **3.1 Binding resources (Figure 3).** From a system trace of a warm run, we take a device profile of every graph
 that carries the latency, and compute one floor per resource.
 
-**Two usage profiles (Figure 3, bounds.svg).** Typical usage of each stage, all measured:
-
-| | DiT | VAE |
-|---|---|---|
-| Matmul engine busy | 68% of the time | 88% |
-| Data movement busy (overlaps compute) | 82% | 51% |
-| Talks to other chips each call | yes: TP and CP, about 25% of its data movement | barely: tile edges only |
-| Device memory per rank | about 8.4 GiB of weights plus an 8.65 GB KV cache (720p) | about 3 GiB, with 4 sessions |
-| Speed-up from 8x the chips | 3.2x (2 to 16 chips) | 2.1x (1 to 8 chips) |
-
-The DiT is big, spreads over several chips and talks between them; the VAE is small and compute-dense, and fits one
-chip with room to share. Engine shares are from the main program of each stage (4 chips, 480x768); memory from the
-pods' allocation logs.
+**Two usage profiles (Figure 3, bounds.svg).** Figure 3 shows, for the hottest program of each stage in one split run
+(LingBot 720p, a 16-chip DiT and a 2-chip VAE), the share of time each engine of a NeuronCore is busy. The engines run
+in parallel, so the shares overlap. The VAE is compute-bound: its matmul engine is busy 94% of the time, its other
+engines stay at or below 49%, and the core is almost never idle (2%). The DiT is not bound by any one engine: data
+movement is the busiest (80%), the matmul engine is busy 57% of the time, the Scalar engine (softmax exponentials) 54%,
+and every engine sits idle 19% of the time, waiting on data or on other chips. One stage needs dense compute; the other
+needs data movement and communication across chips. Co-locating them gives both the same chips; disaggregating lets
+each pool get chips sized to its own bound, and lets each be tuned without changing the other.
 
 **Coverage.** Share of chip-busy time in the profiled run (4 chips, 480x768, about 31.7 s of chip time), source
 perf/disagg/results/prof/p14_devprof_dma_480.devprof.txt:
