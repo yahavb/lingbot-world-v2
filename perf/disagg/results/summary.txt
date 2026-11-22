@@ -129,3 +129,4 @@ p16_lat_split8p1_480: LATENCY presses 100 median 881 ms p90 1056 ms parts {'wait
 p16_mono16e_fps: fps 26.69 over 55 chunks, dit_ms 299.1, vae_ms 127.6
 p16_mono16e_fps_r2: fps 26.72 over 55 chunks, dit_ms 299.2, vae_ms 126.4
 p16_mono16e_720: fps 11.38 over 55 chunks, dit_ms 758.0, vae_ms 234.6
+demo_4p1_check: fps 17.53 over 35 chunks, dit_ms 434.4, vae_ms 394.5
