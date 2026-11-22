@@ -16,7 +16,9 @@ from wan.modules import attention as A  # noqa: E402
 REPS = int(os.environ.get("REPS", "50"))
 QPAD = int(os.environ.get("QPAD", "128"))
 TM = os.environ.get("TM", "0") == "1"   # chained path reads V token-major (v_token_major)
-n, d, L, LQ = 10, 128, 4320, 288
+n, d = 10, 128
+L, LQ = int(os.environ.get("L", "4320")), int(os.environ.get("LQ", "288"))   # 720p CP16: L=10560 LQ=660
+PAIR = os.environ.get("PAIR", "1") == "1"   # PAIR=0: one cached chunk per chained call (LINGBOT_ATTN_PAIR=0)
 dev = torch.device("neuron")
 g = torch.Generator().manual_seed(11)
 def rnd(*s, scale=1.0):
@@ -35,6 +37,11 @@ def merged(q, ks, vs):
 def chained(q, ks, vs):
     """LINGBOT_CTE_CHAIN: the same calls, chained; the last one normalizes ([n, d, Lq_p])."""
     state = None
+    if not PAIR:
+        for k_, v_ in zip(ks[:-1], vs[:-1]):
+            state = A.cte_call(q, k_, v_, chain=state, v_token_major=TM)
+        o = A.cte_call(q, ks[-1], vs[-1], chain=state, normalize=True, v_token_major=TM)
+        return o[:, :, :LQ].permute(2, 0, 1).unsqueeze(0)
     if len(ks) == 3:
         state = A.cte_call(q, ks[0], vs[0], v_token_major=TM)
     elif len(ks) == 4:
