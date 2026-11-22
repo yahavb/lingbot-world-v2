@@ -311,14 +311,14 @@ def fig_timeline():
     for k in range(3):
         bar(t, y, 322, BLUE, f"DiT {k}"); t += 322
         bar(t, y, 127, ORANGE, f"VAE {k}"); t += 127
-    s.append(f"<text x='{L + t * sc + 6:.1f}' y='{y + 17}' font-size='11' fill='{INK2}'>449 ms / chunk = 26.7 fps</text>")
-    y2 = 130
+    s.append(f"<text x='{L}' y='{y + 46}' font-size='12' fill='{INK}'>co-located: a chunk every 449 ms = 26.7 fps</text>")
+    y2 = 140
     s.append(f"<text x='{L - 10}' y='{y2 + 17}' font-size='12' text-anchor='end' fill='{INK}'>DiT pod, 16 chips</text>")
     s.append(f"<text x='{L - 10}' y='{y2 + 51}' font-size='12' text-anchor='end' fill='{INK}'>VAE pod, 1 chip</text>")
     for k in range(3):
         bar(375 * k, y2, 375, BLUE, f"DiT {k}")
         bar(375 * (k + 1), y2 + 34, 324, ORANGE, f"VAE {k}")
-    s.append(f"<text x='{L}' y='{y2 + 90}' font-size='11' fill='{INK2}'>375 ms / chunk = 32 fps: the VAE of chunk n overlaps the DiT of chunk n + 1</text>")
+    s.append(f"<text x='{L}' y='{y2 + 80}' font-size='12' fill='{INK}'>disaggregated: a chunk every 375 ms = 32 fps (the VAE decodes chunk n while the DiT denoises chunk n + 1)</text>")
     s.append(f"<text x='24' y='{H - 14}' font-size='11' fill='{INK2}'>Co-located: P = T_d(N) + T_v(N). Disaggregated: P = max(T_d(n_d), T_v(n_v)); the 1.1 MB latent moves over NIXL/EFA in 0.17 ms.</text>")
     s.append("</svg>")
     return "\n".join(s)
