@@ -14,6 +14,7 @@ import os
 import random
 import threading
 import time
+_NIXL_TIMING = __import__('os').environ.get('LINGBOT_NIXL_TIMING', '0') == '1'
 
 import requests
 
@@ -29,6 +30,7 @@ class VaeUnavailable(RuntimeError):
 
 class VaePool:
     def __init__(self):
+        self._wt = []   # LINGBOT_NIXL_TIMING samples
         from wan import rdma_link as R
         self.R = R
         self.selector = os.environ.get("VAE_SELECTOR", "app=lbw-vae")
@@ -221,7 +223,17 @@ class VaePool:
                 remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq, sid=self.current[2][2])
                 for retry in range(3):
                     try:
+                        _t0 = time.perf_counter()
                         self.nixl.write(self.current[2], x_dev, seq)
+                        if _NIXL_TIMING:
+                            # LINGBOT_NIXL_TIMING=1: the hand-off's own time (device copy into the send buffer, sync,
+                            # one-sided write, completion), median of every 20 chunks
+                            self._wt.append((time.perf_counter() - _t0) * 1000)
+                            if len(self._wt) == 20:
+                                w = sorted(self._wt)
+                                log.info(f"[NIXL] write ms over 20 chunks: median {w[10]:.3f} min {w[0]:.3f} "
+                                         f"max {w[-1]:.3f} bytes {x_dev.numel() * x_dev.element_size()}")
+                                self._wt = []
                         break
                     except Exception as e:
                         # a cancelled completion left by the dead VAE can fail this write; the new VAE is still
