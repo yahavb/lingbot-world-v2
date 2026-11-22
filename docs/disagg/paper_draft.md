@@ -56,12 +56,41 @@ co-located in each replica. These pipelines have two stages, and neither is negl
 - in a 14B world model on 16 Trainium3 chips, the decoder takes 143 ms per chunk next to the DiT's 300 ms;
 - in Stable Audio 3, decode is 40-53% of the DiT's time.
 
-**Motivation (Figure 1, Figure 2).**
+**Motivation: two stages, two usage profiles (Figure 3, bounds.svg).** The DiT and the VAE use the accelerator very
+differently (all measured, LingBot, 4 chips, 480x768 unless noted):
 
-- **Co-located serving scales slowly.** 15.5, 22.6 and 26.7 fps at 4, 8 and 16 chips.
-- **The cause is serialization.** Each chunk pays DiT plus decoder (Figure 1).
-- **The decoder doesn't get faster with chips.** About 140 ms at every chip count (Figure 2).
-- **Splitting the stages keeps scaling:** 25.8 fps on 9 chips, 32.2 fps on 17.
+| Typical usage | DiT | VAE |
+|---|---|---|
+| Matmul engine busy | 68% of the time | 88% |
+| Data movement busy (overlaps compute) | 82% | 51% |
+| Talks to other chips each call | yes: TP and CP | barely: tile edges only |
+| Device memory per rank | about 8.4 GiB of weights plus an 8.65 GB KV cache (720p) | about 3 GiB, with 4 sessions |
+| Speed-up from 8x the chips | 3.2x | 2.1x |
+
+The DiT is big, spreads over several chips and talks between them. The VAE is small and compute-dense, and fits one
+chip with room to share.
+
+**Why co-location is suboptimal.** A co-located replica runs both stages on the same chips, one after the other:
+
+- every chip runs the DiT, then every chip runs the VAE;
+- so the VAE is charged at the DiT's chip count, where it gains little: at 16 chips it holds 2,032 chip-ms per chunk,
+  against 324 on its own chip (Figure chiptime);
+- and each stage waits for the other.
+
+**The claim.** Splitting the stages into independently sized and scaled roles gives **about 27% higher frame rate on
+average** (measured over four configurations), and serves a real-time stream on **44% fewer chips**. The per-setup
+breakdown is in section 7:
+
+| Setup | fps gain |
+|---|---|
+| LingBot 720p, 16 chips | 11% |
+| LingBot 480, 16 chips | 20% |
+| Stable Audio, 190 s windows | 32-36% |
+| LingBot, 2-step DiT | 44% |
+| Stable Audio, 280 s windows | **[to validate: not yet measured]** |
+
+Once the 280 s run is measured, the average is expected to be about 30% [to validate]. The gain is larger when the VAE
+is a bigger share of the work, as the cost model predicts (section 4).
 
 **Why not prefill/decode disaggregation.** That design separates a compute-bound phase from a bandwidth-bound one
 that interfere. Our profiles show neither: the two stages have different bounds, and they interact through time and
