@@ -257,6 +257,14 @@ _BF16_ITEMSIZE = 2
 _SBUF_COMPILER_RESERVE = 8 * 1024
 _FLASH_ATTENTION_THRESHOLD = 10 * 1024  # Use flash attention above this K/V length
 _FLASH_ATTENTION_SECTION_LENGTH = 8 * 1024  # Section size when using flash attention
+# lingbot LINGBOT_CTE_SECTION=<keys> (opt-in): one section up to this many keys (raises both the flash threshold and
+# the section length). 720p has 10560 keys a chunk, just above the 10240 threshold, so it ran as two flash sections,
+# and the one-section paths (CTE_CHAIN, K_BLOCKED, q-major) were off. Not bit-exact: one softmax pass instead of
+# two sections joined by a running-max rescale (rounding differs; gated against the CPU reference).
+_SECTION_OVERRIDE = int(__import__("os").environ.get("LINGBOT_CTE_SECTION", "0") or 0)
+if _SECTION_OVERRIDE:
+    _FLASH_ATTENTION_THRESHOLD = max(_FLASH_ATTENTION_THRESHOLD, _SECTION_OVERRIDE)
+    _FLASH_ATTENTION_SECTION_LENGTH = max(_FLASH_ATTENTION_SECTION_LENGTH, _SECTION_OVERRIDE)
 _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
     128  # for SWA, threshold above which allocate more q tiles and use range_select masking
 )
