@@ -126,14 +126,16 @@ chip count (section 3).
 **3.1 Binding resources (Figure 3).** From a system trace of a warm run, we take a device profile of every graph
 that carries the latency, and compute one floor per resource.
 
-**Computing vs waiting (Figure 3, bounds.svg).** For each stage's main program:
+**Compute vs I/O (Figure 3, bounds.svg).** For each stage's main program:
 
-| Stage | Computing | Waiting for data | Total |
+| Stage | Compute | I/O | Total |
 |---|---|---|---|
 | DiT | 4.4 ms | 2.0 ms | 6.4 ms |
 | VAE | 5.0 ms | 0.7 ms | 5.7 ms |
 
-The DiT's math engine waits for data about a third of the time; the VAE's almost never waits. They are slow for
+I/O is the time the math engine stalls for data: moves between the chip's memories, and exchanges with the other
+chips (the DiT's communication across its chips, the VAE's tile edges). The DiT spends a third of its time in I/O; the
+VAE almost none. They are slow for
 different reasons, so they need different numbers of chips.
 
 **Coverage.** Share of chip-busy time in the profiled run (4 chips, 480x768, about 31.7 s of chip time), source

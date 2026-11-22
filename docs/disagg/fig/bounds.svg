@@ -1,19 +1,19 @@
 <svg xmlns='http://www.w3.org/2000/svg' width='760' height='230' viewBox='0 0 760 230' font-family='Helvetica, Arial, sans-serif'>
 <rect width='760' height='230' fill='#fcfcfb'/>
-<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>The DiT waits for data; the VAE does not</text>
+<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>The DiT is I/O-heavy; the VAE is compute-bound</text>
 <text x='24' y='48' font-size='12' fill='#52514e'>Time per call of each stage's main program (ms, 4 chips, 480x768)</text>
 <text x='68' y='92' font-size='14' font-weight='600' text-anchor='end' fill='#0b0b0b'>DiT</text>
 <rect x='80' y='70' width='327.4' height='34' rx='4' fill='#2a78d6'/>
-<text x='88' y='92' font-size='12' fill='#ffffff'>computing 4.4</text>
+<text x='88' y='92' font-size='12' fill='#ffffff'>compute 4.4</text>
 <rect x='409.4' y='70' width='149.5' height='34' rx='4' fill='#eb6834'/>
-<text x='415.4' y='92' font-size='12' fill='#ffffff'>waiting 2.0</text>
-<text x='569.0' y='92' font-size='12' fill='#0b0b0b'>waits a third of the time</text>
+<text x='415.4' y='92' font-size='12' fill='#ffffff'>I/O 2.0</text>
+<text x='569.0' y='92' font-size='12' fill='#0b0b0b'>I/O a third of the time</text>
 <text x='68' y='152' font-size='14' font-weight='600' text-anchor='end' fill='#0b0b0b'>VAE</text>
 <rect x='80' y='130' width='376.4' height='34' rx='4' fill='#2a78d6'/>
-<text x='88' y='152' font-size='12' fill='#ffffff'>computing 5.0</text>
+<text x='88' y='152' font-size='12' fill='#ffffff'>compute 5.0</text>
 <rect x='458.4' y='130' width='50.0' height='34' rx='4' fill='#eb6834'/>
 <text x='464.4' y='152' font-size='12' fill='#ffffff'>0.7</text>
-<text x='518.4' y='152' font-size='12' fill='#0b0b0b'>almost never waits</text>
-<text x='24' y='204' font-size='11' fill='#52514e'>Blue: the math engine computing. Orange: the math engine waiting for data.</text>
+<text x='518.4' y='152' font-size='12' fill='#0b0b0b'>almost no I/O</text>
+<text x='24' y='204' font-size='11' fill='#52514e'>Blue: compute. Orange: I/O (moving data between the chip's memories and to the other chips).</text>
 <text x='24' y='220' font-size='11' fill='#52514e'>Slow for different reasons, so the two stages need different numbers of chips.</text>
 </svg>
