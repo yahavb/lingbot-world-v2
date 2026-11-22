@@ -249,6 +249,17 @@ decoder. At 16 chips the decoder takes 16 × 143 ms = 2.29 chip-seconds per chun
 - co-located: P_co = T_d(N) + T_v(N)
 - disaggregated: P_dis = max(T_d(n_d), T_v(n_v)) + ε, where ε = 0.17 ms per 1.1 MB latent
 
+**Overlap (Figure timeline.svg).** In a co-located replica, the DiT and the VAE share the same chips, so each chunk is
+denoised and then decoded, one after the other. A chunk takes T_d + T_v, and the chips running the DiT sit idle while
+the VAE runs. Disaggregation puts the two stages on separate chips, connected by a 0.17 ms latent hand-off. That lets
+them work on different chunks at the same time: while the VAE decodes chunk n, the DiT is already denoising chunk n + 1.
+The stream then advances at the pace of the slower stage, max(T_d, T_v), and the faster stage's time is hidden. We
+measure this directly. The disaggregated stream runs at the DiT's own pace (32.1 fps at 16 + 1 chips, against 32.0 for
+the DiT alone), while the co-located replica pays for both stages (26.7 fps). The same split inside a single pod gives
+the same frame rate (17.51 against 17.54 fps), so the gain comes from decoupling the stages, not from the pods. Overlap
+does not shorten the time for any single chunk, so a key press takes as long to show up. It only lets chunks come out
+more often.
+
 **Rate matching.** One decoder replica serves k = T_d(n_d) / T_v(n_v) denoiser replicas.
 
 - Beyond k, add decoder replicas and spread the sessions.
