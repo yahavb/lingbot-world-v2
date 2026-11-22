@@ -576,7 +576,6 @@ def main():
         rdma = VaePool()
         VAE_POOL["pool"] = rdma
         if NIXL_ASYNC:
-            import threading
             threading.Thread(target=_nixl_worker, args=(rdma,), daemon=True, name="nixl-send").start()
 
     # LINGBOT_VAE_FUSED=1 (world > 1): the inline decode uses the fused decoder in decode_chunk mode,
