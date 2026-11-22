@@ -225,7 +225,19 @@ role's pool resizes on its own. A co-located replica cannot change its ratio.
 
 ## 5 [SYSTEM] design
 
-**5.1 Overview (Figure 5).**
+**5.1 Overview (Figure 5).** How a session is served:
+
+1. The browser opens a session with lbw-web, the session manager.
+2. lbw-web sends it through the DiT Service, so any Ready DiT pod takes it. The session stays bound to that DiT pod,
+   which serves one session at a time.
+3. That DiT streams each chunk's latent to any Ready VAE pod with a free slot.
+4. The frames go back through lbw-web to the browser.
+
+Each VAE pod has K open slots, so it serves up to K sessions; their chunks are decoded one after another, each with its
+own causal cache. About T_d / T_v sessions keep up. DiT pods scale out for more sessions; VAE pods scale out for more
+open slots.
+
+**Previous 5.1 text:**
 
 - Two roles: a denoiser (DiT + T5) and a decoder (VAE). Each is a pool of replicas, sized, replicated, placed and
   failed over on its own.
