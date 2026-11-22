@@ -28,81 +28,40 @@ On LingBot-World v2 and Stable Audio 3, [SYSTEM]:
 
 ## 1 Introduction
 
-**Background.**
+Interactive world models turn a user's actions into video in real time. Each step of such a model has two stages. A
+diffusion transformer (DiT) denoises a chunk of latent frames, conditioned on the user's input and on a cache of the
+frames it already produced. A variational autoencoder (VAE) then decodes the latents into pixels. The loop repeats
+for every chunk, and the frame rate the user sees is set by how fast one chunk passes through both stages.
 
-- Interactive world models turn actions into video chunk by chunk.
-- Robot-policy training runs many such simulations in parallel.
-- Audio models render long pieces in seconds.
+Today both stages run on the same accelerators, one after the other. The DiT finishes a chunk, the VAE decodes it on
+the same chips, and only then does the DiT start the next chunk. The time per chunk is the sum of the two stages, and
+every chip serves both, whatever each stage actually needs.
 
-Every unit of output passes through a DiT and then a decoder.
+The two stages need very different things. We profiled LingBot-World v2 on AWS Trainium3. The VAE is compute-bound:
+its matmul engine is busy 94% of the time, and it fits on a single chip. The DiT is not bound by compute: its matmul
+engine is busy 57% of the time, data movement 80%, and the chip waits 19% of the time on data and on other chips. The
+DiT holds a large KV cache and needs many chips; the VAE is small and dense. Sharing the same chips forces one
+allocation on two different workloads, and it puts the two stages in sequence.
 
-**Problem.** Serving stacks inherit the LLM playbook: tensor and sequence parallelism, and the whole pipeline
-co-located in each replica. These pipelines have two stages, and neither is negligible:
+We argue that the two stages should be managed as separate resources, the way an operating system separates
+processes with different demands. We split the pipeline into a DiT pool and a VAE pool on their own chips. A session
+is bound to one DiT, which holds its KV cache; each chunk's latents go to any VAE, chosen by load, over the network.
+The VAE decodes chunk n while the DiT denoises chunk n + 1. The time per chunk becomes the slower of the two stages
+instead of their sum, each pool is sized to its own bound, and one VAE can serve several streams.
 
-- in a 14B world model on 16 Trainium3 chips, the decoder takes 143 ms per chunk next to the DiT's 300 ms;
-- in Stable Audio 3, decode is 40-53% of the DiT's time.
+We built this on Kubernetes (EKS) with Dynamic Resource Allocation to claim chips and network devices per pod, and
+NIXL over EFA to move latents between pods in 0.17 ms. On LingBot-World v2, disaggregation raises the frame rate by
+about 30% on average at the same model and kernels, and needs 44% fewer chips per real-time stream. A simple cost
+model, built from each stage's measured time, predicts the frame rate within 1.4%, so the system can size the pools
+before deploying them.
 
-**Motivation: two stages, two usage profiles (Figure 3, bounds.svg).** The DiT and the VAE use the accelerator very
-differently (all measured, LingBot, 4 chips, 480x768 unless noted):
+This paper makes four contributions:
 
-| Typical usage | DiT | VAE |
-|---|---|---|
-| Matmul engine busy | 68% of the time | 88% |
-| Data movement busy (overlaps compute) | 82% | 51% |
-| Talks to other chips each call | yes: TP and CP | barely: tile edges only |
-| Device memory per rank | about 8.4 GiB of weights plus an 8.65 GB KV cache (720p) | about 3 GiB, with 4 sessions |
-| Speed-up from 8x the chips | 3.2x | 2.1x |
-
-The DiT is big, spreads over several chips and talks between them. The VAE is small and compute-dense, and fits one
-chip with room to share.
-
-**Why co-location is suboptimal.** A co-located replica runs both stages on the same chips, one after the other:
-
-- every chip runs the DiT, then every chip runs the VAE;
-- so the VAE is charged at the DiT's chip count, where it gains little: at 16 chips it holds 2,032 chip-ms per chunk,
-  against 324 on its own chip (Figure chiptime);
-- and each stage waits for the other.
-
-**The claim.** Splitting the stages into independently sized and scaled roles gives **about 30% higher frame rate on
-average**, and serves a real-time stream on **44% fewer chips**. The per-setup
-breakdown is in section 7:
-
-| Setup | fps gain |
-|---|---|
-| LingBot 720p, 16 chips | 11% |
-| LingBot 480, 16 chips | 20% |
-| Stable Audio, 190 s windows | 32-36% |
-| LingBot, 2-step DiT | 44% |
-| Stable Audio, 280 s windows | 27% |
-
-The gain is larger when the VAE is a bigger share of the work, as the cost model predicts (section 4).
-
-**Why not prefill/decode disaggregation.** That design separates a compute-bound phase from a bandwidth-bound one
-that interfere. Our profiles show neither: the two stages have different bounds, and they interact through time and
-chip count (section 3).
-
-**Challenges.**
-
-1. **Finding the binding resource of each stage.** The classic roofline places both far from compute and bandwidth
-   alike.
-2. **Choosing the chip split and the replica ratio.** The right answer depends on model, resolution and steps, and a
-   wrong split loses (8 chips).
-3. **Sharing a stateful decoder.** A causal VAE carries per-stream state across chunks.
-4. **Operating two roles on Kubernetes.** Device and EFA pairing, latent transport between device memories, pod
-   discovery, failover.
-
-**Our work.** Contributions:
-
-1. **A characterization of the two stages on Trainium3,** with an extended roofline. The DiT is bound by on-chip data
-   movement (DMA busy 82%, 8.8x its HBM need). The decoder is bound by array utilization (tensor busy about 90% at
-   44-50% of peak).
-2. **A cost model of stage coupling:** T_d(N) + T_v(N) co-located, max(T_d(n_d), T_v(n_v)) disaggregated, and
-   k = T_d / T_v streams per decoder. It predicts 15 measured configurations within 1.4%, and a held-out 16-chip DiT
-   within 2.5%.
-3. **[SYSTEM], role disaggregation as an operating-system abstraction on EKS.** It has DRA claims with paired EFA,
-   NIXL writes between device memories, per-session decoder caches, least-loaded placement and failover.
-4. **An evaluation on two pipelines.** It covers chip budgets, resolutions, denoising steps, N:M ratios, latency,
-   ablations and failures, including where disaggregation does not pay.
+1. A characterization of the two stages on Trainium3 that shows they are bound by different resources.
+2. A design that serves the stages as separate pools: sessions bound to a DiT, chunks placed on any VAE by load, and
+   decoding overlapped with denoising.
+3. A cost model that predicts the frame rate and the number of VAE replicas from per-stage times.
+4. An evaluation on a real cluster: frame rate, chips per stream, latency, sharing, placement and failover.
 
 ## 2 Background
 
