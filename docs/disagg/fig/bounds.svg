@@ -1,21 +1,26 @@
-<svg xmlns='http://www.w3.org/2000/svg' width='760' height='270' viewBox='0 0 760 270' font-family='Helvetica, Arial, sans-serif'>
-<rect width='760' height='270' fill='#fcfcfb'/>
+<svg xmlns='http://www.w3.org/2000/svg' width='800' height='300' viewBox='0 0 800 300' font-family='Helvetica, Arial, sans-serif'>
+<rect width='800' height='300' fill='#fcfcfb'/>
 <text x='24' y='26' font-size='15' font-weight='600' fill='#0b0b0b'>What each stage spends its time on (ms per call, 4-chip, 480x768)</text>
 <text x='150' y='78' font-size='12' text-anchor='end' fill='#0b0b0b'>DiT attention block</text>
-<rect x='160' y='56' width='142.4' height='32' rx='4' fill='#2a78d6'><title>useful math 1.84 ms</title></rect>
-<text x='166' y='77' font-size='11' fill='#ffffff'>compute 1.84</text>
-<rect x='304.4' y='56' width='354.2' height='32' rx='4' fill='#eb6834'><title>headroom 4.54 ms</title></rect>
-<text x='310.4' y='77' font-size='11' fill='#ffffff'>data movement (memory / IO) 4.5</text>
-<text x='666.6' y='77' font-size='11' fill='#0b0b0b'>= 6.38 ms</text>
-<text x='160' y='104' font-size='11' fill='#52514e'>on-chip data-movement engines busy 82% of the time</text>
-<text x='150' y='148' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE convolution</text>
-<rect x='160' y='126' width='196.5' height='32' rx='4' fill='#2a78d6'><title>useful math 2.53 ms</title></rect>
-<text x='166' y='147' font-size='11' fill='#ffffff'>compute 2.53</text>
-<rect x='358.5' y='126' width='247.5' height='32' rx='4' fill='#eb6834'><title>headroom 3.18 ms</title></rect>
-<text x='364.5' y='147' font-size='11' fill='#ffffff'>underused compute 3.2</text>
-<text x='614.0' y='147' font-size='11' fill='#0b0b0b'>= 5.71 ms</text>
-<text x='160' y='174' font-size='11' fill='#52514e'>math engine busy ~90% of the time at ~45% of its peak</text>
-<text x='24' y='226' font-size='11' fill='#52514e'>Blue: compute at full speed. Orange: the rest of the time, headroom a better kernel could reclaim.</text>
-<text x='24' y='242' font-size='11' fill='#52514e'>Each stage's headroom has a different cause, so they scale differently with chips (the cause).</text>
-<text x='24' y='258' font-size='11' fill='#52514e'>Disaggregation does not change it (that is kernel work); Figure chiptime shows what disaggregation saves.</text>
+<rect x='160.0' y='56' width='153.7' height='32' rx='4' fill='#2a78d6'><title>DiT attention block full steps 1.84 ms</title></rect>
+<text x='165.0' y='77' font-size='10' fill='#ffffff'>full steps 1.84</text>
+<rect x='315.7' y='56' width='212.1' height='32' rx='4' fill='#1baf7a'><title>DiT attention block partly-full steps 2.53 ms</title></rect>
+<text x='320.7' y='77' font-size='10' fill='#0b0b0b'>partly-full steps 2.53</text>
+<rect x='529.8' y='56' width='168.1' height='32' rx='4' fill='#eb6834'><title>DiT attention block waiting 2.01 ms</title></rect>
+<text x='534.8' y='77' font-size='10' fill='#ffffff'>waiting 2.01</text>
+<text x='705.8' y='77' font-size='11' fill='#0b0b0b'>= 6.38 ms</text>
+<text x='160' y='106' font-size='11' fill='#52514e'>orange: waiting on data movement (memory / IO)</text>
+<text x='150' y='154' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE convolution</text>
+<rect x='160.0' y='132' width='212.1' height='32' rx='4' fill='#2a78d6'><title>VAE convolution full steps 2.53 ms</title></rect>
+<text x='165.0' y='153' font-size='10' fill='#ffffff'>full steps 2.53</text>
+<rect x='374.1' y='132' width='208.7' height='32' rx='4' fill='#1baf7a'><title>VAE convolution partly-full steps 2.49 ms</title></rect>
+<text x='379.1' y='153' font-size='10' fill='#0b0b0b'>partly-full steps 2.49</text>
+<rect x='584.8' y='132' width='56.4' height='32' rx='4' fill='#eb6834'><title>VAE convolution waiting 0.69 ms</title></rect>
+<text x='589.8' y='153' font-size='10' fill='#ffffff'>0.69</text>
+<text x='649.2' y='153' font-size='11' fill='#0b0b0b'>= 5.71 ms</text>
+<text x='160' y='182' font-size='11' fill='#52514e'>orange: waiting on normalization and tile-edge exchange</text>
+<text x='24' y='240' font-size='11' fill='#52514e'>Blue + aqua: the math engine computing (blue = the time it would need with every step full).</text>
+<text x='24' y='256' font-size='11' fill='#52514e'>Orange: the math engine waiting. The DiT waits on data movement (2.0 ms); the VAE hardly waits (0.7 ms).</text>
+<text x='24' y='272' font-size='11' fill='#52514e'>Different bottlenecks, so the stages scale differently with chips (the cause).</text>
+<text x='24' y='288' font-size='11' fill='#52514e'>Disaggregation does not change these kernels; Figure chiptime shows what it saves.</text>
 </svg>

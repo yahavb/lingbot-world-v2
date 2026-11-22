@@ -644,3 +644,37 @@ def fig_architecture3():
 if __name__ == "__main__":
     open(os.path.join(OUT, "architecture.svg"), "w").write(fig_architecture3())
     print("architecture.svg (flow)")
+
+
+def fig_bounds3():
+    """Measured time split three ways (tensor-engine profile of the top graph of each stage):
+    compute at full steps (FLOPs / peak), compute in partly-full steps (tensor busy - that), compute engine waiting."""
+    rows = [("DiT attention block", 1.84, 4.37 - 1.84, 6.38 - 4.37, "waiting on data movement (memory / IO)"),
+            ("VAE convolution", 2.53, 5.02 - 2.53, 5.71 - 5.02, "waiting on normalization and tile-edge exchange")]
+    W, H, L = 800, 300, 160
+    sc = (W - L - 90) / 6.5
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>What each stage spends its time on (ms per call, 4-chip, 480x768)</text>"]
+    for i, (name, full, partial, wait, why) in enumerate(rows):
+        y = 56 + i * 76
+        s.append(f"<text x='{L - 10}' y='{y + 22}' font-size='12' text-anchor='end' fill='{INK}'>{name}</text>")
+        x = L
+        for v, col, lab in ((full, BLUE, f"full steps {full:.2f}"), (partial, AQUA, f"partly-full steps {partial:.2f}"), (wait, ORANGE, f"waiting {wait:.2f}")):
+            s.append(f"<rect x='{x:.1f}' y='{y}' width='{v * sc - 2:.1f}' height='32' rx='4' fill='{col}'><title>{name} {lab} ms</title></rect>")
+            txt = lab if v * sc > 80 else f"{v:.2f}"
+            s.append(f"<text x='{x + 5:.1f}' y='{y + 21}' font-size='10' fill='{INK if col == AQUA else '#ffffff'}'>{txt}</text>")
+            x += v * sc
+        s.append(f"<text x='{x + 6:.1f}' y='{y + 21}' font-size='11' fill='{INK}'>= {full + partial + wait:.2f} ms</text>")
+        s.append(f"<text x='{L}' y='{y + 50}' font-size='11' fill='{INK2}'>orange: {why}</text>")
+    s.append(f"<text x='24' y='{H - 60}' font-size='11' fill='{INK2}'>Blue + aqua: the math engine computing (blue = the time it would need with every step full).</text>")
+    s.append(f"<text x='24' y='{H - 44}' font-size='11' fill='{INK2}'>Orange: the math engine waiting. The DiT waits on data movement (2.0 ms); the VAE hardly waits (0.7 ms).</text>")
+    s.append(f"<text x='24' y='{H - 28}' font-size='11' fill='{INK2}'>Different bottlenecks, so the stages scale differently with chips (the cause).</text>")
+    s.append(f"<text x='24' y='{H - 12}' font-size='11' fill='{INK2}'>Disaggregation does not change these kernels; Figure chiptime shows what it saves.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds3())
+    print("bounds.svg (three parts)")
