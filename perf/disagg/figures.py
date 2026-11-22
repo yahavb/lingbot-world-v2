@@ -575,7 +575,7 @@ if __name__ == "__main__":
 def fig_architecture3():
     """The serving flow as it runs (deck S11e, serve.py, vae_serve.py): browser -> lbw-web (session manager) -> any Ready
     DiT pod (the session is bound to it) -> that DiT picks any Ready VAE with an open slot -> frames back via lbw-web."""
-    W, H = 1000, 580
+    W, H = 1000, 600
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<defs><marker id='a' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'>"
          f"<path d='M0,0 L10,5 L0,10 z' fill='{INK2}'/></marker></defs>",
@@ -591,10 +591,10 @@ def fig_architecture3():
     def lab(x, y, t, col=INK2, fs=10, anchor="middle"):
         s.append(f"<text x='{x}' y='{y}' font-size='{fs}' text-anchor='{anchor}' fill='{col}'>{t}</text>")
     # browser and session manager
-    box(30, 230, 120, 60, "Browser", "keys in, frames out", INK2)
-    box(190, 220, 150, 80, "lbw-web", "session manager (m5)", INK2, "#f3f2ee")
+    box(30, 230, 120, 60, "Client", "actions in, frames out", INK2)
+    box(190, 220, 150, 80, "Session manager", "opens and tracks sessions", INK2, "#f3f2ee")
     arrow(150, 252, 190, 252); arrow(190, 270, 150, 270)
-    lab(170, 244, "1 open"); lab(170, 286, "4 frames")
+    lab(170, 244, "1"); lab(170, 286, "4")
     # DiT pool
     s.append(f"<rect x='380' y='60' width='250' height='420' rx='12' fill='none' stroke='{BLUE}' stroke-width='2' stroke-dasharray='6 4'/>")
     s.append(f"<text x='394' y='82' font-size='13' font-weight='600' fill='{INK}'>DiT pool (DiT + T5)</text>")
@@ -604,10 +604,8 @@ def fig_architecture3():
     lab(505, 382, "...", INK2, 16)
     lab(394, 410, "scale out: add DiT pods", BLUE, 12, "start")
     lab(394, 428, "= more concurrent sessions", BLUE, 11, "start")
-    arrow(340, 252, 400, 147)
-    lab(330, 150, "2 via the Service:", INK2, 10, "end")
-    lab(330, 162, "any Ready DiT pod;", INK2, 10, "end")
-    lab(330, 174, "the session stays on it", INK2, 10, "end")
+    arrow(340, 260, 380, 260)
+    lab(360, 248, "2", INK2, 11)
     # VAE pool with slots
     s.append(f"<rect x='690' y='60' width='280' height='420' rx='12' fill='none' stroke='{ORANGE}' stroke-width='2' stroke-dasharray='6 4'/>")
     s.append(f"<text x='704' y='82' font-size='13' font-weight='600' fill='{INK}'>VAE pool</text>")
@@ -624,13 +622,17 @@ def fig_architecture3():
     lab(704, 410, "scale out: add VAE pods", ORANGE, 12, "start")
     lab(704, 428, "= more open slots", ORANGE, 11, "start")
     # DiT -> VAE streams (any to any)
-    for y in (147, 237, 327):
-        arrow(610, y, 710, 160 if y != 327 else 260, ORANGE, 1.6)
-    lab(660, 300, "3 latents", ORANGE, 10)
+    # one pool-to-pool arrow through a fairness circle: a chunk's DiT picks any VAE pod with a free slot (least loaded)
+    arrow(630, 260, 690, 260, ORANGE, 2.4)
+    s.append(f"<circle cx='660' cy='260' r='20' fill='{SURF}' stroke='{ORANGE}' stroke-width='2'/>")
+    s.append(f"<path d='M 650 252 A 10 10 0 1 1 650 268' fill='none' stroke='{ORANGE}' stroke-width='2' marker-end='url(#a)'/>")
+    lab(660, 232, "3", INK2, 11)
+    lab(660, 300, "least-loaded", ORANGE, 10); lab(660, 312, "free slot", ORANGE, 10)
     # frames back
     s.append(f"<path d='M 830 480 L 830 500 L 265 500 L 265 300' fill='none' stroke='{INK2}' stroke-width='1.6' stroke-dasharray='5 4' marker-end='url(#a)'/>")
-    lab(560, 516, "4 frames back to lbw-web, then the browser", INK2, 11)
-    s.append(f"<text x='24' y='{H - 28}' font-size='11' fill='{INK2}'>3: each DiT streams its latents to any VAE pod with a free slot (NIXL one-sided writes over EFA, 1.1 MB per chunk).</text>")
+    lab(560, 516, "4 frames back through the session manager to the client", INK2, 11)
+    s.append(f"<text x='24' y='{H - 44}' font-size='11' fill='{INK2}'>1 the client opens a session. 2 any Ready DiT pod takes it; the session stays on that pod.</text>")
+    s.append(f"<text x='24' y='{H - 28}' font-size='11' fill='{INK2}'>3 the DiT streams its latents to the least-loaded VAE pod with a free slot (NIXL over EFA, 1.1 MB per chunk). 4 frames back.</text>")
     s.append(f"<text x='24' y='{H - 12}' font-size='11' fill='{INK2}'>Each role scales on its own: DiT pods for more sessions, VAE pods for more open slots. Kubernetes DRA gives each pod its Neuron devices + EFAs.</text>")
     s.append("</svg>")
     return "\n".join(s)
