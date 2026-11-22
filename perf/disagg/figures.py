@@ -296,8 +296,8 @@ if __name__ == "__main__":
 
 def fig_timeline():
     """Schematic (measured durations, LingBot 480, 16 chips): co-located DiT then VAE per chunk vs disaggregated overlap."""
-    W, H, L = 820, 260, 150
-    sc = (W - L - 30) / 1500      # ms -> px
+    W, H, L = 900, 260, 150
+    sc = (W - L - 190) / 1500      # ms -> px
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
          f"<text x='24' y='26' font-size='15' font-weight='600' fill='{INK}'>One stream, three chunks: co-located vs disaggregated (16-chip DiT, measured times)</text>"]
