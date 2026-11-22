@@ -678,3 +678,32 @@ def fig_bounds3():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds3())
     print("bounds.svg (three parts)")
+
+
+def fig_bounds4():
+    """Two parts per stage: the math engine computing vs waiting (tensor-engine busy vs idle, top graph per stage)."""
+    rows = [("DiT", 4.37, 6.38 - 4.37, "waits a third of the time"),
+            ("VAE", 5.02, 5.71 - 5.02, "almost never waits")]
+    W, H, L = 760, 230, 80
+    sc = (W - L - 190) / 6.5
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>The DiT waits for data; the VAE does not</text>",
+         f"<text x='24' y='48' font-size='12' fill='{INK2}'>Time per call of each stage's main program (ms, 4 chips, 480x768)</text>"]
+    for i, (name, comp, wait, note) in enumerate(rows):
+        y = 70 + i * 60
+        s.append(f"<text x='{L - 12}' y='{y + 22}' font-size='14' font-weight='600' text-anchor='end' fill='{INK}'>{name}</text>")
+        s.append(f"<rect x='{L}' y='{y}' width='{comp * sc - 2:.1f}' height='34' rx='4' fill='{BLUE}'/>")
+        s.append(f"<text x='{L + 8}' y='{y + 22}' font-size='12' fill='#ffffff'>computing {comp:.1f}</text>")
+        s.append(f"<rect x='{L + comp * sc:.1f}' y='{y}' width='{wait * sc - 2:.1f}' height='34' rx='4' fill='{ORANGE}'/>")
+        s.append(f"<text x='{L + comp * sc + 6:.1f}' y='{y + 22}' font-size='12' fill='#ffffff'>{'waiting ' if wait * sc > 90 else ''}{wait:.1f}</text>")
+        s.append(f"<text x='{L + (comp + wait) * sc + 8:.1f}' y='{y + 22}' font-size='12' fill='{INK}'>{note}</text>")
+    s.append(f"<text x='24' y='{H - 26}' font-size='11' fill='{INK2}'>Blue: the math engine computing. Orange: the math engine waiting for data.</text>")
+    s.append(f"<text x='24' y='{H - 10}' font-size='11' fill='{INK2}'>Slow for different reasons, so the two stages need different numbers of chips.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds4())
+    print("bounds.svg (computing vs waiting)")

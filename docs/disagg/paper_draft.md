@@ -126,19 +126,15 @@ chip count (section 3).
 **3.1 Binding resources (Figure 3).** From a system trace of a warm run, we take a device profile of every graph
 that carries the latency, and compute one floor per resource.
 
-**Time split per call (Figure 3, bounds.svg).** For each stage's top graph:
+**Computing vs waiting (Figure 3, bounds.svg).** For each stage's main program:
 
-| Stage | Compute, full steps | Compute, partly-full steps | Compute engine waiting | Total |
-|---|---|---|---|---|
-| DiT attention block | 1.84 ms | 2.53 ms | 2.01 ms (data movement) | 6.38 ms |
-| VAE convolution | 2.53 ms | 2.49 ms | 0.69 ms (normalization, tile-edge exchange) | 5.71 ms |
+| Stage | Computing | Waiting for data | Total |
+|---|---|---|---|
+| DiT | 4.4 ms | 2.0 ms | 6.4 ms |
+| VAE | 5.0 ms | 0.7 ms | 5.7 ms |
 
-- "Full steps" is the FLOPs at peak.
-- "Partly-full steps" is the rest of the time the math engine is busy: the same math, in steps that fill only part of
-  the array.
-- "Waiting" is the time the math engine is idle.
-- Both stages compute in partly-full steps. The difference is that the DiT also waits about 2 ms on data movement,
-  while the VAE hardly waits.
+The DiT's math engine waits for data about a third of the time; the VAE's almost never waits. They are slow for
+different reasons, so they need different numbers of chips.
 
 **Coverage.** Share of chip-busy time in the profiled run (4 chips, 480x768, about 31.7 s of chip time), source
 perf/disagg/results/prof/p14_devprof_dma_480.devprof.txt:
