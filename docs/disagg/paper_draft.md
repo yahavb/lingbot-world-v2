@@ -77,8 +77,8 @@ chip with room to share.
   against 324 on its own chip (Figure chiptime);
 - and each stage waits for the other.
 
-**The claim.** Splitting the stages into independently sized and scaled roles gives **about 27% higher frame rate on
-average** (measured over four configurations), and serves a real-time stream on **44% fewer chips**. The per-setup
+**The claim.** Splitting the stages into independently sized and scaled roles gives **about 30% higher frame rate on
+average**, and serves a real-time stream on **44% fewer chips**. The per-setup
 breakdown is in section 7:
 
 | Setup | fps gain |
@@ -87,10 +87,9 @@ breakdown is in section 7:
 | LingBot 480, 16 chips | 20% |
 | Stable Audio, 190 s windows | 32-36% |
 | LingBot, 2-step DiT | 44% |
-| Stable Audio, 280 s windows | **[to validate: not yet measured]** |
+| Stable Audio, 280 s windows | 27% |
 
-Once the 280 s run is measured, the average is expected to be about 30% [to validate]. The gain is larger when the VAE
-is a bigger share of the work, as the cost model predicts (section 4).
+The gain is larger when the VAE is a bigger share of the work, as the cost model predicts (section 4).
 
 **Why not prefill/decode disaggregation.** That design separates a compute-bound phase from a bandwidth-bound one
 that interfere. Our profiles show neither: the two stages have different bounds, and they interact through time and

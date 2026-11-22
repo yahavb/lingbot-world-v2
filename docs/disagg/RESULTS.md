@@ -94,3 +94,7 @@ The model is distilled to 4 steps, so only fewer steps can be tested.
 | Composition model, 15 cells | within 1.4% | perf/disagg/model_check.py |
 | Held-out 16-chip DiT | +2.5% | same |
 | Held-out 8-chip VAE | +10% | same |
+
+## Pending
+
+- Stable Audio, 280 s windows: the draft uses 27% (and the 30% average); run it before submission.
