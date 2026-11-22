@@ -228,11 +228,13 @@ class VaePool:
                         if _NIXL_TIMING:
                             # LINGBOT_NIXL_TIMING=1: the hand-off's own time (device copy into the send buffer, sync,
                             # one-sided write, completion), median of every 20 chunks
-                            self._wt.append((time.perf_counter() - _t0) * 1000)
+                            self._wt.append(((time.perf_counter() - _t0) * 1000, getattr(self.nixl, "last_xfer_ms", -1.0)))
                             if len(self._wt) == 20:
-                                w = sorted(self._wt)
-                                log.info(f"[NIXL] write ms over 20 chunks: median {w[10]:.3f} min {w[0]:.3f} "
-                                         f"max {w[-1]:.3f} bytes {x_dev.numel() * x_dev.element_size()}")
+                                w = sorted(x[0] for x in self._wt)
+                                x = sorted(x[1] for x in self._wt)
+                                log.info(f"[NIXL] over 20 chunks: transfer median {x[10]:.3f} ms (min {x[0]:.3f} max "
+                                         f"{x[-1]:.3f}); write() incl. device sync median {w[10]:.1f} ms; "
+                                         f"bytes {x_dev.numel() * x_dev.element_size()}")
                                 self._wt = []
                         break
                     except Exception as e:

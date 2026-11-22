@@ -121,6 +121,7 @@ class NixlDit:
         torch.neuron.synchronize()
         remote, slots, sid = conn
         tag = f"s{sid}:{seq}" if sid else f"seq:{seq}"
+        _tx = time.perf_counter()
         h = self.agent.initialize_xfer("WRITE", self.local, slots[seq % len(slots)], remote, tag.encode())
         try:
             st = self.agent.transfer(h)
@@ -131,6 +132,7 @@ class NixlDit:
                 st = self.agent.check_xfer_state(h)
             if st != "DONE":
                 raise RuntimeError(f"nixl write of chunk {seq}: {st}")
+            self.last_xfer_ms = (time.perf_counter() - _tx) * 1000   # the one-sided write alone (after the device sync)
         finally:
             try:
                 self.agent.release_xfer_handle(h)
