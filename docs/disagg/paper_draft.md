@@ -154,8 +154,8 @@ We observe that:
 
   The DiT re-lays out its own activations on the chip; it is not starved for HBM bandwidth.
 - **The transposes are the price of MXFP8's input layout on this kernel.** nkilib's matmul_mxfp8 takes the activation
-  token-major and converts it to its own layout on every call. Both cheaper variants we know of were measured and
-  lost:
+  token-major and converts it to its own layout on every call. Both cheaper variants we know of were measured, and
+  both were slower:
   - passing the activation K-major, so the kernel skips its transpose, was slower for every shape (e.g. QKV 237 vs
     132 us);
   - quantizing the shared Q/K/V input once and reusing it cost more than it saved (467 vs 358 us).
@@ -432,7 +432,7 @@ We observe that:
 
 Two-stage generative pipelines are limited by the coupling of two stages with different bounds. Treating the stages
 as independently sized, replicated and placed roles, an operating-system responsibility on EKS with DRA, EFA and
-NIXL, recovers the lost chip time. A cost model the operator computes at deploy time picks the sizing.
+NIXL, recovers the chip time co-location spends on the wrong chip count. A cost model the operator computes at deploy time picks the sizing.
 
 **Figures:**
 
