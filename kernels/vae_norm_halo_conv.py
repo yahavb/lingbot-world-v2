@@ -49,6 +49,7 @@ _R = int(os.environ.get("LINGBOT_VAE_NKI_CONV_R", "12"))
 _SQ16 = os.environ.get("LINGBOT_VAE_NKI_CONV_SQ", "fp32") == "bf16"
 _LA = int(os.environ.get("LINGBOT_VAE_NKI_CONV_LA", "0"))
 _EDGE = os.environ.get("LINGBOT_VAE_NKI_CONV_EDGE", "") == "copy"
+_WG = int(os.environ.get("LINGBOT_VAE_CONV_WG", "1"))   # output blocks sharing one weight load (see conv())
 
 
 def _norm_tiles(xts, yts, n, cs, ones, gts, sq16):
@@ -165,20 +166,29 @@ def _body(x, left, right, up, down, cache, g, wt, bias, res, rows, la, sq16, edg
             m0, ms = m * _P, cos[m]
             ot = nl.ndarray((_P, R, Wp), dtype=x.dtype, buffer=nl.sbuf)
             otf = ot.reshape((_P, R * Wp))
-            for b in range(nq):
-                q0 = b * _B
-                n = min(_B, NQ - q0)
-                ps = nl.ndarray((_P, _B), dtype=nl.float32, buffer=nl.psum)
+            for g0 in range(0, nq, _WG):
+                # LINGBOT_VAE_CONV_WG=G (opt-in, default 1 = one block at a time): G output blocks of 512 at once,
+                # each in its own PSUM bank, so one stationary weight tile serves G matmuls before the next
+                # LDWEIGHTS. Exact: every PSUM tile accumulates the same taps in the same order.
+                blk = list(range(g0, min(nq, g0 + _WG)))
+                pss = [nl.ndarray((_P, _B), dtype=nl.float32, buffer=nl.psum) for _ in blk]
                 i = 0
                 for tap in range(27):
                     kt, kh, kw = tap // 9, (tap // 3) % 3, tap % 3
-                    s = q0 + kh * Wp + kw
                     for k in range(nct):
-                        nisa.nc_matmul(dst=ps[0:ms, 0:n], stationary=wss[k][0:cs[k], tap * CO + m0:tap * CO + m0 + ms],
-                                       moving=nts[t + kt][k][0:cs[k], s:s + n], accumulate=(i > 0))
+                        for bi, b in enumerate(blk):
+                            q0 = b * _B
+                            n = min(_B, NQ - q0)
+                            s = q0 + kh * Wp + kw
+                            nisa.nc_matmul(dst=pss[bi][0:ms, 0:n],
+                                           stationary=wss[k][0:cs[k], tap * CO + m0:tap * CO + m0 + ms],
+                                           moving=nts[t + kt][k][0:cs[k], s:s + n], accumulate=(i > 0))
                         i += 1
-                nisa.activation(dst=otf[0:ms, q0:q0 + n], op=nl.copy, data=ps[0:ms, 0:n], bias=bss[m][0:ms, 0:1],
-                                scale=1.0)
+                for bi, b in enumerate(blk):
+                    q0 = b * _B
+                    n = min(_B, NQ - q0)
+                    nisa.activation(dst=otf[0:ms, q0:q0 + n], op=nl.copy, data=pss[bi][0:ms, 0:n],
+                                    bias=bss[m][0:ms, 0:1], scale=1.0)
             if res is not None:                            # + the residual, rounded like torch's bf16 y + h
                 rt = nl.ndarray((_P, R, W), dtype=x.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=rt[0:ms, 0:R, 0:W], src=res[m0:m0 + ms, t, h0:h0 + R, 0:W])

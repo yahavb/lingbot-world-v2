@@ -20,7 +20,7 @@ import torch_neuronx  # noqa: F401,E402
 from wan.configs import WAN_CONFIGS  # noqa: E402
 from wan.modules import vae2_1_sharded as vs  # noqa: E402
 from wan.modules.vae2_1 import Wan2_1_VAE  # noqa: E402
-CKPT = "/work/ckpt/lingbot-world-v2-14b-causal-fast"
+CKPT = os.environ.get("CKPT", "/work/ckpt/lingbot-world-v2-14b-causal-fast")
 def main(latents_path):
     rank, world, local = (int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     torch.neuron.set_device(local)
