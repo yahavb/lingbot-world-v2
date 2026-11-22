@@ -1,7 +1,6 @@
 # Long abstract (for collaborators; draft)
 
-Every number below is measured on KEEP-trn3-dev1. The OSDI
-submission text must be the authors' own; this draft is a pitch and an outline.
+Every number below is measured; this draft is a pitch and an outline.
 
 ---
 
