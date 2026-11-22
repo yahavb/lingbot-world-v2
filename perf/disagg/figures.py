@@ -578,7 +578,9 @@ def fig_architecture3():
     W, H = 1000, 600
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
          f"<defs><marker id='a' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'>"
-         f"<path d='M0,0 L10,5 L0,10 z' fill='{INK2}'/></marker></defs>",
+         f"<path d='M0,0 L10,5 L0,10 z' fill='{INK2}'/></marker>"
+         f"<marker id='c' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='4' markerHeight='4' orient='auto'>"
+         f"<path d='M0,0 L10,5 L0,10 z' fill='{ORANGE}'/></marker></defs>",
          f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
          f"<text x='24' y='30' font-size='16' font-weight='600' fill='{INK}'>How a session is served: two pools that scale independently</text>"]
     def box(x, y, w, h, t, sub, col, fill="#ffffff", fs=12):
@@ -623,13 +625,9 @@ def fig_architecture3():
     lab(704, 410, "scale out: add VAE pods", ORANGE, 12, "start")
     lab(704, 428, "= more open slots", ORANGE, 11, "start")
     # DiT -> VAE streams (any to any)
-    # one pool-to-pool arrow through a fairness circle: a chunk's DiT picks any VAE pod with a free slot (least loaded)
+    # one pool-to-pool arrow, with a circular arrow around it: any VAE, least loaded (no fixed pairing)
     arrow(630, 260, 690, 260, ORANGE, 2.4)
-    s.append(f"<circle cx='660' cy='260' r='20' fill='{SURF}' stroke='{ORANGE}' stroke-width='2'/>")
-    s.append(f"<path d='M 650 252 A 10 10 0 1 1 650 268' fill='none' stroke='{ORANGE}' stroke-width='2' marker-end='url(#a)'/>")
-    lab(660, 232, "3", INK2, 11)
-    lab(660, 300, "any VAE", ORANGE, 9); lab(660, 311, "least-", ORANGE, 9); lab(660, 322, "loaded", ORANGE, 9)
-    lab(660, 333, "failover", ORANGE, 9); lab(660, 344, "~3 s", ORANGE, 9)
+    s.append(f"<path d='M 668 244 A 17 17 0 1 0 676 266' fill='none' stroke='{ORANGE}' stroke-width='2' marker-end='url(#c)'/>")
     # frames back
     s.append(f"<path d='M 830 480 L 830 500 L 265 500 L 265 300' fill='none' stroke='{INK2}' stroke-width='1.6' stroke-dasharray='5 4' marker-end='url(#a)'/>")
     lab(560, 516, "4 frames back through the session manager to the client", INK2, 11)
