@@ -420,7 +420,7 @@ We observe that:
 **Fairness note.** All co-located numbers at 480 include the async frame emit (section 7.7); without it co-located
 4 / 8 / 16 chips ran 14.3 / 20.0 / 23.4 fps. The 720p co-located 16-chip number is 11.4 fps with it (10.0 without).
 
-**7.6 Latency (Figures 10 pipeline.svg, 11 latency.svg).** The statement: splitting never makes a key press show
+**7.6 Latency (Figure 11, latency.svg).** The statement: splitting never makes a key press show
 up sooner. With too few VAE chips it makes reactions about 0.1 s slower (4 + 1: 1221 vs 1114 ms). With enough VAE chips
 the reaction time is the same as co-located (4 + 4: 1114 ms) while frames per second rise (17.6 vs 15.5). At 8 chips:
 co-located 736 / 960 ms (22.6 fps) vs 8 + 1 881 / 1056 ms (25.7 fps): a 1-chip VAE again adds about 0.15 s. Press-to-photon over 100 presses, median / p90:
@@ -489,5 +489,4 @@ NIXL, recovers the chip time co-location spends on the wrong chip count. A cost 
 7. pareto.svg
 8. nm.svg
 9. steps.svg
-10. pipeline.svg
 11. latency.svg

@@ -473,8 +473,7 @@ def fig_carwash():
 
 
 if __name__ == "__main__":
-    open(os.path.join(OUT, "pipeline.svg"), "w").write(fig_carwash())
-    print("pipeline.svg")
+    pass   # pipeline.svg removed (unclear); timeline.svg shows the overlap
 
 
 def fig_latency3():
