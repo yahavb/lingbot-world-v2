@@ -214,6 +214,16 @@ def vae(a):
     env_set(c, "LAT_W", lw)
     env_set(c, "LINGBOT_VAE_PER_DEVICE", a.per_device)
     env_set(c, "CACHE_VERSION", a.cache)
+    if getattr(a, "sysprof", False):
+        # runtime system profile of VAE rank 0, as for the DiT; the container stays after the server stops
+        cmd = c["command"][2]
+        old = 'torchrun --nproc_per_node="$NPROC" vae_serve.py'
+        assert old in cmd
+        cmd = cmd.replace(old, 'torchrun --nproc_per_node="$NPROC" --no-python bash perf/sysprof_rank0.sh python3 vae_serve.py')
+        cmd = cmd.replace('NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun', 'set +e\nNEURON_LOGICAL_NC_CONFIG="$LNC" torchrun')
+        c["command"][2] = cmd + "\necho SERVER STOPPED; sleep infinity\n"
+        env_set(c, "SYSPROF_DIR", "/logs/sysprof")
+        c.pop("livenessProbe", None)
     for kv in getattr(a, "env", []):
         k, v = kv.split("=", 1)
         env_set(c, k, v)
@@ -246,6 +256,7 @@ def main():
     p.add_argument("--node", default="")
     p.add_argument("--replicas", type=int, default=1); p.add_argument("--size", default="480*768")
     p.add_argument("--per-device", default="2"); p.add_argument("--cache", default="5")
+    p.add_argument("--sysprof", action="store_true", help="runtime system profile of rank 0")
     p.add_argument("--env", action="append", default=[], help="K=V, repeatable")
     a = ap.parse_args()
     os.makedirs(GEN, exist_ok=True)
