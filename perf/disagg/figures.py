@@ -846,3 +846,11 @@ def fig_bounds8():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds8())
     print("bounds.svg (sums to 100%)")
+
+
+if __name__ == "__main__":
+    # bounds.svg: per-engine busy (engines run in parallel, so the shares overlap); bounds_100.svg: the same time split
+    # three ways, summing to 100%
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds7())
+    open(os.path.join(OUT, "bounds_100.svg"), "w").write(fig_bounds8())
+    print("bounds.svg (per engine) + bounds_100.svg")

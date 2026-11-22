@@ -1,0 +1,27 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='860' height='250' viewBox='0 0 860 250' font-family='Helvetica, Arial, sans-serif'>
+<rect width='860' height='250' fill='#fcfcfb'/>
+<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>What each stage's chips are doing, % of the time (sums to 100%)</text>
+<text x='24' y='46' font-size='12' fill='#52514e'>LingBot 720p split run, hottest graph of each stage</text>
+<text x='120' y='92' font-size='12' text-anchor='end' fill='#0b0b0b'>DiT (16 chips)</text>
+<rect x='130.0' y='70' width='324.0' height='34' rx='4' fill='#2a78d6'><title>DiT (16 chips) computing (matmul busy): 57%</title></rect>
+<text x='136.0' y='92' font-size='12' fill='#ffffff'>57%</text>
+<rect x='456.0' y='70' width='134.8' height='34' rx='4' fill='#1baf7a'><title>DiT (16 chips) moving data / softmax, matmul idle: 24%</title></rect>
+<text x='462.0' y='92' font-size='12' fill='#0b0b0b'>24%</text>
+<rect x='592.8' y='70' width='105.2' height='34' rx='4' fill='#c9c7c0'><title>DiT (16 chips) waiting (all idle): 19%</title></rect>
+<text x='598.8' y='92' font-size='12' fill='#0b0b0b'>19%</text>
+<text x='120' y='154' font-size='12' text-anchor='end' fill='#0b0b0b'>VAE (2 chips)</text>
+<rect x='130.0' y='132' width='533.8' height='34' rx='4' fill='#2a78d6'><title>VAE (2 chips) computing (matmul busy): 94%</title></rect>
+<text x='136.0' y='154' font-size='12' fill='#ffffff'>94%</text>
+<rect x='665.8' y='132' width='21.9' height='34' rx='4' fill='#1baf7a'><title>VAE (2 chips) moving data / softmax, matmul idle: 4%</title></rect>
+<text x='665.8' y='180' font-size='11' fill='#52514e'>4%</text>
+<rect x='689.7' y='132' width='8.3' height='34' rx='4' fill='#c9c7c0'><title>VAE (2 chips) waiting (all idle): 2%</title></rect>
+<text x='715.7' y='180' font-size='11' fill='#52514e'>2%</text>
+<rect x='130' y='188' width='12' height='10' rx='2' fill='#2a78d6'/>
+<text x='146' y='197' font-size='11' fill='#0b0b0b'>computing (matmul busy)</text>
+<rect x='327' y='188' width='12' height='10' rx='2' fill='#1baf7a'/>
+<text x='343' y='197' font-size='11' fill='#0b0b0b'>moving data / softmax, matmul idle</text>
+<rect x='601' y='188' width='12' height='10' rx='2' fill='#c9c7c0'/>
+<text x='617' y='197' font-size='11' fill='#0b0b0b'>waiting (all idle)</text>
+<text x='24' y='224' font-size='12' fill='#0b0b0b'>VAE: compute-bound, computing 94% of the time.</text>
+<text x='24' y='240' font-size='12' fill='#0b0b0b'>DiT: computing only 57%; 24% moving data with the matmul engine idle, 19% waiting.</text>
+</svg>
