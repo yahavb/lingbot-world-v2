@@ -501,3 +501,72 @@ def fig_latency3():
 if __name__ == "__main__":
     open(os.path.join(OUT, "latency.svg"), "w").write(fig_latency3())
     print("latency.svg")
+
+
+def fig_architecture2():
+    """Two decoupled role pools (as in LLM prefill/decode disaggregation figures): a scheduler, a DiT pool and a VAE pool
+    that each scale out on their own, a many-to-many latent fabric between them, EKS/DRA underneath."""
+    W, H = 980, 560
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<defs><marker id='a' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'>"
+         f"<path d='M0,0 L10,5 L0,10 z' fill='{INK2}'/></marker></defs>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='30' font-size='16' font-weight='600' fill='{INK}'>Role-disaggregated serving: two pools that scale independently</text>"]
+    def box(x, y, w, h, t, sub, col, fill="#ffffff"):
+        s.append(f"<rect x='{x}' y='{y}' width='{w}' height='{h}' rx='8' fill='{fill}' stroke='{col}' stroke-width='2'/>")
+        s.append(f"<text x='{x + w / 2}' y='{y + h / 2 - 2}' font-size='12' font-weight='600' text-anchor='middle' fill='{INK}'>{t}</text>")
+        if sub:
+            s.append(f"<text x='{x + w / 2}' y='{y + h / 2 + 14}' font-size='10' text-anchor='middle' fill='{INK2}'>{sub}</text>")
+    def arrow(x1, y1, x2, y2, col=INK2):
+        s.append(f"<line x1='{x1}' y1='{y1}' x2='{x2}' y2='{y2}' stroke='{col}' stroke-width='1.6' marker-end='url(#a)'/>")
+    # clients and scheduler
+    box(400, 48, 180, 44, "Clients (sessions)", "actions in, frames out", INK2)
+    box(330, 116, 320, 50, "Scheduler", "places each session: a DiT replica + the least-loaded VAE", INK2, "#f3f2ee")
+    arrow(490, 92, 490, 116)
+    # DiT pool
+    s.append(f"<rect x='40' y='196' width='380' height='250' rx='12' fill='none' stroke='{BLUE}' stroke-width='2' stroke-dasharray='6 4'/>")
+    s.append(f"<text x='56' y='218' font-size='13' font-weight='600' fill='{INK}'>DiT pool (denoise): R_d replicas</text>")
+    for i, x in enumerate((60, 180, 300)):
+        lab = ["DiT 1", "DiT 2", "DiT R_d"][i]
+        box(x, 240, 100, 64, lab, "n_d chips", BLUE)
+    s.append(f"<text x='290' y='278' font-size='16' text-anchor='middle' fill='{INK2}'>...</text>")
+    s.append(f"<text x='56' y='376' font-size='11' fill='{INK2}'>each replica: n_d devices + paired EFAs (DRA claim),</text>")
+    s.append(f"<text x='56' y='392' font-size='11' fill='{INK2}'>TP x CP, per-stream KV cache</text>")
+    s.append(f"<text x='56' y='420' font-size='12' font-weight='600' fill='{BLUE}'>scale out: add DiT replicas (more streams)</text>")
+    # VAE pool
+    s.append(f"<rect x='560' y='196' width='380' height='250' rx='12' fill='none' stroke='{ORANGE}' stroke-width='2' stroke-dasharray='6 4'/>")
+    s.append(f"<text x='576' y='218' font-size='13' font-weight='600' fill='{INK}'>VAE pool (decode): R_v replicas</text>")
+    for i, x in enumerate((580, 700, 820)):
+        lab = ["VAE 1", "VAE 2", "VAE R_v"][i]
+        box(x, 240, 100, 64, lab, "n_v chips", ORANGE)
+    s.append(f"<text x='810' y='278' font-size='16' text-anchor='middle' fill='{INK2}'>...</text>")
+    s.append(f"<text x='576' y='376' font-size='11' fill='{INK2}'>each replica: K sessions, a causal cache each,</text>")
+    s.append(f"<text x='576' y='392' font-size='11' fill='{INK2}'>serves ~ T_d / T_v DiT streams</text>")
+    s.append(f"<text x='576' y='420' font-size='12' font-weight='600' fill='{ORANGE}'>scale out: add VAE replicas (keep the ratio)</text>")
+    # many-to-many latent fabric: a bus under both pools, every replica attached
+    bus = 336
+    s.append(f"<line x1='110' y1='{bus}' x2='870' y2='{bus}' stroke='{INK2}' stroke-width='4'/>")
+    for x in (110, 230, 350):
+        s.append(f"<line x1='{x}' y1='304' x2='{x}' y2='{bus}' stroke='{BLUE}' stroke-width='2'/>")
+    for x in (630, 750, 870):
+        s.append(f"<line x1='{x}' y1='{bus}' x2='{x}' y2='304' stroke='{ORANGE}' stroke-width='2' marker-end='url(#a)'/>")
+    s.append(f"<text x='490' y='{bus - 22}' font-size='12' font-weight='600' text-anchor='middle' fill='{INK}'>latent fabric</text>")
+    s.append(f"<text x='490' y='{bus - 8}' font-size='11' text-anchor='middle' fill='{INK}'>any DiT to any VAE</text>")
+    s.append(f"<text x='490' y='{bus + 18}' font-size='10' text-anchor='middle' fill='{INK2}'>NIXL over EFA</text>")
+    s.append(f"<text x='490' y='{bus + 32}' font-size='10' text-anchor='middle' fill='{INK2}'>or NeuronLink</text>")
+    s.append(f"<text x='490' y='{bus + 46}' font-size='10' text-anchor='middle' fill='{INK2}'>1.1 MB, 0.17 ms</text>")
+    # scheduler to pools
+    arrow(400, 166, 230, 196); arrow(580, 166, 750, 196)
+    # frames back
+    s.append(f"<path d='M 940 260 C 975 200, 975 80, 580 70' fill='none' stroke='{INK2}' stroke-width='1.4' stroke-dasharray='4 3' marker-end='url(#a)'/>")
+    s.append(f"<text x='920' y='120' font-size='10' fill='{INK2}' text-anchor='end'>frames back</text>")
+    # platform layer
+    box(40, 470, 900, 40, "Amazon EKS + Neuron DRA: device-and-EFA claims per role; pod discovery, least-loaded placement, failover", "", INK2, "#f3f2ee")
+    s.append(f"<text x='40' y='536' font-size='11' fill='{INK2}'>Sizing: n_d, n_v from each stage's scaling curve; ratio R_v = ceil(R_d * T_v / T_d). Co-located instead: every chip runs both stages, T_d(N) + T_v(N) per chunk.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "architecture.svg"), "w").write(fig_architecture2())
+    print("architecture.svg redrawn")
