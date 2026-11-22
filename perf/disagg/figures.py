@@ -628,6 +628,7 @@ def fig_architecture3():
     # one pool-to-pool arrow, with a circular arrow around it: any VAE, least loaded (no fixed pairing)
     arrow(630, 260, 690, 260, ORANGE, 2.4)
     s.append(f"<path d='M 668 244 A 17 17 0 1 0 676 266' fill='none' stroke='{ORANGE}' stroke-width='2' marker-end='url(#c)'/>")
+    lab(660, 232, "3", INK2, 11)
     lab(660, 296, "any VAE", ORANGE, 9); lab(660, 307, "least-loaded", ORANGE, 9); lab(660, 318, "failover ~3 s", ORANGE, 9)
     # frames back
     s.append(f"<path d='M 830 480 L 830 500 L 265 500 L 265 300' fill='none' stroke='{INK2}' stroke-width='1.6' stroke-dasharray='5 4' marker-end='url(#a)'/>")
