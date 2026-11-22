@@ -1,19 +1,41 @@
-<svg xmlns='http://www.w3.org/2000/svg' width='760' height='230' viewBox='0 0 760 230' font-family='Helvetica, Arial, sans-serif'>
-<rect width='760' height='230' fill='#fcfcfb'/>
-<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>The DiT is I/O-heavy; the VAE is compute-bound</text>
-<text x='24' y='48' font-size='12' fill='#52514e'>Time per call of each stage's main program (ms, 4 chips, 480x768)</text>
-<text x='68' y='92' font-size='14' font-weight='600' text-anchor='end' fill='#0b0b0b'>DiT</text>
-<rect x='80' y='70' width='327.4' height='34' rx='4' fill='#2a78d6'/>
-<text x='88' y='92' font-size='12' fill='#ffffff'>compute 4.4</text>
-<rect x='409.4' y='70' width='149.5' height='34' rx='4' fill='#eb6834'/>
-<text x='415.4' y='92' font-size='12' fill='#ffffff'>I/O 2.0</text>
-<text x='569.0' y='92' font-size='12' fill='#0b0b0b'>I/O a third of the time</text>
-<text x='68' y='152' font-size='14' font-weight='600' text-anchor='end' fill='#0b0b0b'>VAE</text>
-<rect x='80' y='130' width='376.4' height='34' rx='4' fill='#2a78d6'/>
-<text x='88' y='152' font-size='12' fill='#ffffff'>compute 5.0</text>
-<rect x='458.4' y='130' width='50.0' height='34' rx='4' fill='#eb6834'/>
-<text x='464.4' y='152' font-size='12' fill='#ffffff'>0.7</text>
-<text x='518.4' y='152' font-size='12' fill='#0b0b0b'>almost no I/O</text>
-<text x='24' y='204' font-size='11' fill='#52514e'>Blue: compute. Orange: I/O (moving data between the chip's memories and to the other chips).</text>
-<text x='24' y='220' font-size='11' fill='#52514e'>Slow for different reasons, so the two stages need different numbers of chips.</text>
+<svg xmlns='http://www.w3.org/2000/svg' width='900' height='330' viewBox='0 0 900 330' font-family='Helvetica, Arial, sans-serif'>
+<rect width='900' height='330' fill='#fcfcfb'/>
+<text x='24' y='28' font-size='16' font-weight='600' fill='#0b0b0b'>Two stages, two usage profiles (LingBot, measured)</text>
+<text x='24' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Matmul engine busy</text>
+<text x='24' y='80' font-size='10' fill='#52514e'>% of time</text>
+<rect x='54' y='161.2' width='56' height='108.8' rx='4' fill='#2a78d6'/>
+<text x='82' y='155.2' font-size='12' text-anchor='middle' fill='#0b0b0b'>68%</text>
+<text x='82' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
+<rect x='134' y='129.2' width='56' height='140.8' rx='4' fill='#eb6834'/>
+<text x='162' y='123.2' font-size='12' text-anchor='middle' fill='#0b0b0b'>88%</text>
+<text x='162' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
+<line x1='44' x2='219' y1='270' y2='270' stroke='#52514e'/>
+<text x='241' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Data movement busy</text>
+<text x='241' y='80' font-size='10' fill='#52514e'>% of time, overlaps compute</text>
+<rect x='271' y='138.8' width='56' height='131.2' rx='4' fill='#2a78d6'/>
+<text x='299' y='132.8' font-size='12' text-anchor='middle' fill='#0b0b0b'>82%</text>
+<text x='299' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
+<rect x='351' y='188.4' width='56' height='81.6' rx='4' fill='#eb6834'/>
+<text x='379' y='182.4' font-size='12' text-anchor='middle' fill='#0b0b0b'>51%</text>
+<text x='379' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
+<line x1='261' x2='436' y1='270' y2='270' stroke='#52514e'/>
+<text x='458' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Device memory per rank</text>
+<text x='458' y='80' font-size='10' fill='#52514e'>GiB (DiT: weights + KV, 720p)</text>
+<rect x='488' y='133.6' width='56' height='136.4' rx='4' fill='#2a78d6'/>
+<text x='516' y='127.6' font-size='12' text-anchor='middle' fill='#0b0b0b'>17.1</text>
+<text x='516' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
+<rect x='568' y='246.0' width='56' height='24.0' rx='4' fill='#eb6834'/>
+<text x='596' y='240.0' font-size='12' text-anchor='middle' fill='#0b0b0b'>3.0</text>
+<text x='596' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
+<line x1='478' x2='653' y1='270' y2='270' stroke='#52514e'/>
+<text x='675' y='64' font-size='12' font-weight='600' fill='#0b0b0b'>Speed-up with more chips</text>
+<text x='675' y='80' font-size='10' fill='#52514e'>DiT 2 -> 16 chips, VAE 1 -> 8</text>
+<rect x='705' y='142.0' width='56' height='128.0' rx='4' fill='#2a78d6'/>
+<text x='733' y='136.0' font-size='12' text-anchor='middle' fill='#0b0b0b'>3.2x</text>
+<text x='733' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>DiT</text>
+<rect x='785' y='186.0' width='56' height='84.0' rx='4' fill='#eb6834'/>
+<text x='813' y='180.0' font-size='12' text-anchor='middle' fill='#0b0b0b'>2.1x</text>
+<text x='813' y='286' font-size='11' text-anchor='middle' fill='#0b0b0b'>VAE</text>
+<line x1='695' x2='870' y1='270' y2='270' stroke='#52514e'/>
+<text x='24' y='312' font-size='11' fill='#52514e'>The DiT is big, spreads over several chips and talks between them; the VAE is small and compute-dense, fits one chip with room to share.</text>
 </svg>

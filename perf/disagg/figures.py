@@ -707,3 +707,37 @@ def fig_bounds4():
 if __name__ == "__main__":
     open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds4())
     print("bounds.svg (computing vs waiting)")
+
+
+def fig_bounds5():
+    """Typical usage of each stage, side by side (all measured): matmul engine busy, data movement busy, device memory per
+    rank, speed-up with chips. The point: the DiT is a big, chip-hungry, talkative model; the VAE is small and compute-dense."""
+    W, H = 900, 330
+    s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {FONT}>",
+         f"<rect width='{W}' height='{H}' fill='{SURF}'/>",
+         f"<text x='24' y='28' font-size='16' font-weight='600' fill='{INK}'>Two stages, two usage profiles (LingBot, measured)</text>"]
+    panels = [("Matmul engine busy", "% of time", 100, (68, 88), "{:.0f}%"),
+              ("Data movement busy", "% of time, overlaps compute", 100, (82, 51), "{:.0f}%"),
+              ("Device memory per rank", "GiB (DiT: weights + KV, 720p)", 20, (8.4 + 8.65, 3.0), "{:.1f}"),
+              ("Speed-up with more chips", "DiT 2 -> 16 chips, VAE 1 -> 8", 4, (3.2, 2.1), "{:.1f}x")]
+    pw, x0 = 205, 24
+    for k, (title, unit, vmax, (d, v), fmt) in enumerate(panels):
+        x = x0 + k * (pw + 12)
+        s.append(f"<text x='{x}' y='64' font-size='12' font-weight='600' fill='{INK}'>{title}</text>")
+        s.append(f"<text x='{x}' y='80' font-size='10' fill='{INK2}'>{unit}</text>")
+        base = 270
+        for j, (val, col, name) in enumerate(((d, BLUE, "DiT"), (v, ORANGE, "VAE"))):
+            bh = 160 * min(val, vmax) / vmax
+            bx = x + 30 + j * 80
+            s.append(f"<rect x='{bx}' y='{base - bh:.1f}' width='56' height='{bh:.1f}' rx='4' fill='{col}'/>")
+            s.append(f"<text x='{bx + 28}' y='{base - bh - 6:.1f}' font-size='12' text-anchor='middle' fill='{INK}'>{fmt.format(val)}</text>")
+            s.append(f"<text x='{bx + 28}' y='{base + 16}' font-size='11' text-anchor='middle' fill='{INK}'>{name}</text>")
+        s.append(f"<line x1='{x + 20}' x2='{x + pw - 10}' y1='{base}' y2='{base}' stroke='{INK2}'/>")
+    s.append(f"<text x='24' y='{H - 18}' font-size='11' fill='{INK2}'>The DiT is big, spreads over several chips and talks between them; the VAE is small and compute-dense, fits one chip with room to share.</text>")
+    s.append("</svg>")
+    return "\n".join(s)
+
+
+if __name__ == "__main__":
+    open(os.path.join(OUT, "bounds.svg"), "w").write(fig_bounds5())
+    print("bounds.svg (usage profiles)")

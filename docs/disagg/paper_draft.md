@@ -126,17 +126,19 @@ chip count (section 3).
 **3.1 Binding resources (Figure 3).** From a system trace of a warm run, we take a device profile of every graph
 that carries the latency, and compute one floor per resource.
 
-**Compute vs I/O (Figure 3, bounds.svg).** For each stage's main program:
+**Two usage profiles (Figure 3, bounds.svg).** Typical usage of each stage, all measured:
 
-| Stage | Compute | I/O | Total |
-|---|---|---|---|
-| DiT | 4.4 ms | 2.0 ms | 6.4 ms |
-| VAE | 5.0 ms | 0.7 ms | 5.7 ms |
+| | DiT | VAE |
+|---|---|---|
+| Matmul engine busy | 68% of the time | 88% |
+| Data movement busy (overlaps compute) | 82% | 51% |
+| Talks to other chips each call | yes: TP and CP, about 25% of its data movement | barely: tile edges only |
+| Device memory per rank | about 8.4 GiB of weights plus an 8.65 GB KV cache (720p) | about 3 GiB, with 4 sessions |
+| Speed-up from 8x the chips | 3.2x (2 to 16 chips) | 2.1x (1 to 8 chips) |
 
-I/O is the time the math engine stalls for data: moves between the chip's memories, and exchanges with the other
-chips (the DiT's communication across its chips, the VAE's tile edges). The DiT spends a third of its time in I/O; the
-VAE almost none. They are slow for
-different reasons, so they need different numbers of chips.
+The DiT is big, spreads over several chips and talks between them; the VAE is small and compute-dense, and fits one
+chip with room to share. Engine shares are from the main program of each stage (4 chips, 480x768); memory from the
+pods' allocation logs.
 
 **Coverage.** Share of chip-busy time in the profiled run (4 chips, 480x768, about 31.7 s of chip time), source
 perf/disagg/results/prof/p14_devprof_dma_480.devprof.txt:
