@@ -67,7 +67,7 @@ NULL_DECODE = os.environ.get("LINGBOT_NULL_DECODE", "0") == "1"
 PHASE_SYNC = os.environ.get("LINGBOT_PHASE_SYNC", "0") == "1"
 NIXL_ASYNC = os.environ.get("LINGBOT_NIXL_ASYNC", "0") == "1"
 import queue as _queue
-_NIXL_Q = _queue.Queue()
+_NIXL_Q = _queue.Queue(maxsize=2)   # (kiro) bounded, so the send thread's backpressure reaches rank 0
 
 
 def _nixl_worker(rdma):

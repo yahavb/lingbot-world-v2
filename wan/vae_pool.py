@@ -218,6 +218,12 @@ class VaePool:
                 self.fail()
             if not self.acquire():
                 raise VaeUnavailable("no VAE available")
+            # (kiro) backpressure: at most SLOTS chunks in flight (submitted, not decoded yet). Chunk seq goes to
+            # slot seq % SLOTS, which last held chunk seq - SLOTS; without this wait a DiT ahead of its decoder
+            # overwrote latents the decoder had not read yet, and those chunks decoded the wrong latents
+            from wan.nixl_link import SLOTS as _SLOTS
+            while remote.q.unfinished_tasks >= _SLOTS and remote.error is None:
+                time.sleep(0.001)
             name, seq = self.current[0], next(self.seq)
             try:
                 remote.submit(first or self.fresh, None, emit, url=self.url(), seq=seq, sid=self.current[2][2])
