@@ -40,7 +40,7 @@ spec:
             - name: VLM_URL
               value: "http://muse-glimmer-30b-vllm.default.svc.cluster.local:8000/v1"
             - name: LBW_URL
-              value: "http://lbw-v2.default.svc.cluster.local:8000"
+              value: "http://lbw-dit.default.svc.cluster.local:8000"
             # served under /lbw (the dev1 ALB routes /lbw straight here, no path rewrite)
             - name: URL_PREFIX
               value: "/lbw"
@@ -54,8 +54,8 @@ spec:
             periodSeconds: 10
           resources:
             requests:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "15"
+              memory: 40Gi
             limits:
-              cpu: "2"
-              memory: 2Gi
+              cpu: "20"
+              memory: 50Gi
