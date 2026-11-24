@@ -1,0 +1,199 @@
+# lbw-vae: the VAE alone (vae_serve.py) for lbw-dit, 1:1. 1 trn3 device + its paired EFA (s-lnc2-efa), LNC2, 4 ranks,
+# fused 2-D decoder tiled 2 x 2. Receives each chunk's latents from lbw-dit rank 0 over EFA RDMA (LINGBOT_VAE_RDMA=1;
+# this pod hosts the rendezvous store on :29600; a DiT links per session via POST /link) and streams the frames
+# back on the HTTP response. replicas: N VAEs for lbw-dit to choose from and fail over between. Service: lbw-svc.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lbw-vae-nixl
+spec:
+  replicas: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: lbw-vae-nixl
+  template:
+    metadata:
+      labels:
+        app: lbw-vae-nixl
+    spec:
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neuroncores
+          resourceClaimTemplateName: s-lnc2-efa
+      initContainers:
+        - name: neuron-healthcheck   # as wan2-i2v-14b-deploy.yaml: fail the pod early on a bad device
+          image: public.ecr.aws/neuron/neuron-observer:0.2.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              ls /dev/neuron*
+              neuron-observer health-check --test matmul
+          env:
+            - name: NEURON_RT_ALLOW_LEGACY_NEFF
+              value: "1"
+          resources:
+            claims:
+              - name: neuroncores
+      containers:
+        - name: vae
+          image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+          command:
+            - /bin/bash
+            - "-c"
+            - |
+              set -euo pipefail
+              git clone -b "$BRANCH" https://github.com/yahavb/lingbot-world-v2.git /tmp/lingbot
+              cd /tmp/lingbot
+              echo "commit: $(git log --oneline -1)"
+              install -m 755 tools/neuron-top/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" \
+                && echo "neuron-top: enhanced" || echo "neuron-top: stock"
+              # NIXL (latents DiT -> VAE over EFA, LINGBOT_VAE_TRANSPORT=nixl): built once per node into the node cache
+              eval "$(bash tools/nixl/build_nixl.sh)" && echo "nixl: $NIXL_PLUGIN_DIR"
+              NODE=/node-cache; CKPT=$NODE/lingbot-world-v2-14b-causal-fast
+              [ -f "$CKPT/Wan2.1_VAE.pth" ] || { pip install -q huggingface_hub; hf download robbyant/lingbot-world-v2-14b-causal-fast Wan2.1_VAE.pth --local-dir "$CKPT"; }
+              C=$NODE/cache/v${CACHE_VERSION:?set CACHE_VERSION}
+              export NEURON_COMPILE_CACHE_URL=$C/neuron-compile-cache TORCH_NEURONX_NEFF_CACHE_DIR=$C/neff_cache
+              export TORCH_NEURONX_HLO_CACHE_DIR=$C/hlo_cache HF_HOME=/tmp/hf-cache
+              mkdir -p "$NEURON_COMPILE_CACHE_URL" "$TORCH_NEURONX_NEFF_CACHE_DIR" "$TORCH_NEURONX_HLO_CACHE_DIR" "$C/nki-intermediate-cache"
+              # compiled graphs reference NKI kernel binaries by path under /var/tmp: keep them with the cache
+              rm -rf /var/tmp/nki-intermediate-cache && ln -s "$C/nki-intermediate-cache" /var/tmp/nki-intermediate-cache
+              pip install -q -r requirements_neuron.txt fastapi uvicorn
+              python3 -c "import torchvision" 2>/dev/null || bash install_neuron.sh
+              NEURON_LOGICAL_NC_CONFIG="$LNC" torchrun --nproc_per_node="$NPROC" vae_serve.py \
+                --ckpt_dir "$CKPT" --lat_h "$LAT_H" --lat_w "$LAT_W" --chunk_size "$CHUNK_SIZE" 2>&1 \
+                | tee -a /logs/serve.log | grep --line-buffered -avE "AliasingInfo|Mutated inputs|Detected collective"
+          ports:
+            - containerPort: 8000
+          startupProbe:
+            httpGet: {path: /readiness, port: 8000}
+            periodSeconds: 30
+            failureThreshold: 240
+          readinessProbe:
+            httpGet: {path: /readiness, port: 8000}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 10
+          resources:
+            claims:
+              - name: neuroncores
+            requests:  # 11 CPUs and 120Gi per Neuron device share of the trn3-dev1 node (11 CPUs, 120Gi per device)
+              cpu: "11"
+              memory: 120Gi
+              ephemeral-storage: 100Gi
+            limits:
+              cpu: "11"
+              memory: 120Gi
+              ephemeral-storage: 600Gi
+          volumeMounts:
+            - name: node-cache
+              mountPath: /node-cache
+            - name: dshm
+              mountPath: /dev/shm
+            - name: logs
+              mountPath: /logs
+          env:
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            - name: FI_EFA_ENABLE_SHM_TRANSFER
+              value: "0"
+            - name: CCOM_SOCKET_IFNAME
+              value: "eth0"
+            - name: LINGBOT_VAE_RDMA
+              value: "1"
+            - name: DIT_WORLD
+              value: "8"
+            - name: BRANCH
+              value: "nixl-eager"
+            - name: CACHE_VERSION
+              value: "5"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NPROC
+              value: "4"
+            - name: LNC
+              value: "2"
+            - name: LAT_H
+              value: "60"
+            - name: LAT_W
+              value: "96"
+            - name: CHUNK_SIZE
+              value: "3"
+            - name: LINGBOT_VAE_PER_DEVICE
+              value: "2"
+            - name: LINGBOT_VAE_HEAD_BF16
+              value: "1"
+            - name: LINGBOT_VAE_NKI_HALO
+              value: "1"
+            - name: LINGBOT_VAE_NKI_CONV
+              value: "all"
+            - name: LINGBOT_VAE_NKI_CONV_SQ
+              value: "bf16"
+            - name: LINGBOT_VAE_NKI_CONV_LA
+              value: "0"
+            - name: LINGBOT_VAE_NKI_CONV_CMAX
+              value: "192"
+            - name: LINGBOT_VAE_NKI_UP
+              value: "all"
+            - name: LINGBOT_VAE_NKI_UP_FOLD
+              value: "1"
+            - name: LINGBOT_VAE_LOW_T
+              value: "20"
+            - name: NEURON_LAUNCH_BLOCKING
+              value: "0"
+            - name: NKI_ENABLE_TRACE_CACHE
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--internal-backend-options=--disable-cb-before-global-cc"
+            - name: NKI_COMPILER_FRONTEND
+              value: "tracer"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "1"
+            - name: TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION
+              value: "1"
+            - name: NEURON_RT_EXEC_TIMEOUT
+              value: "600"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_LOAD_CONCURRENCY
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: LINGBOT_VAE_GATHER1
+              value: "1"
+            - name: LINGBOT_VAE_2D
+              value: "1"
+            - name: LINGBOT_VAE_T
+              value: "2"
+            - name: LINGBOT_VAE_NORM
+              value: "mm"
+            - name: LINGBOT_VAE_CC_FLAGS
+              value: "-O1+--model-type=unet-inference"
+            - name: LINGBOT_VAE_BF16
+              value: "1"
+            - name: LINGBOT_VAE_FUSED
+              value: "1"
+      volumes:
+        - name: node-cache
+          hostPath:
+            path: /opt/lingbot-world-v2
+            type: Directory
+        - name: logs
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
