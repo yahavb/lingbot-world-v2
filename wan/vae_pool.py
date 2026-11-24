@@ -41,8 +41,12 @@ class VaePool:
         self.gen = itertools.count(random.randrange(1, 1 << 30))
         # transport: "nixl" (default; wan/nixl_link.py, one-sided writes) or "neuron" (wan/rdma_link.py)
         self.transport = os.environ.get("LINGBOT_VAE_TRANSPORT", "nixl")
-        self.nixl = None               # wan.nixl_link.NixlDit, made at the first chunk (its shape)
+        self.nixl = None               # wan.nixl_link.NixlDit; its send buffer is registered at the first chunk (its shape)
         self.seq = itertools.count()
+        if self.transport == "nixl" and os.environ.get("LINGBOT_NIXL_EAGER", "1") != "0":
+            # the NIXL agent now, on this (main) thread at startup, not inside the first session's first chunk
+            from wan.nixl_link import NixlDit
+            self.nixl = NixlDit()
         if self.transport != "nixl":
             self.store = R.shared_store()  # the cluster's one rendezvous store, for this process's life
             self.rank = R.new_transport_rank(self.store)  # this process's transport rank, never reused
@@ -211,7 +215,8 @@ class VaePool:
         set it aside and retry the chunk on the next one."""
         if self.nixl is None:
             from wan.nixl_link import NixlDit
-            self.nixl = NixlDit(tuple(x_dev.shape), x_dev.device)
+            self.nixl = NixlDit()
+        self.nixl.ensure_buf(tuple(x_dev.shape), x_dev.device)
         for attempt in range(3):
             if remote.error is not None:                     # the last HTTP request failed
                 remote.error = None

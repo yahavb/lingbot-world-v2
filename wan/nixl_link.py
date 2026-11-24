@@ -38,8 +38,23 @@ def nrt_va(t):
     return nrt.nrt_tensor_get_va(ptr) + t.storage_offset() * t.element_size()
 
 
-def _agent(prefix):
+def _load_nixl():
     from nixl_cu12._api import nixl_agent, nixl_agent_config
+    return nixl_agent, nixl_agent_config
+
+
+# Load NIXL's native module when this module is imported, on the importing (main) thread, not on first use:
+# in torchft the first use ran on a background thread while others ran, and loading the module there segfaulted
+# 2 of 64 ranks (torchft 6bb8e0a). Here the first use can be the LINGBOT_NIXL_ASYNC worker. LINGBOT_NIXL_EAGER=0: off.
+if os.environ.get("LINGBOT_NIXL_EAGER", "1") != "0" and os.environ.get("LINGBOT_VAE_TRANSPORT", "nixl") == "nixl":
+    try:
+        _load_nixl()
+    except ImportError as _e:   # NIXL absent: fail when an agent is made, not at import
+        logging.getLogger("nixl_link").warning(f"nixl: eager load failed: {_e}")
+
+
+def _agent(prefix):
+    nixl_agent, nixl_agent_config = _load_nixl()
     name = f"{prefix}-{uuid.uuid4().hex[:8]}"
     return nixl_agent(name, nixl_agent_config(backends=["LIBFABRIC"])), name
 
@@ -92,14 +107,23 @@ class NixlVae:
 
 
 class NixlDit:
-    """DiT rank 0: one send buffer; a connection per VAE."""
+    """DiT rank 0: one send buffer; a connection per VAE. The agent can be made before the buffer's shape is known
+    (create_agent at startup, torchft f4194dc), so the first session does not wait for it."""
 
-    def __init__(self, shape, dev):
+    def __init__(self, shape=None, dev=None):
+        self.agent, self.name = _agent("lbw-dit")
+        self.buf = None
+        if shape is not None:
+            self.ensure_buf(shape, dev)
+
+    def ensure_buf(self, shape, dev):
+        """Allocate and register the send buffer (once; the latent shape is fixed for the process's life)."""
+        if self.buf is not None:
+            return
         self.buf = torch.zeros(tuple(shape), dtype=torch.float32, device=dev)
         torch.neuron.synchronize()
         self.nbytes = self.buf.numel() * 4
         va = nrt_va(self.buf)
-        self.agent, self.name = _agent("lbw-dit")
         self.agent.register_memory(self.agent.get_reg_descs([(va, self.nbytes, 0, "")], "VRAM"))
         self.local = self.agent.get_xfer_descs([(va, self.nbytes, 0)], "VRAM")
         log.info(f"nixl dit: agent {self.name}, send buffer {self.nbytes} B at {va:#x}")
